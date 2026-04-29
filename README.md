@@ -1,8 +1,10 @@
 # babysit
 
-A transparent PTY wrapper that runs a shell command and exposes it to
-*external* AI agents (Claude Code, Codex, …) via plain `babysit`
-subcommands.
+[日本語版 README](README_JA.md)
+
+A transparent PTY wrapper for local commands — so external AI agents
+(Claude Code, Codex, …) can read their live output the same way they
+already read `gcloud` or `kubectl` logs.
 
 ```console
 $ babysit -- make local-ci
@@ -17,24 +19,47 @@ $ echo $?
 2
 ```
 
-`babysit run make local-ci` is the explicit form (and the one that
-accepts `--name`); behaves identically.
-
-There is no TUI, no alt-screen, no key grabbing. Output streams straight
-to your terminal and stays in scrollback. Ctrl-C, Ctrl-Z, Ctrl-D and
-every other keystroke flow through to the wrapped command exactly as if
-you ran it directly. Babysit exits with the same exit code as the
-wrapped command, and to "quit babysit" you just kill the wrapped command
-(Ctrl-C, `exit`, etc.).
-
-The session id printed at the top is the only thing babysit adds.
-Paste it into a Claude or Codex session running in another terminal:
+Then, from another terminal, hand the session id to your agent:
 
 > *"hey, can you tell me if anything goes wrong on babysit session `ab12`?"*
 
-The agent reads state via the subcommands below. babysit does no
-monitoring of its own — it just exposes the wrapped command as a small
-CLI/file API; the agent decides when and how to use it.
+The agent calls `babysit log` / `babysit status` to read state. babysit
+does no monitoring of its own — it exposes the wrapped command as a
+small CLI/file API; the agent decides when and how to use it.
+
+## Why
+
+Remote execution platforms (`gcloud`, `kubectl`, CI providers, …) ship
+APIs that let an AI agent pull logs and status on demand. Local
+execution doesn't: a command running in your terminal is a black box to
+any agent that isn't already attached to that TTY, so analyzing an
+in-progress run usually means copy-pasting scrollback by hand.
+
+babysit closes that gap. Wrap a command once, and its live output and
+exit state become queryable through a small CLI an agent already knows
+how to drive — no scraping, no screen sharing, no extra daemon.
+
+## Stays out of your way
+
+No TUI, no alt-screen, no key grabbing. Output streams straight to your
+terminal and stays in scrollback. Ctrl-C, Ctrl-Z, Ctrl-D and every
+other keystroke flow through to the wrapped command exactly as if you
+ran it directly. babysit exits with the same exit code as the wrapped
+command, and to "quit babysit" you just kill the wrapped command
+(Ctrl-C, `exit`, etc.). The session id printed at the top is the only
+thing babysit adds.
+
+## Install
+
+Grab a prebuilt binary from
+[GitHub Releases](https://github.com/yusukeshib/babysit/releases)
+(macOS / Linux), or install from source:
+
+```
+cargo install --git https://github.com/yusukeshib/babysit
+```
+
+Once installed, `babysit upgrade` self-updates to the latest release.
 
 ## Subcommands
 
@@ -48,6 +73,7 @@ babysit restart -s <id>                     # kill + respawn        (alias: r)
 babysit kill -s <id>                        # terminate it          (alias: stop)
 babysit send -s <id> "<text>"               # write text + newline  (alias: type)
 babysit prune [--dry-run]                   # delete finished / dead sessions
+babysit upgrade                             # self-update to latest release
 ```
 
 `-s <id>` is shorthand for `--session <id>` and accepts either the id,
@@ -79,7 +105,7 @@ control.sock    # Unix socket the subcommands talk to
 recorded). Run `babysit prune` to clear out anything that's no longer
 running.
 
-## Build
+## Build from source
 
 ```
 cargo build --release
