@@ -1,6 +1,6 @@
 [package]
 name = "babysit"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Wrap a shell command in a PTY and expose it to external AI agents (Claude / Codex) via subcommands"
 license = "MIT"
