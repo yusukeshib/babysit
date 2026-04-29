@@ -5,7 +5,7 @@ A transparent PTY wrapper that runs a shell command and exposes it to
 subcommands.
 
 ```
-$ babysit -- make local-ci
+$ babysit make local-ci
 babysit session ab12: make local-ci
   babysit log -s ab12 --tail 200
   babysit status -s ab12
@@ -15,6 +15,9 @@ Running tests...
 make: *** [local-ci] Error 1
 $
 ```
+
+(Use `--` only when the wrapped command starts with a flag babysit
+would otherwise parse, e.g. `babysit -- --version`.)
 
 There is no TUI, no alt-screen, no key grabbing. Output streams straight
 to your terminal and stays in scrollback. Ctrl-C, Ctrl-Z, Ctrl-D and
