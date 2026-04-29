@@ -2,6 +2,12 @@
 name = "babysit"
 version = "0.1.0"
 edition = "2024"
+description = "Run a shell command in a TUI alongside an AI agent (Claude / Codex) that can observe and operate it"
+license = "MIT"
+repository = "https://github.com/yusukeshib/babysit"
+readme = "README.md"
+keywords = ["tui", "ai", "agent", "pty", "claude"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 ratatui = "0.30"
