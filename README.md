@@ -41,12 +41,12 @@ CLI/file API; the agent decides when and how to use it.
 ```
 babysit -- <cmd> [args…]                    # wrap a command (short form)
 babysit run [--name NAME] <cmd> [args…]     # wrap a command (named form)
-babysit list [--json]                       # all sessions
-babysit status -s <id> [--json]             # state of the wrapped command
-babysit log -s <id> [--tail N] [--raw]      # output (ANSI stripped unless --raw)
-babysit restart -s <id>                     # kill + respawn the wrapped command
-babysit kill -s <id>                        # terminate it
-babysit send -s <id> "<text>"               # write text + newline to its stdin
+babysit list [--json]                       # all sessions          (alias: ls)
+babysit status -s <id> [--json]             # state of wrapped cmd  (aliases: st, info)
+babysit log -s <id> [--tail N] [--raw]      # output, ANSI stripped (alias: logs)
+babysit restart -s <id>                     # kill + respawn        (alias: r)
+babysit kill -s <id>                        # terminate it          (alias: stop)
+babysit send -s <id> "<text>"               # write text + newline  (alias: type)
 babysit prune [--dry-run]                   # delete finished / dead sessions
 ```
 
