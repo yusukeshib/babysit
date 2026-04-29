@@ -35,11 +35,13 @@ pub enum Command {
         cmd: Vec<String>,
     },
     /// List all babysit sessions
+    #[command(alias = "ls")]
     List {
         #[arg(long)]
         json: bool,
     },
     /// Show status of a session
+    #[command(aliases = ["st", "info"])]
     Status {
         #[command(flatten)]
         sel: SessionSel,
@@ -47,6 +49,7 @@ pub enum Command {
         json: bool,
     },
     /// Show recent output from the wrapped command
+    #[command(alias = "logs")]
     Log {
         #[command(flatten)]
         sel: SessionSel,
@@ -58,16 +61,19 @@ pub enum Command {
         raw: bool,
     },
     /// Restart the wrapped command
+    #[command(alias = "r")]
     Restart {
         #[command(flatten)]
         sel: SessionSel,
     },
     /// Terminate the wrapped command
+    #[command(alias = "stop")]
     Kill {
         #[command(flatten)]
         sel: SessionSel,
     },
     /// Send text to the wrapped command's stdin (newline appended)
+    #[command(alias = "type")]
     Send {
         #[command(flatten)]
         sel: SessionSel,
