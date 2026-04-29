@@ -6,21 +6,11 @@ use clap::{Parser, Subcommand};
     version,
     about = "Wrap a shell command in a PTY and expose it to external agents via subcommands",
     long_about = None,
-    arg_required_else_help = false,
-    // When no subcommand is given, trailing args become the wrapped command.
-    subcommand_negates_reqs = true,
+    arg_required_else_help = true,
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Option<Command>,
-
-    /// Optional name for the session (visible in `babysit list`)
-    #[arg(long, value_name = "NAME")]
-    pub name: Option<String>,
-
-    /// The command to wrap, plus its arguments. Use `--` to separate.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-    pub cmd: Vec<String>,
+    pub command: Command,
 }
 
 /// Session selector flag, shared across read/operate subcommands.
@@ -35,7 +25,7 @@ pub struct SessionSel {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Wrap a shell command in a PTY (explicit alternative to the bare form)
+    /// Wrap a shell command in a PTY and expose it via the other subcommands
     Run {
         /// Optional name for the session (visible in `babysit list`)
         #[arg(long, value_name = "NAME")]
@@ -90,10 +80,4 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-}
-
-pub fn print_help() {
-    use clap::CommandFactory;
-    Cli::command().print_help().ok();
-    println!();
 }

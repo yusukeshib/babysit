@@ -5,7 +5,7 @@ A transparent PTY wrapper that runs a shell command and exposes it to
 subcommands.
 
 ```console
-$ babysit make local-ci
+$ babysit -- make local-ci
 babysit session ab12: make local-ci
   babysit log -s ab12 --tail 200
   babysit status -s ab12
@@ -17,9 +17,8 @@ $ echo $?
 2
 ```
 
-`babysit run make local-ci` is the explicit form and behaves identically.
-Use `--` (or the `run` form) when the wrapped command's name collides
-with a babysit subcommand: `babysit -- list` or `babysit run list`.
+`babysit run make local-ci` is the explicit form (and the one that
+accepts `--name`); behaves identically.
 
 There is no TUI, no alt-screen, no key grabbing. Output streams straight
 to your terminal and stays in scrollback. Ctrl-C, Ctrl-Z, Ctrl-D and
@@ -40,8 +39,8 @@ CLI/file API; the agent decides when and how to use it.
 ## Subcommands
 
 ```
-babysit [--name NAME] <cmd> [args…]        # wrap a command (bare form)
-babysit run [--name NAME] <cmd> [args…]    # wrap a command (explicit form)
+babysit -- <cmd> [args…]                    # wrap a command (short form)
+babysit run [--name NAME] <cmd> [args…]     # wrap a command (named form)
 babysit list [--json]                       # all sessions
 babysit status -s <id> [--json]             # state of the wrapped command
 babysit log -s <id> [--tail N] [--raw]      # output (ANSI stripped unless --raw)
@@ -59,6 +58,10 @@ the wrapped command itself the session is implicit via
 `status` and `log` work even after babysit has exited — they fall back
 to the on-disk state files. `restart`, `kill`, and `send` need the live
 control socket and will fail if the babysit process is gone.
+
+`babysit <unknown>` is treated as an unknown subcommand (with a
+`did you mean …?` hint), not as a wrap attempt — use `babysit -- <cmd>`
+or `babysit run <cmd>` to wrap.
 
 ## Session state on disk
 
