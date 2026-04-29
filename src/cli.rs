@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "babysit",
     version,
-    about = "Run a command inside a TUI with a sidecar AI agent that can observe and operate it",
+    about = "Run a command inside a TUI and expose it to external agents via subcommands",
     long_about = None,
     arg_required_else_help = false,
     // When no subcommand is given, trailing args become the wrapped command.
@@ -13,14 +13,6 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
-
-    /// First message to send to the agent (its initial user-message)
-    #[arg(short = 'p', long, value_name = "PROMPT")]
-    pub prompt: Option<String>,
-
-    /// Agent CLI to spawn. Defaults: claude, codex (PATH lookup)
-    #[arg(long, value_name = "NAME")]
-    pub agent: Option<String>,
 
     /// Optional name for the session (visible in `babysit list`)
     #[arg(long, value_name = "NAME")]

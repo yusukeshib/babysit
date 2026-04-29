@@ -9,8 +9,6 @@ pub struct Meta {
     pub id: String,
     pub name: Option<String>,
     pub cmd: Vec<String>,
-    pub agent: Option<String>,
-    pub prompt: Option<String>,
     pub babysit_pid: u32,
     pub started_at: DateTime<Utc>,
 }
