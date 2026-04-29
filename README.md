@@ -2,9 +2,9 @@
 
 [日本語版 README](README_JA.md)
 
-A transparent PTY wrapper for local commands — so external AI agents
-(Claude Code, Codex, …) can read their live output the same way they
-already read `gcloud` or `kubectl` logs.
+Gives local terminal commands an API, so external AI agents (Claude
+Code, Codex, …) can query their live output and exit state — the same
+way they already query `gcloud` or `kubectl`.
 
 ```console
 $ babysit -- make local-ci
@@ -39,21 +39,19 @@ babysit closes that gap. Wrap a command once, and its live output and
 exit state become queryable through a small CLI an agent already knows
 how to drive — no scraping, no screen sharing, no extra daemon.
 
-## Stays out of your way
-
-No TUI, no alt-screen, no key grabbing. Output streams straight to your
-terminal and stays in scrollback. Ctrl-C, Ctrl-Z, Ctrl-D and every
-other keystroke flow through to the wrapped command exactly as if you
-ran it directly. babysit exits with the same exit code as the wrapped
-command, and to "quit babysit" you just kill the wrapped command
-(Ctrl-C, `exit`, etc.). The session id printed at the top is the only
-thing babysit adds.
-
 ## Install
 
-Grab a prebuilt binary from
-[GitHub Releases](https://github.com/yusukeshib/babysit/releases)
-(macOS / Linux), or install from source:
+```
+curl -fsSL https://raw.githubusercontent.com/yusukeshib/babysit/main/install.sh | sh
+```
+
+Drops a checksum-verified binary at `~/.local/bin/babysit` (override
+with `BABYSIT_INSTALL_DIR`, pin a version with `BABYSIT_VERSION=v0.2.4`).
+macOS / Linux on x86_64 or aarch64.
+
+Or grab a prebuilt binary directly from
+[GitHub Releases](https://github.com/yusukeshib/babysit/releases), or
+build from source:
 
 ```
 cargo install --git https://github.com/yusukeshib/babysit
@@ -96,7 +94,7 @@ Each session writes to `~/.babysit/sessions/<id>/`:
 ```
 meta.json       # static info (cmd, started_at, …)
 status.json     # live state (running / exited / killed, exit_code)
-output.log      # raw bytes from the wrapped command's PTY
+output.log      # raw output from the wrapped command
 control.sock    # Unix socket the subcommands talk to
 ```
 
