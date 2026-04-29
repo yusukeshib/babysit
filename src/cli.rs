@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "babysit",
     version,
-    about = "Run a command inside a TUI and expose it to external agents via subcommands",
+    about = "Wrap a shell command in a PTY and expose it to external agents via subcommands",
     long_about = None,
     arg_required_else_help = false,
     // When no subcommand is given, trailing args become the wrapped command.
@@ -23,7 +23,7 @@ pub struct Cli {
     pub cmd: Vec<String>,
 }
 
-/// Session selector flag, shared across subcommands.
+/// Session selector flag, shared across read/operate subcommands.
 ///
 /// Resolution: --session arg → $BABYSIT_SESSION_ID env → most recently active.
 #[derive(clap::Args, Debug, Clone)]
@@ -35,6 +35,15 @@ pub struct SessionSel {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Wrap a shell command in a PTY (explicit alternative to the bare form)
+    Run {
+        /// Optional name for the session (visible in `babysit list`)
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The command to wrap, plus its arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        cmd: Vec<String>,
+    },
     /// List all babysit sessions
     List {
         #[arg(long)]
@@ -74,6 +83,12 @@ pub enum Command {
         sel: SessionSel,
         /// Text to send
         text: String,
+    },
+    /// Delete sessions whose wrapped command has finished or whose owner died
+    Prune {
+        /// Print what would be deleted, but don't delete
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

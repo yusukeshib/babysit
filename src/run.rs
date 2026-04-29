@@ -11,13 +11,13 @@ use std::thread;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-pub async fn run(cmd: Vec<String>) -> Result<i32> {
+pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<i32> {
     let id = session::new_id();
     let cmd_title = cmd.join(" ");
 
     let meta = Meta {
         id: id.clone(),
-        name: None,
+        name,
         cmd: cmd.clone(),
         babysit_pid: std::process::id(),
         started_at: Utc::now(),

@@ -156,6 +156,55 @@ pub async fn send(session: Option<String>, text: String) -> Result<()> {
     Ok(())
 }
 
+/// Delete session directories for sessions that are in a terminal state
+/// (exited / killed) or whose owning babysit process has died.
+///
+/// Live sessions (running, with a live owner) are never touched.
+pub async fn prune(dry_run: bool) -> Result<()> {
+    let ids = session::list_ids().await?;
+    let mut targets: Vec<(String, Meta)> = Vec::new();
+    for id in &ids {
+        let meta = match session::read_meta(id).await {
+            Ok(m) => m,
+            // Unparseable meta — leave it alone rather than silently nuke it.
+            Err(_) => continue,
+        };
+        let status = session::read_status(id).await.ok();
+        let alive = session::is_pid_alive(meta.babysit_pid);
+        let should_delete = match status.as_ref().map(|s| s.state) {
+            Some(State::Exited | State::Killed) => true,
+            // Starting/Running with a dead owner ⇒ "dead" in `babysit list`.
+            Some(State::Starting | State::Running) if !alive => true,
+            // No status file at all and no live owner ⇒ orphan.
+            None if !alive => true,
+            _ => false,
+        };
+        if should_delete {
+            targets.push((id.clone(), meta));
+        }
+    }
+
+    if targets.is_empty() {
+        println!("(nothing to prune)");
+        return Ok(());
+    }
+
+    for (id, meta) in &targets {
+        let cmd = meta.cmd.join(" ");
+        if dry_run {
+            println!("would delete {id}  {cmd}");
+        } else {
+            let dir = paths::session_dir(id)?;
+            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                eprintln!("babysit: failed to remove {}: {e}", dir.display());
+                continue;
+            }
+            println!("deleted {id}  {cmd}");
+        }
+    }
+    Ok(())
+}
+
 /// Open a short-lived connection to the session's control socket, send a
 /// single JSON request, and parse the JSON response.
 async fn request(id: &str, req: &Request) -> Result<Response> {
