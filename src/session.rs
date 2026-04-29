@@ -44,6 +44,21 @@ impl Status {
     }
 }
 
+/// True if `pid` corresponds to a process this user can see.
+///
+/// Used to distinguish a session whose babysit owner is still running from
+/// one whose owner died (crash, kill -9, reboot) without writing a terminal
+/// state. Subject to PID reuse, but in practice good enough for display.
+pub fn is_pid_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    matches!(
+        kill(Pid::from_raw(pid as i32), None),
+        Ok(_) | Err(Errno::EPERM)
+    )
+}
+
 /// Generate a short, human-friendly session id ("babysit-3a7f"-style).
 pub fn new_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};

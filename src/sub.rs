@@ -6,7 +6,7 @@
 
 use crate::control::{Request, Response};
 use crate::paths;
-use crate::session::{self, State, Status};
+use crate::session::{self, Meta, State, Status};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -36,6 +36,7 @@ pub async fn list(json: bool) -> Result<()> {
                     "cmd": m.cmd,
                     "agent": m.agent,
                     "state": s.state,
+                    "alive": is_owner_alive(m, s),
                     "exit_code": s.exit_code,
                     "started_at": m.started_at,
                     "last_change": s.last_change,
@@ -57,7 +58,7 @@ pub async fn list(json: bool) -> Result<()> {
                 m.id,
                 m.name.as_deref().unwrap_or("-"),
                 m.agent.as_deref().unwrap_or("-"),
-                state_label(s),
+                state_label_for(Some(m), s),
                 age,
                 m.cmd.join(" "),
             );
@@ -93,7 +94,7 @@ pub async fn status(session: Option<String>, json: bool) -> Result<()> {
                 println!("agent:   {agent}");
             }
         }
-        println!("state:   {}", state_label(&s));
+        println!("state:   {}", state_label_for(meta.as_ref(), &s));
         if let Some(c) = s.exit_code {
             println!("exit:    {c}");
         }
@@ -179,7 +180,14 @@ async fn request(id: &str, req: &Request) -> Result<Response> {
     Ok(resp)
 }
 
-fn state_label(s: &Status) -> String {
+fn state_label_for(meta: Option<&Meta>, s: &Status) -> String {
+    // A persisted Starting/Running state only reflects reality while the
+    // owning babysit process is still alive. If the process is gone (crash,
+    // kill -9, reboot, or an early spawn failure that bailed before writing
+    // a terminal state) the on-disk value is stale — surface that instead.
+    if matches!(s.state, State::Starting | State::Running) && !is_owner_alive_meta(meta) {
+        return "dead".into();
+    }
     match s.state {
         State::Starting => "starting".into(),
         State::Running => "running".into(),
@@ -189,6 +197,18 @@ fn state_label(s: &Status) -> String {
         },
         State::Killed => "killed".into(),
     }
+}
+
+fn is_owner_alive_meta(meta: Option<&Meta>) -> bool {
+    meta.map(|m| session::is_pid_alive(m.babysit_pid))
+        .unwrap_or(false)
+}
+
+fn is_owner_alive(meta: &Meta, s: &Status) -> bool {
+    if !matches!(s.state, State::Starting | State::Running) {
+        return false;
+    }
+    session::is_pid_alive(meta.babysit_pid)
 }
 
 fn format_age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
