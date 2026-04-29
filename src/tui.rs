@@ -127,11 +127,12 @@ impl App {
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> bool {
         if matches!(ev.kind, MouseEventKind::Down(_)) && ev.row == 0 {
             for (i, hit) in self.tab_hit_boxes.iter().enumerate() {
-                if let Some((lo, hi)) = hit {
-                    if ev.column >= *lo && ev.column < *hi {
-                        self.active = i;
-                        return true;
-                    }
+                if let Some((lo, hi)) = hit
+                    && ev.column >= *lo
+                    && ev.column < *hi
+                {
+                    self.active = i;
+                    return true;
                 }
             }
         }

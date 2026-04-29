@@ -93,13 +93,8 @@ impl Pane {
             let parser = parser.clone();
             let redraw = redraw.clone();
             thread::spawn(move || {
-                let mut log_file = log_path.and_then(|p| {
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&p)
-                        .ok()
-                });
+                let mut log_file = log_path
+                    .and_then(|p| OpenOptions::new().create(true).append(true).open(&p).ok());
                 let mut buf = [0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {

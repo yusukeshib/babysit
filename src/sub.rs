@@ -24,7 +24,7 @@ pub async fn list(json: bool) -> Result<()> {
         entries.push((meta, status));
     }
     // Most-recently-active first.
-    entries.sort_by(|a, b| b.1.last_change.cmp(&a.1.last_change));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1.last_change));
 
     if json {
         let arr: Vec<serde_json::Value> = entries
@@ -47,8 +47,8 @@ pub async fn list(json: bool) -> Result<()> {
         println!("(no sessions)");
     } else {
         println!(
-            "{:<10} {:<14} {:<10} {:<8} {:<10} {}",
-            "ID", "NAME", "AGENT", "STATE", "AGE", "CMD"
+            "{:<10} {:<14} {:<10} {:<8} {:<10} CMD",
+            "ID", "NAME", "AGENT", "STATE", "AGE"
         );
         for (m, s) in &entries {
             let age = format_age(m.started_at, Utc::now());
@@ -217,4 +217,3 @@ fn last_n_lines(text: &str, n: usize) -> String {
     };
     text[start..].to_string()
 }
-

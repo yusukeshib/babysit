@@ -100,10 +100,10 @@ pub async fn list_ids() -> Result<Vec<String>> {
     let mut rd = tokio::fs::read_dir(&dir).await?;
     let mut ids = Vec::new();
     while let Some(entry) = rd.next_entry().await? {
-        if entry.file_type().await?.is_dir() {
-            if let Some(name) = entry.file_name().to_str() {
-                ids.push(name.to_string());
-            }
+        if entry.file_type().await?.is_dir()
+            && let Some(name) = entry.file_name().to_str()
+        {
+            ids.push(name.to_string());
         }
     }
     Ok(ids)
@@ -119,10 +119,10 @@ pub async fn resolve(session: Option<String>) -> Result<String> {
     if let Some(s) = session {
         return resolve_one(&s).await;
     }
-    if let Ok(env_id) = std::env::var("BABYSIT_SESSION_ID") {
-        if !env_id.is_empty() {
-            return resolve_one(&env_id).await;
-        }
+    if let Ok(env_id) = std::env::var("BABYSIT_SESSION_ID")
+        && !env_id.is_empty()
+    {
+        return resolve_one(&env_id).await;
     }
     resolve_latest().await
 }
@@ -137,10 +137,10 @@ async fn resolve_one(s: &str) -> Result<String> {
         return Ok(s.to_string());
     }
     for id in &ids {
-        if let Ok(meta) = read_meta(id).await {
-            if meta.name.as_deref() == Some(s) {
-                return Ok(id.clone());
-            }
+        if let Ok(meta) = read_meta(id).await
+            && meta.name.as_deref() == Some(s)
+        {
+            return Ok(id.clone());
         }
     }
     Err(anyhow!("no session matching `{s}`"))
@@ -164,4 +164,3 @@ async fn resolve_latest() -> Result<String> {
     best.map(|(id, _)| id)
         .ok_or_else(|| anyhow!("no sessions with status"))
 }
-
