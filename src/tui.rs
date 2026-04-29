@@ -26,7 +26,12 @@ use ratatui::{
 };
 use std::io::{Stdout, stdout};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tui_term::widget::PseudoTerminal;
+
+/// Time window within which a second Ctrl+C is treated as "quit babysit"
+/// rather than another forwarded interrupt.
+const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_millis(500);
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -62,6 +67,9 @@ pub struct App {
     /// Cached column ranges for tab bar entries, used for mouse-click routing.
     /// Updated each frame.
     tab_hit_boxes: [Option<(u16, u16)>; 2],
+    /// Timestamp of the last Ctrl+C press. A second press within
+    /// `DOUBLE_CTRL_C_WINDOW` quits babysit instead of being forwarded.
+    last_ctrl_c: Option<Instant>,
 }
 
 impl App {
@@ -74,6 +82,7 @@ impl App {
             pending_restart_cmd: false,
             redraw: Arc::new(tokio::sync::Notify::new()),
             tab_hit_boxes: [None, None],
+            last_ctrl_c: None,
         }
     }
 
@@ -104,6 +113,27 @@ impl App {
             KeyCode::Char('q') if ctrl => {
                 self.should_quit = true;
                 true
+            }
+            // Ctrl+C: forward to the child on first press, but a second press
+            // within the double-tap window quits babysit. This preserves the
+            // ability to send SIGINT while giving an escape hatch.
+            //
+            // Only applies on the cmd tab. The agent tab hosts CLIs (e.g.
+            // claude) that have their own "Ctrl+C twice to exit" semantics,
+            // and we don't want to swallow their second press.
+            KeyCode::Char('c') if ctrl && self.active == 0 => {
+                let now = Instant::now();
+                let is_double = self
+                    .last_ctrl_c
+                    .is_some_and(|t| now.duration_since(t) < DOUBLE_CTRL_C_WINDOW);
+                if is_double {
+                    self.last_ctrl_c = None;
+                    self.should_quit = true;
+                    true
+                } else {
+                    self.last_ctrl_c = Some(now);
+                    false
+                }
             }
             KeyCode::Char('1') if ctrl || alt => {
                 self.active = 0;
@@ -241,9 +271,9 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let hint = if app.cmd_tab_idle() {
-        " Press [r] to restart · Ctrl-1/2 switch tabs · Ctrl-Q quit ".to_string()
+        " Press [r] to restart · Ctrl-1/2 switch tabs · Ctrl-C×2 or Ctrl-Q to quit ".to_string()
     } else {
-        " Ctrl-1/2 switch tabs · click tab to focus · Ctrl-Q quit (Ctrl-C forwards to command) "
+        " Ctrl-1/2 switch tabs · click tab to focus · Ctrl-C interrupts (×2 quits) · Ctrl-Q quit "
             .to_string()
     };
     let p = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
