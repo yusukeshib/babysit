@@ -28,8 +28,8 @@ pub struct AgentSpec {
 /// Resolve the agent to use. `explicit` overrides PATH detection.
 pub fn resolve(explicit: Option<&str>) -> Result<(String, PathBuf)> {
     if let Some(name) = explicit {
-        let bin = which::which(name)
-            .with_context(|| format!("agent `{name}` not found in PATH"))?;
+        let bin =
+            which::which(name).with_context(|| format!("agent `{name}` not found in PATH"))?;
         return Ok((name.to_string(), bin));
     }
     for name in KNOWN_AGENTS {
@@ -88,9 +88,7 @@ pub fn build_spec(
 }
 
 fn combined_message(manual: &str, user_msg: &str) -> String {
-    format!(
-        "{manual}\n\n--- USER INSTRUCTION ---\n{user_msg}\n",
-    )
+    format!("{manual}\n\n--- USER INSTRUCTION ---\n{user_msg}\n",)
 }
 
 /// The babysit "manual" — explains the subcommand API and that the session id

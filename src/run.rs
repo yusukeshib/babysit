@@ -12,7 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-pub async fn run(prompt: Option<String>, agent_arg: Option<String>, cmd: Vec<String>) -> Result<()> {
+pub async fn run(
+    prompt: Option<String>,
+    agent_arg: Option<String>,
+    cmd: Vec<String>,
+) -> Result<()> {
     let id = session::new_id();
     let cmd_title = cmd.join(" ");
 
@@ -175,26 +179,25 @@ async fn drive_loop(
         }
 
         // Detect child exit transitions and persist them.
-        if let Some(pane) = app.tabs[0].pane.as_ref() {
-            if let Some(info) = pane.exit_info() {
-                if *current_state == State::Running {
-                    *current_state = if info.signaled {
-                        State::Killed
-                    } else {
-                        State::Exited
-                    };
-                    session::write_status(
-                        id,
-                        &Status {
-                            state: *current_state,
-                            child_pid: None,
-                            exit_code: info.code,
-                            last_change: Utc::now(),
-                        },
-                    )
-                    .await?;
-                }
-            }
+        if let Some(pane) = app.tabs[0].pane.as_ref()
+            && let Some(info) = pane.exit_info()
+            && *current_state == State::Running
+        {
+            *current_state = if info.signaled {
+                State::Killed
+            } else {
+                State::Exited
+            };
+            session::write_status(
+                id,
+                &Status {
+                    state: *current_state,
+                    child_pid: None,
+                    exit_code: info.code,
+                    last_change: Utc::now(),
+                },
+            )
+            .await?;
         }
 
         // Honor the `r` keybind from the TUI.
@@ -221,12 +224,7 @@ async fn drive_loop(
     Ok(())
 }
 
-async fn do_restart(
-    app: &mut App,
-    handle: &Handle,
-    id: &str,
-    cmd: &[String],
-) -> Result<()> {
+async fn do_restart(app: &mut App, handle: &Handle, id: &str, cmd: &[String]) -> Result<()> {
     if let Some(old) = app.tabs[0].pane.take() {
         old.kill();
     }
@@ -246,17 +244,17 @@ async fn do_restart(
 
 fn build_agent_env(id: &str) -> Vec<(String, String)> {
     let mut env = vec![("BABYSIT_SESSION_ID".to_string(), id.to_string())];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let dir = dir.to_string_lossy().into_owned();
-            let existing = std::env::var("PATH").unwrap_or_default();
-            let new_path = if existing.is_empty() {
-                dir
-            } else {
-                format!("{dir}:{existing}")
-            };
-            env.push(("PATH".to_string(), new_path));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let dir = dir.to_string_lossy().into_owned();
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let new_path = if existing.is_empty() {
+            dir
+        } else {
+            format!("{dir}:{existing}")
+        };
+        env.push(("PATH".to_string(), new_path));
     }
     env
 }
