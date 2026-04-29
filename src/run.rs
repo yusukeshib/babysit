@@ -56,15 +56,46 @@ pub async fn run(
 
     // Tab 1: wrapped command.
     let log_path = paths::output_log_path(&id)?;
-    let cmd_pane = Arc::new(Pane::spawn(
+    let cmd_pane = match Pane::spawn(
         &cmd,
         initial_rows,
         initial_cols,
         &[("BABYSIT_SESSION_ID".into(), id.clone())],
         app.redraw.clone(),
         Some(&log_path),
-    )?);
+    ) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            // Don't leave the session stuck in "starting" forever.
+            let _ = session::write_status(
+                &id,
+                &Status {
+                    state: State::Exited,
+                    child_pid: None,
+                    exit_code: None,
+                    last_change: Utc::now(),
+                },
+            )
+            .await;
+            return Err(e);
+        }
+    };
     app.tabs[0].pane = Some(cmd_pane.clone());
+
+    // Mark the session running as soon as the wrapped command is spawned.
+    // Doing this before the agent pane means an agent-spawn failure can
+    // never leave the session stuck in `starting`.
+    let mut current_state = State::Running;
+    session::write_status(
+        &id,
+        &Status {
+            state: current_state,
+            child_pid: None,
+            exit_code: None,
+            last_change: Utc::now(),
+        },
+    )
+    .await?;
 
     // Tab 2: agent (if available).
     if let Some(spec) = agent_spec {
@@ -89,19 +120,6 @@ pub async fn run(
             agent_pane.write_input(b"\r");
         });
     }
-
-    // Mark the session running once the child is spawned.
-    let mut current_state = State::Running;
-    session::write_status(
-        &id,
-        &Status {
-            state: current_state,
-            child_pid: None,
-            exit_code: None,
-            last_change: Utc::now(),
-        },
-    )
-    .await?;
 
     // Action channel for control-plane → main-loop messages.
     let (action_tx, mut action_rx) = mpsc::unbounded_channel::<LoopMessage>();
