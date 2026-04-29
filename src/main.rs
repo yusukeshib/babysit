@@ -5,6 +5,7 @@ mod paths;
 mod run;
 mod session;
 mod sub;
+mod upgrade;
 
 use anyhow::Result;
 use clap::Parser;
@@ -40,5 +41,9 @@ async fn main() -> Result<()> {
         cli::Command::Kill { sel } => sub::kill(sel.session).await,
         cli::Command::Send { sel, text } => sub::send(sel.session, text).await,
         cli::Command::Prune { dry_run } => sub::prune(dry_run).await,
+        cli::Command::Upgrade => {
+            let code = upgrade::run()?;
+            std::process::exit(code);
+        }
     }
 }
