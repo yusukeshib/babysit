@@ -1,13 +1,10 @@
-mod agent;
 mod cli;
 mod control;
-mod keys;
 mod pane;
 mod paths;
 mod run;
 mod session;
 mod sub;
-mod tui;
 
 use anyhow::Result;
 use clap::Parser;
@@ -28,7 +25,8 @@ async fn main() -> Result<()> {
                 cli::print_help();
                 std::process::exit(2);
             }
-            run::run(cli.prompt, cli.agent, cli.cmd).await
+            let code = run::run(cli.cmd).await?;
+            std::process::exit(code);
         }
     }
 }

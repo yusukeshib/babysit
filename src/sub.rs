@@ -34,7 +34,6 @@ pub async fn list(json: bool) -> Result<()> {
                     "id": m.id,
                     "name": m.name,
                     "cmd": m.cmd,
-                    "agent": m.agent,
                     "state": s.state,
                     "alive": is_owner_alive(m, s),
                     "exit_code": s.exit_code,
@@ -48,16 +47,15 @@ pub async fn list(json: bool) -> Result<()> {
         println!("(no sessions)");
     } else {
         println!(
-            "{:<10} {:<14} {:<10} {:<8} {:<10} CMD",
-            "ID", "NAME", "AGENT", "STATE", "AGE"
+            "{:<10} {:<14} {:<8} {:<10} CMD",
+            "ID", "NAME", "STATE", "AGE"
         );
         for (m, s) in &entries {
             let age = format_age(m.started_at, Utc::now());
             println!(
-                "{:<10} {:<14} {:<10} {:<8} {:<10} {}",
+                "{:<10} {:<14} {:<8} {:<10} {}",
                 m.id,
                 m.name.as_deref().unwrap_or("-"),
-                m.agent.as_deref().unwrap_or("-"),
                 state_label_for(Some(m), s),
                 age,
                 m.cmd.join(" "),
@@ -89,9 +87,6 @@ pub async fn status(session: Option<String>, json: bool) -> Result<()> {
             println!("cmd:     {}", m.cmd.join(" "));
             if let Some(name) = m.name.as_deref() {
                 println!("name:    {name}");
-            }
-            if let Some(agent) = m.agent.as_deref() {
-                println!("agent:   {agent}");
             }
         }
         println!("state:   {}", state_label_for(meta.as_ref(), &s));
