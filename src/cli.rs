@@ -86,4 +86,6 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Self-update to the latest version
+    Upgrade,
 }
