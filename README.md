@@ -6,6 +6,9 @@ Gives local terminal commands an API, so external AI agents (Claude
 Code, Codex, …) can query their live output and exit state — the same
 way they already query `gcloud` or `kubectl`.
 
+**Your shell** — wrap the command you'd normally run. babysit prints a
+session id, then runs the command transparently:
+
 ```console
 $ babysit -- make local-ci
 babysit session ab12: make local-ci
@@ -15,17 +18,41 @@ Running tests...
 ✓ test_a
 ✗ test_b: assertion failed
 make: *** [local-ci] Error 1
-$ echo $?
-2
 ```
 
-Then, from another terminal, hand the session id to your agent:
+**Your agent, in another terminal** — hand it the session id (`ab12`)
+and it can pull state on demand:
 
-> *"hey, can you tell me if anything goes wrong on babysit session `ab12`?"*
+```console
+$ babysit status -s ab12
+session: ab12
+cmd:     make local-ci
+state:   exit:2
+exit:    2
 
-The agent calls `babysit log` / `babysit status` to read state. babysit
-does no monitoring of its own — it exposes the wrapped command as a
-small CLI/file API; the agent decides when and how to use it.
+$ babysit log -s ab12 --tail 3
+✓ test_a
+✗ test_b: assertion failed
+make: *** [local-ci] Error 1
+```
+
+babysit does no monitoring of its own — it exposes the wrapped command
+as a small CLI/file API; the agent decides when and how to use it.
+
+## Example prompts
+
+Once you've handed your agent the session id, the prompts that work
+well are the kind you'd give a coworker keeping an eye on the run:
+
+> Watch session `ab12` with the `babysit` CLI. Tell me when
+> `make local-ci` finishes, and if it fails, summarize which tests
+> broke and why.
+
+> Keep an eye on session `ab12` using the `babysit` command. Ping me
+> only if something goes wrong.
+
+The agent polls `babysit status` / `babysit log` on its own loop —
+babysit itself does not push notifications.
 
 ## Why
 
@@ -62,17 +89,30 @@ Once installed, `babysit upgrade` self-updates to the latest release.
 ## Subcommands
 
 ```
-babysit -- <cmd> [args…]                    # wrap a command (short form)
-babysit run [--name NAME] <cmd> [args…]     # wrap a command (named form)
-babysit list [--json]                       # all sessions          (alias: ls)
-babysit status -s <id> [--json]             # state of wrapped cmd  (aliases: st, info)
-babysit log -s <id> [--tail N] [--raw]      # output, ANSI stripped (alias: logs)
-babysit restart -s <id>                     # kill + respawn        (alias: r)
-babysit kill -s <id>                        # terminate it          (alias: stop)
-babysit send -s <id> "<text>"               # write text + newline  (alias: type)
-babysit prune [--dry-run]                   # delete finished / dead sessions
-babysit upgrade                             # self-update to latest release
+$ babysit help
+Wrap a shell command in a PTY and expose it to external agents via subcommands
+
+Usage: babysit <COMMAND>
+
+Commands:
+  run      Wrap a shell command in a PTY and expose it via the other subcommands
+  list     List all babysit sessions
+  status   Show status of a session
+  log      Show recent output from the wrapped command
+  restart  Restart the wrapped command
+  kill     Terminate the wrapped command
+  send     Send text to the wrapped command's stdin (newline appended)
+  prune    Delete sessions whose wrapped command has finished or whose owner died
+  upgrade  Self-update to the latest version
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
 ```
+
+Run `babysit help <command>` for flags and aliases. `babysit -- <cmd>`
+is a short form for `babysit run <cmd>`.
 
 `-s <id>` is shorthand for `--session <id>` and accepts either the id,
 a name set via `--name`, or the literal string `latest`. From inside
