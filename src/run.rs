@@ -28,9 +28,14 @@ pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<i32> {
     // Print the session id banner *before* raw mode so it stays in the
     // user's scrollback. They can paste this id into a Claude / Codex
     // session running in another terminal.
-    println!("babysit session {id}: {cmd_title}");
-    println!("  babysit log -s {id} --tail 200");
-    println!("  babysit status -s {id}");
+    let (on, off) = if std::io::stdout().is_terminal() {
+        ("\x1b[1;36m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    println!("babysit session {on}{id}{off}: {cmd_title}");
+    println!("  babysit log -s {on}{id}{off} --tail 200");
+    println!("  babysit status -s {on}{id}{off}");
     let _ = std::io::stdout().flush();
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));

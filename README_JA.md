@@ -6,6 +6,9 @@
 Code, Codex, …）がライブ出力と終了状態を、`gcloud` や `kubectl` を
 クエリするのと同じ感覚でクエリできる。
 
+**自分のシェル** — 普段通りに動かしたいコマンドをラップする。babysit が
+セッション ID を表示し、コマンドはそのまま透過的に実行される:
+
 ```console
 $ babysit -- make local-ci
 babysit session ab12: make local-ci
@@ -15,18 +18,42 @@ Running tests...
 ✓ test_a
 ✗ test_b: assertion failed
 make: *** [local-ci] Error 1
-$ echo $?
-2
 ```
 
-別ターミナルのエージェントに、表示されたセッション ID をそのまま渡す:
+**別ターミナルのエージェント** — セッション ID（`ab12`）を渡せば、必要な
+タイミングで状態を引きにいける:
 
-> *「babysit セッション `ab12` で何かおかしくなってないか見てくれる？」*
+```console
+$ babysit status -s ab12
+session: ab12
+cmd:     make local-ci
+state:   exit:2
+exit:    2
 
-エージェントは `babysit log` / `babysit status` で状態を読みに行く。
+$ babysit log -s ab12 --tail 3
+✓ test_a
+✗ test_b: assertion failed
+make: *** [local-ci] Error 1
+```
+
 babysit 自身は監視を一切行わず、ラップされたコマンドを小さな
 CLI / ファイル API として公開するだけ。いつ・どう使うかはエージェントが
 決める。
+
+## プロンプト例
+
+セッション ID を渡したら、走り続けるコマンドを見ててくれる同僚に
+頼むような感覚でプロンプトを書ける:
+
+> `babysit` っていう CLI でセッション `ab12` を見ててほしい。
+> `make local-ci` が終わったら教えて、コケてたらどのテストがどう
+> 落ちたか要約して。
+
+> `babysit` コマンドでセッション `ab12` を見張っといて。何かおかしく
+> なった時だけ知らせて。
+
+エージェントが自身のループで `babysit status` / `babysit log` を叩く
+仕組みで、babysit 側からプッシュ通知を出すわけではない。
 
 ## なぜ作ったか
 
@@ -65,17 +92,30 @@ cargo install --git https://github.com/yusukeshib/babysit
 ## サブコマンド
 
 ```
-babysit -- <cmd> [args…]                    # コマンドをラップ（短縮形）
-babysit run [--name NAME] <cmd> [args…]     # コマンドをラップ（名前付き形）
-babysit list [--json]                       # 全セッション           (alias: ls)
-babysit status -s <id> [--json]             # ラップ中コマンドの状態 (aliases: st, info)
-babysit log -s <id> [--tail N] [--raw]      # 出力（ANSI 除去済み）  (alias: logs)
-babysit restart -s <id>                     # kill + 再起動          (alias: r)
-babysit kill -s <id>                        # 終了させる             (alias: stop)
-babysit send -s <id> "<text>"               # テキスト + 改行を送る  (alias: type)
-babysit prune [--dry-run]                   # 終了済み / dead セッションを削除
-babysit upgrade                             # 最新リリースに自己アップデート
+$ babysit help
+Wrap a shell command in a PTY and expose it to external agents via subcommands
+
+Usage: babysit <COMMAND>
+
+Commands:
+  run      Wrap a shell command in a PTY and expose it via the other subcommands
+  list     List all babysit sessions
+  status   Show status of a session
+  log      Show recent output from the wrapped command
+  restart  Restart the wrapped command
+  kill     Terminate the wrapped command
+  send     Send text to the wrapped command's stdin (newline appended)
+  prune    Delete sessions whose wrapped command has finished or whose owner died
+  upgrade  Self-update to the latest version
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
 ```
+
+各コマンドのフラグやエイリアスは `babysit help <command>` で見られる。
+`babysit -- <cmd>` は `babysit run <cmd>` の短縮形。
 
 `-s <id>` は `--session <id>` の短縮形で、ID か `--name` で付けた名前、
 または `latest` という文字列を受け付ける。ラップされたコマンドの内側
