@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -98,4 +98,17 @@ pub enum Command {
     },
     /// Self-update to the latest version
     Upgrade,
+    /// Print shell integration (completions) to eval from your shell rc,
+    /// e.g. `eval "$(babysit config zsh)"`.
+    Config {
+        /// Shell to emit integration for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum Shell {
+    Zsh,
+    Bash,
 }

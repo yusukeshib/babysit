@@ -107,6 +107,7 @@ Commands:
   send     Send text to the wrapped command's stdin (newline appended)
   prune    Delete sessions whose wrapped command has finished or whose owner died
   upgrade  Self-update to the latest version
+  config   Print shell integration (completions)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -151,6 +152,22 @@ $ # すぐにプロンプトが戻る。あとはエージェントが ci をポ
 `babysit <unknown>` は未知のサブコマンドとして扱われ（`did you mean …?`
 のヒント付き）、ラップ実行とはみなされない。ラップしたい場合は
 `babysit -- <cmd>` か `babysit run <cmd>` を使うこと。
+
+## シェル統合
+
+`babysit config` を eval すると補完が有効になる:
+
+```sh
+# zsh (~/.zshrc)
+eval "$(babysit config zsh)"
+
+# bash (~/.bashrc)
+eval "$(babysit config bash)"
+```
+
+サブコマンドとそのエイリアス、各コマンドのフラグ、そして最も便利な点として
+`-s` のセッション ID 補完（`~/.babysit/sessions` を直接読む。`latest` も含む）
+が効くようになる。`babysit run` はシェル本来のコマンド補完に委譲する。
 
 ## ディスク上のセッション状態
 

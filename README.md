@@ -104,6 +104,7 @@ Commands:
   send     Send text to the wrapped command's stdin (newline appended)
   prune    Delete sessions whose wrapped command has finished or whose owner died
   upgrade  Self-update to the latest version
+  config   Print shell integration (completions)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -149,6 +150,23 @@ control socket and will fail if the babysit process is gone.
 `babysit <unknown>` is treated as an unknown subcommand (with a
 `did you mean …?` hint), not as a wrap attempt — use `babysit -- <cmd>`
 or `babysit run <cmd>` to wrap.
+
+## Shell integration
+
+Add completions to your shell by eval'ing `babysit config`:
+
+```sh
+# zsh (~/.zshrc)
+eval "$(babysit config zsh)"
+
+# bash (~/.bashrc)
+eval "$(babysit config bash)"
+```
+
+This completes subcommands and their aliases, per-command flags, and —
+most usefully — live session ids for `-s` (read straight from
+`~/.babysit/sessions`, plus the `latest` selector). `babysit run`
+delegates to your shell's normal command completion.
 
 ## Session state on disk
 
