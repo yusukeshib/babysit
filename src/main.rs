@@ -67,5 +67,12 @@ async fn main() -> Result<()> {
             let code = upgrade::run()?;
             std::process::exit(code);
         }
+        cli::Command::Config { shell } => {
+            match shell {
+                cli::Shell::Zsh => print!("{}", include_str!("completions/babysit.zsh")),
+                cli::Shell::Bash => print!("{}", include_str!("completions/babysit.bash")),
+            }
+            Ok(())
+        }
     }
 }
