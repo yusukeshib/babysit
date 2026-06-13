@@ -11,13 +11,34 @@ use std::thread;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<i32> {
-    let id = session::new_unique_id().await;
+pub async fn run(
+    cmd: Vec<String>,
+    id: Option<String>,
+    detach: bool,
+    detached_id: Option<String>,
+) -> Result<i32> {
     let cmd_title = cmd.join(" ");
+
+    // Parent side of `-d`: pick the id, print the banner, then re-exec a copy
+    // of ourselves detached (own session, stdio → /dev/null) so the wrapped
+    // command keeps running after this process and the user's shell return.
+    // The worker copy is invoked with --detached-id and lands below.
+    if detach && detached_id.is_none() {
+        let session_id = session::make_id(id).await?;
+        print_banner(&session_id, &cmd_title);
+        spawn_detached(&cmd, &session_id)?;
+        return Ok(0);
+    }
+
+    // Either an attached run, or the detached worker (which carries the id the
+    // parent already validated and announced).
+    let id = match detached_id {
+        Some(worker_id) => worker_id,
+        None => session::make_id(id).await?,
+    };
 
     let meta = Meta {
         id: id.clone(),
-        name,
         cmd: cmd.clone(),
         babysit_pid: std::process::id(),
         started_at: Utc::now(),
@@ -27,16 +48,9 @@ pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<i32> {
 
     // Print the session id banner *before* raw mode so it stays in the
     // user's scrollback. They can paste this id into a Claude / Codex
-    // session running in another terminal.
-    let (on, off) = if std::io::stdout().is_terminal() {
-        ("\x1b[1;36m", "\x1b[0m")
-    } else {
-        ("", "")
-    };
-    println!("babysit session {on}{id}{off}: {cmd_title}");
-    println!("  babysit log -s {on}{id}{off} --tail 200");
-    println!("  babysit status -s {on}{id}{off}");
-    let _ = std::io::stdout().flush();
+    // session running in another terminal. (For the detached worker this
+    // goes to /dev/null; the parent already printed the visible banner.)
+    print_banner(&id, &cmd_title);
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
@@ -162,6 +176,59 @@ pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<i32> {
     drop(_raw);
 
     Ok(exit_code.unwrap_or(if signaled { 130 } else { 0 }))
+}
+
+/// Print the session-id banner. Goes to the user's terminal for an attached
+/// run (and for the `-d` parent); for the detached worker stdout is
+/// /dev/null, so it's a no-op there.
+fn print_banner(id: &str, cmd_title: &str) {
+    let (on, off) = if std::io::stdout().is_terminal() {
+        ("\x1b[1;36m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    println!("babysit session {on}{id}{off}: {cmd_title}");
+    println!("  babysit log -s {on}{id}{off} --tail 200");
+    println!("  babysit status -s {on}{id}{off}");
+    let _ = std::io::stdout().flush();
+}
+
+/// Re-exec babysit as a detached worker that supervises `cmd` in the
+/// background. The worker gets its own session (setsid) so it survives the
+/// parent and the user's shell exiting, and its stdio is detached to
+/// /dev/null (output is still captured to the session log). The chosen `id`
+/// is handed down so the worker adopts the same session id the parent just
+/// announced.
+fn spawn_detached(cmd: &[String], id: &str) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().context("locating the babysit executable")?;
+    let mut command = Command::new(exe);
+    command.arg("run").arg("--detached-id").arg(id);
+    command.arg("--").args(cmd);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New session: detach from the controlling terminal and the parent's
+        // process group so the worker isn't killed when the shell exits or
+        // sends Ctrl-C to the foreground group.
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setsid().map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                Ok(())
+            });
+        }
+    }
+
+    command
+        .spawn()
+        .context("spawning detached babysit worker")?;
+    Ok(())
 }
 
 fn spawn_stdin_forwarder(active: Arc<RwLock<Arc<Pane>>>) {
