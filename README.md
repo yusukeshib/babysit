@@ -40,10 +40,15 @@ Then `babysit upgrade` self-updates to the latest release.
 | `run` | Wrap a command in a PTY (`babysit -- <cmd>` is shorthand; `-d` starts it detached in the background) |
 | `list` (`ls`) | List all sessions |
 | `status` | Show a session's state and exit code |
-| `log` | Show output; `--tail N`, `--since <off> --json`, `--follow` for incremental/live reads |
+| `log` | Show output; `--tail N`, `--grep <re>`, `--since <off> --json`, `--follow` for incremental/live reads |
 | `screenshot` (`shot`) | Render the *current* screen via a virtual terminal — see below |
-| `send` | Send text to the command's stdin |
+| `send` | Send text to the command's stdin (`-n`/`--no-newline` to omit the newline) |
+| `key` | Send named keys (`Enter`, `Up`, `Esc`, `C-c`, `F1`, …) |
+| `expect` | Block until a regex appears in the output (expect-style) |
+| `wait-idle` | Block until output has been quiet for `--settle` |
 | `wait` | Block until the command exits, returning its exit code |
+| `resize` | Resize the wrapped command's terminal (`COLSxROWS`) |
+| `flag` / `unflag` | Flag a session for human attention (shown with ⚑ in `ls`) / clear it |
 | `restart` | Restart the wrapped command |
 | `kill` | Terminate the wrapped command |
 | `attach` / `detach` | Attach your terminal to a session (detach: `Ctrl-\ Ctrl-\`) / detach others |
@@ -60,6 +65,37 @@ session (or `latest`); inside the wrapped command it's implicit via
 - `babysit run -d` — start detached, return immediately (survives your shell).
 - `--no-tty` — use plain pipes instead of a PTY, for clean line-oriented logs.
 - `--timeout <30s|10m|2h>` — auto-terminate a hung run.
+- `--idle-timeout <5m>` — auto-terminate if the command goes silent for that long.
+- `--size <120x40>` — fix the terminal size so a TUI lays out deterministically.
+
+### Driving a TUI to completion (agent loop)
+
+```sh
+id=$(babysit run -d -- some-tui | awk '{print $3; exit}')  # or use --id
+babysit expect -s "$id" 'ready>'        # wait until it's ready
+babysit screenshot -s "$id" --trim      # read the CURRENT screen
+babysit key -s "$id" Down Down Enter    # navigate with named keys
+babysit send -s "$id" 'some text'       # or type a line
+babysit wait -s "$id"                    # block for the exit code
+```
+
+- **`expect`** scans the whole log by default, so an already-printed marker
+  still matches. To wait for a response to a *specific* action race-free,
+  capture `output_bytes` from `status --json` before the action and pass it as
+  `expect --since <bytes>`; use `--from-now` for pure streaming semantics.
+- **Cheap polling:** `status --json` reports `output_bytes` and `screen_seq`.
+  If neither changed since your last poll, nothing moved — skip the screenshot.
+- **`log --grep <re>`** filters server-side so you only read matching lines.
+
+### Human handoff
+
+When the agent needs a human (approval, a captcha, an ambiguous prompt):
+
+```sh
+babysit flag -s "$id" 'need approval to deploy'   # ⚑ shows in `babysit ls`
+babysit attach -s "$id"                            # a human takes over
+babysit unflag -s "$id"                            # clear once handled
+```
 
 ## `babysit screenshot`
 

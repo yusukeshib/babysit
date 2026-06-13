@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -97,6 +97,28 @@ pub struct Pane {
     /// Virtual terminal: every output byte is fed here so we can render the
     /// current visible screen for `babysit screenshot`.
     screen: Arc<Mutex<vt100::Parser>>,
+    /// Output activity counters, updated by the reader thread(s).
+    activity: Arc<Activity>,
+}
+
+/// Cheap, lock-free probes for "has output changed?" and "how long since the
+/// last output?", shared with the reader thread(s).
+///
+/// * `seq` increments on every output chunk, so an agent can poll `status`
+///   and tell whether the screen moved without re-fetching a screenshot.
+/// * `last_ms` is the epoch-millis timestamp of the most recent output (seeded
+///   at spawn), so the worker can enforce an idle timeout.
+pub struct Activity {
+    pub seq: AtomicU64,
+    pub last_ms: AtomicU64,
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -207,6 +229,12 @@ impl Pane {
         // Virtual terminal sized to the PTY (no scrollback: a screenshot is a
         // single visible frame). Kept in sync with the PTY via `resize`.
         let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        // Seed `last_ms` at spawn so idle time is measured from start, not from
+        // the first byte of output.
+        let activity = Arc::new(Activity {
+            seq: AtomicU64::new(0),
+            last_ms: AtomicU64::new(now_ms()),
+        });
 
         // One reader thread per output stream (PTY: 1; pipe: stdout + stderr).
         // `reader_done` fires when the last of them drains and sees EOF.
@@ -217,6 +245,7 @@ impl Pane {
                 log_path.clone(),
                 hub.clone(),
                 screen.clone(),
+                activity.clone(),
                 remaining.clone(),
                 reader_done.clone(),
             );
@@ -274,6 +303,7 @@ impl Pane {
             exit_notify,
             reader_done,
             screen,
+            activity,
         })
     }
 
@@ -323,6 +353,17 @@ impl Pane {
         self.exit_status.lock().ok().and_then(|g| *g)
     }
 
+    /// Monotonic counter of output chunks seen so far. An agent can compare it
+    /// across `status` polls to cheaply tell whether the screen has moved.
+    pub fn screen_seq(&self) -> u64 {
+        self.activity.seq.load(Ordering::Relaxed)
+    }
+
+    /// Milliseconds since the most recent output (or since spawn if none yet).
+    pub fn idle_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.activity.last_ms.load(Ordering::Relaxed))
+    }
+
     /// Signal the child to terminate (best-effort). Uses the independent
     /// killer so it works even while the wait thread is blocked in `wait()`.
     pub fn kill(&self) {
@@ -340,6 +381,7 @@ fn spawn_output_reader(
     log_path: Option<PathBuf>,
     hub: Arc<OutputHub>,
     screen: Arc<Mutex<vt100::Parser>>,
+    activity: Arc<Activity>,
     remaining: Arc<AtomicUsize>,
     reader_done: Arc<tokio::sync::Notify>,
 ) {
@@ -353,6 +395,8 @@ fn spawn_output_reader(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    activity.seq.fetch_add(1, Ordering::Relaxed);
+                    activity.last_ms.store(now_ms(), Ordering::Relaxed);
                     if let Ok(mut p) = screen.lock() {
                         p.process(&buf[..n]);
                     }

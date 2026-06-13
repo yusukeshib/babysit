@@ -43,8 +43,16 @@ pub enum Request {
         #[serde(default)]
         trim: bool,
     },
-    /// Send text + newline to the wrapped command's stdin.
-    Send { text: String },
+    /// Send text to the wrapped command's stdin. A trailing newline is
+    /// appended unless `newline` is false (default true, for back-compat with
+    /// older clients that omit the field).
+    Send {
+        text: String,
+        #[serde(default = "default_true")]
+        newline: bool,
+    },
+    /// Resize the PTY (and the virtual terminal) to the given dimensions.
+    Resize { cols: u16, rows: u16 },
     /// Restart the wrapped command (kill + respawn with the same argv).
     Restart,
     /// Terminate the wrapped command (SIGHUP).
@@ -59,6 +67,10 @@ pub enum Request {
     },
     /// Detach any currently-attached clients, leaving the command running.
     Detach,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,7 +219,20 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
     match req {
         Request::Status => {
             let status = session::read_status(&handle.session_id).await?;
-            Ok(serde_json::to_value(status)?)
+            let mut obj = serde_json::to_value(status)?;
+            // Augment with cheap-to-poll liveness metrics so an agent can tell
+            // whether output advanced without re-fetching a screenshot/log.
+            if let serde_json::Value::Object(map) = &mut obj {
+                let path = paths::output_log_path(&handle.session_id)?;
+                let output_bytes = tokio::fs::metadata(&path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let screen_seq = handle.cmd_pane.lock().await.clone().screen_seq();
+                map.insert("output_bytes".into(), output_bytes.into());
+                map.insert("screen_seq".into(), screen_seq.into());
+            }
+            Ok(obj)
         }
         Request::Log { tail, raw } => {
             let path = paths::output_log_path(&handle.session_id)?;
@@ -217,11 +242,20 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
             let pane = handle.cmd_pane.lock().await.clone();
             Ok(pane.screenshot(format, trim))
         }
-        Request::Send { text } => {
+        Request::Send { text, newline } => {
             let pane = handle.cmd_pane.lock().await.clone();
             pane.write_input(text.as_bytes());
-            pane.write_input(b"\n");
-            Ok(serde_json::json!({"sent": text.len() + 1}))
+            let mut sent = text.len();
+            if newline {
+                pane.write_input(b"\n");
+                sent += 1;
+            }
+            Ok(serde_json::json!({ "sent": sent }))
+        }
+        Request::Resize { cols, rows } => {
+            let pane = handle.cmd_pane.lock().await.clone();
+            pane.resize(rows, cols);
+            Ok(serde_json::json!({ "cols": cols, "rows": rows }))
         }
         Request::Kill => {
             let pane = handle.cmd_pane.lock().await.clone();
