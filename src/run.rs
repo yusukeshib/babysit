@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 pub async fn run(
     cmd: Vec<String>,
-    name: Option<String>,
+    id: Option<String>,
     detach: bool,
     detached_id: Option<String>,
 ) -> Result<i32> {
@@ -24,22 +24,21 @@ pub async fn run(
     // command keeps running after this process and the user's shell return.
     // The worker copy is invoked with --detached-id and lands below.
     if detach && detached_id.is_none() {
-        let id = session::new_unique_id().await;
-        print_banner(&id, &cmd_title);
-        spawn_detached(&cmd, name.as_deref(), &id)?;
+        let session_id = session::make_id(id).await?;
+        print_banner(&session_id, &cmd_title);
+        spawn_detached(&cmd, &session_id)?;
         return Ok(0);
     }
 
     // Either an attached run, or the detached worker (which carries the id the
-    // parent already announced).
+    // parent already validated and announced).
     let id = match detached_id {
-        Some(id) => id,
-        None => session::new_unique_id().await,
+        Some(worker_id) => worker_id,
+        None => session::make_id(id).await?,
     };
 
     let meta = Meta {
         id: id.clone(),
-        name,
         cmd: cmd.clone(),
         babysit_pid: std::process::id(),
         started_at: Utc::now(),
@@ -200,15 +199,12 @@ fn print_banner(id: &str, cmd_title: &str) {
 /// /dev/null (output is still captured to the session log). The chosen `id`
 /// is handed down so the worker adopts the same session id the parent just
 /// announced.
-fn spawn_detached(cmd: &[String], name: Option<&str>, id: &str) -> Result<()> {
+fn spawn_detached(cmd: &[String], id: &str) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe().context("locating the babysit executable")?;
     let mut command = Command::new(exe);
     command.arg("run").arg("--detached-id").arg(id);
-    if let Some(name) = name {
-        command.arg("--name").arg(name);
-    }
     command.arg("--").args(cmd);
     command
         .stdin(Stdio::null())

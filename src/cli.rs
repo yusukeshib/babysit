@@ -18,8 +18,8 @@ pub struct Cli {
 /// Resolution: --session arg → $BABYSIT_SESSION_ID env → most recently active.
 #[derive(clap::Args, Debug, Clone)]
 pub struct SessionSel {
-    /// Session id or name (defaults to $BABYSIT_SESSION_ID or `latest`)
-    #[arg(short = 's', long, value_name = "ID_OR_NAME")]
+    /// Session id (defaults to $BABYSIT_SESSION_ID or `latest`)
+    #[arg(short = 's', long, value_name = "ID")]
     pub session: Option<String>,
 }
 
@@ -27,9 +27,10 @@ pub struct SessionSel {
 pub enum Command {
     /// Wrap a shell command in a PTY and expose it via the other subcommands
     Run {
-        /// Optional name for the session (visible in `babysit list`)
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
+        /// Session id to assign (default: auto-generated). Must be unique;
+        /// allowed characters: ASCII letters, digits, `-`, `_`, `.`.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
         /// Run detached: start the command in the background and return
         /// immediately. babysit keeps supervising it; query later with
         /// `babysit log`/`status`.

@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub id: String,
-    pub name: Option<String>,
     pub cmd: Vec<String>,
     pub babysit_pid: u32,
     pub started_at: DateTime<Utc>,
@@ -55,6 +54,53 @@ pub fn is_pid_alive(pid: u32) -> bool {
         kill(Pid::from_raw(pid as i32), None),
         Ok(_) | Err(Errno::EPERM)
     )
+}
+
+/// Resolve the session id for a new run: validate a user-supplied `--id`,
+/// or auto-generate a unique one when none was given.
+pub async fn make_id(requested: Option<String>) -> Result<String> {
+    match requested {
+        Some(id) => {
+            validate_id(&id)?;
+            let dir = paths::session_dir(&id)?;
+            if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+                return Err(anyhow!(
+                    "session `{id}` already exists; pick another --id or run `babysit prune`"
+                ));
+            }
+            Ok(id)
+        }
+        None => Ok(new_unique_id().await),
+    }
+}
+
+/// Reject ids that aren't safe as a directory name or that collide with
+/// reserved words. Keeps a user-supplied `--id` from escaping the sessions
+/// directory (path traversal) or shadowing `latest`.
+fn validate_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(anyhow!("session id must not be empty"));
+    }
+    if id.len() > 64 {
+        return Err(anyhow!("session id too long (max 64 characters)"));
+    }
+    if id == "latest" {
+        return Err(anyhow!(
+            "`latest` is reserved and can't be used as a session id"
+        ));
+    }
+    if id == "." || id == ".." {
+        return Err(anyhow!("`.` and `..` are not valid session ids"));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(anyhow!(
+            "session id may only contain ASCII letters, digits, `-`, `_`, `.`"
+        ));
+    }
+    Ok(())
 }
 
 /// Generate a short, human-friendly session id ("3a7f"-style).
@@ -161,17 +207,9 @@ async fn resolve_one(s: &str) -> Result<String> {
     if s == "latest" {
         return resolve_latest().await;
     }
-    // Match by id first, then by name.
     let ids = list_ids().await?;
     if ids.iter().any(|i| i == s) {
         return Ok(s.to_string());
-    }
-    for id in &ids {
-        if let Ok(meta) = read_meta(id).await
-            && meta.name.as_deref() == Some(s)
-        {
-            return Ok(id.clone());
-        }
     }
     Err(anyhow!("no session matching `{s}`"))
 }

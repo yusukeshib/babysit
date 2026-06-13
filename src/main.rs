@@ -38,12 +38,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         cli::Command::Run {
-            name,
+            id,
             detach,
             detached_id,
             cmd,
         } => {
-            let code = run::run(cmd, name, detach, detached_id).await?;
+            let code = run::run(cmd, id, detach, detached_id).await?;
             std::process::exit(code);
         }
         cli::Command::List { json } => sub::list(json).await,
