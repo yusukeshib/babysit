@@ -145,6 +145,17 @@ pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<i32> {
         }
     }
 
+    // The child has been reaped, but the reader thread may still be flushing
+    // the final bytes of PTY output to stdout and the log. Give it a brief
+    // window to drain before we tear the process down, so we don't truncate
+    // the tail of the output. Bounded so a wrapped command that leaves
+    // background processes holding the PTY open can't wedge shutdown.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        current_pane.reader_done.notified(),
+    )
+    .await;
+
     control::cleanup(&id);
 
     // Drop _raw → terminal restored before we return.

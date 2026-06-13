@@ -16,9 +16,9 @@ use std::thread;
 pub struct Pane {
     pub writer: Mutex<Box<dyn Write + Send>>,
     pub master: Mutex<Box<dyn MasterPty + Send>>,
-    /// Independent signaller for the child. Kept separate from `child` so
-    /// `kill()` never has to contend with the wait thread, which holds the
-    /// `child` lock for the entire duration of its blocking `wait()`.
+    /// Independent signaller for the child. Kept separate from the child
+    /// handle (which the wait thread holds locked for the entire duration of
+    /// its blocking `wait()`) so `kill()` never has to contend with it.
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// OS process id of the child, if known.
     pub pid: Option<u32>,
@@ -26,6 +26,10 @@ pub struct Pane {
     pub exit_status: Arc<Mutex<Option<ExitInfo>>>,
     /// Notified once when the child exits, so async callers can `await` it.
     pub exit_notify: Arc<tokio::sync::Notify>,
+    /// Notified once the reader thread has drained all PTY output (to stdout
+    /// and the log) and seen EOF. Lets shutdown wait for the final bytes
+    /// instead of racing `process::exit` against the last flush.
+    pub reader_done: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,27 +96,35 @@ impl Pane {
             .try_clone_reader()
             .context("cloning PTY reader")?;
         let log_path: Option<PathBuf> = output_log.map(|p| p.to_path_buf());
-        thread::spawn(move || {
-            let mut log_file =
-                log_path.and_then(|p| OpenOptions::new().create(true).append(true).open(&p).ok());
-            let stdout = std::io::stdout();
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        // Best-effort; if stdout is closed there's nothing to do.
-                        let mut out = stdout.lock();
-                        let _ = out.write_all(&buf[..n]);
-                        let _ = out.flush();
-                        if let Some(f) = log_file.as_mut() {
-                            let _ = f.write_all(&buf[..n]);
+        let reader_done = Arc::new(tokio::sync::Notify::new());
+        {
+            let reader_done = reader_done.clone();
+            thread::spawn(move || {
+                let mut log_file = log_path
+                    .and_then(|p| OpenOptions::new().create(true).append(true).open(&p).ok());
+                let stdout = std::io::stdout();
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            // Best-effort; if stdout is closed there's nothing to do.
+                            let mut out = stdout.lock();
+                            let _ = out.write_all(&buf[..n]);
+                            let _ = out.flush();
+                            if let Some(f) = log_file.as_mut() {
+                                let _ = f.write_all(&buf[..n]);
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-        });
+                // All output flushed; wake any shutdown awaiter. notify_one
+                // arms a permit so a late awaiter still observes completion.
+                reader_done.notify_waiters();
+                reader_done.notify_one();
+            });
+        }
 
         let writer = pair.master.take_writer().context("taking PTY writer")?;
         let child = Arc::new(Mutex::new(child));
@@ -165,6 +177,7 @@ impl Pane {
             pid,
             exit_status,
             exit_notify,
+            reader_done,
         })
     }
 
