@@ -74,7 +74,10 @@ _babysit() {
                     _arguments \
                         '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
                         '--tail=[Show only the last N lines]:lines:' \
-                        '--raw[Include raw ANSI escapes]'
+                        '--raw[Include raw ANSI escapes]' \
+                        '--since=[Only output bytes after this raw-log offset]:bytes:' \
+                        '(-f --follow)'{-f,--follow}'[Stream new output live until exit]' \
+                        '--json[Emit JSON {text, offset, done}]'
                     ;;
                 restart|r|kill|stop|send|type|attach|a|detach)
                     _arguments \
