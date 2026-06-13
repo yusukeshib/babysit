@@ -6,7 +6,7 @@
 //! in babysit itself — the user's terminal renders the bytes directly.
 
 use anyhow::{Context, Result};
-use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,12 @@ use std::thread;
 pub struct Pane {
     pub writer: Mutex<Box<dyn Write + Send>>,
     pub master: Mutex<Box<dyn MasterPty + Send>>,
-    pub child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    /// Independent signaller for the child. Kept separate from `child` so
+    /// `kill()` never has to contend with the wait thread, which holds the
+    /// `child` lock for the entire duration of its blocking `wait()`.
+    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// OS process id of the child, if known.
+    pub pid: Option<u32>,
     /// Latest known exit status, set by the wait thread when the child exits.
     pub exit_status: Arc<Mutex<Option<ExitInfo>>>,
     /// Notified once when the child exits, so async callers can `await` it.
@@ -68,6 +73,10 @@ impl Pane {
             .slave
             .spawn_command(builder)
             .with_context(|| format!("spawning {:?}", cmd))?;
+        // Grab an independent killer + the pid up front, before `child` is
+        // moved behind a mutex the wait thread will hold while blocked.
+        let killer = child.clone_killer();
+        let pid = child.process_id();
         // Drop slave — the child has it. Keeping it open in the parent
         // prevents EOF on master read when the child exits.
         drop(pair.slave);
@@ -120,10 +129,20 @@ impl Pane {
                     guard.wait()
                 };
                 let info = match status {
-                    Ok(s) => ExitInfo {
-                        code: s.exit_code().try_into().ok(),
-                        signaled: !s.success() && s.exit_code() == 0,
-                    },
+                    Ok(s) => {
+                        // portable_pty reports signal termination via
+                        // `signal()`; the numeric `exit_code()` is a
+                        // placeholder (1) in that case, so don't surface it.
+                        let signaled = s.signal().is_some();
+                        ExitInfo {
+                            code: if signaled {
+                                None
+                            } else {
+                                s.exit_code().try_into().ok()
+                            },
+                            signaled,
+                        }
+                    }
                     Err(_) => ExitInfo {
                         code: None,
                         signaled: true,
@@ -142,7 +161,8 @@ impl Pane {
         Ok(Self {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
-            child,
+            killer: Mutex::new(killer),
+            pid,
             exit_status,
             exit_notify,
         })
@@ -177,10 +197,11 @@ impl Pane {
         self.exit_status.lock().ok().and_then(|g| *g)
     }
 
-    /// Send SIGTERM (best-effort kill).
+    /// Signal the child to terminate (best-effort). Uses the independent
+    /// killer so it works even while the wait thread is blocked in `wait()`.
     pub fn kill(&self) {
-        if let Ok(mut g) = self.child.lock() {
-            let _ = g.kill();
+        if let Ok(mut k) = self.killer.lock() {
+            let _ = k.kill();
         }
     }
 }
