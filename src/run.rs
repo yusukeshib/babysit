@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{mpsc, watch};
 
 /// Entry point for `babysit run` / `babysit -- …` / `babysit -d -- …`.
@@ -95,6 +96,7 @@ async fn serve_worker(cmd: Vec<String>, id: String) -> Result<()> {
     let (exit_tx, exit_rx) = watch::channel::<Option<ExitInfo>>(None);
     let (detach_tx, _detach_rx0) = watch::channel::<u64>(0);
     let detach_tx = Arc::new(detach_tx);
+    let attached = Arc::new(AtomicUsize::new(0));
     let handle = Handle::new(
         id.clone(),
         pane.clone(),
@@ -102,6 +104,7 @@ async fn serve_worker(cmd: Vec<String>, id: String) -> Result<()> {
         hub.clone(),
         exit_rx,
         detach_tx,
+        attached.clone(),
     );
     control::serve(handle.clone()).await?;
 
@@ -154,9 +157,13 @@ async fn serve_worker(cmd: Vec<String>, id: String) -> Result<()> {
         signaled: true,
     })));
 
-    // Give attached clients a beat to flush queued output + the exit frame
-    // before we tear the socket down.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait (bounded) for attached clients to flush the remaining output and
+    // the exit frame and disconnect, so the live view isn't truncated. The
+    // on-disk log already has everything regardless.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while attached.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     control::cleanup(&id);
     Ok(())
 }

@@ -18,6 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
@@ -101,6 +102,9 @@ pub struct Handle {
     pub exit_rx: watch::Receiver<Option<ExitInfo>>,
     /// Bumped to force-detach all currently-attached clients.
     pub detach_tx: Arc<watch::Sender<u64>>,
+    /// Count of currently-attached clients, so shutdown can wait for them to
+    /// drain the final output + exit frame before tearing the socket down.
+    pub attached: Arc<AtomicUsize>,
 }
 
 impl Handle {
@@ -111,6 +115,7 @@ impl Handle {
         hub: Arc<OutputHub>,
         exit_rx: watch::Receiver<Option<ExitInfo>>,
         detach_tx: Arc<watch::Sender<u64>>,
+        attached: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             session_id,
@@ -119,6 +124,7 @@ impl Handle {
             hub,
             exit_rx,
             detach_tx,
+            attached,
         }
     }
 
@@ -239,6 +245,10 @@ async fn handle_attach(
     cols: u16,
     rows: u16,
 ) -> Result<()> {
+    // Track this client so worker shutdown can wait for it to drain.
+    handle.attached.fetch_add(1, Ordering::SeqCst);
+    let _attached_guard = AttachedGuard(handle.attached.clone());
+
     // Apply the client's terminal size to the PTY up front.
     if cols > 0 && rows > 0 {
         handle.cmd_pane.lock().await.clone().resize(rows, cols);
@@ -351,6 +361,16 @@ pub fn last_n_lines(text: &str, n: usize) -> String {
         }
     }
     text[start..].to_string()
+}
+
+/// Decrements the attached-client counter when an attach handler ends, on
+/// any exit path.
+struct AttachedGuard(Arc<AtomicUsize>);
+
+impl Drop for AttachedGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Best-effort cleanup: remove the socket file. Called on graceful shutdown.
