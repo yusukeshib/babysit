@@ -153,7 +153,7 @@ pub async fn screenshot(session: Option<String>, format: ShotFormat, trim: bool)
             // Worker not running: render from the log on disk.
             let path = paths::output_log_path(&id)?;
             let bytes = tokio::fs::read(&path).await.unwrap_or_default();
-            crate::pane::render_log(&bytes, format, trim)
+            crate::render::render_log(&bytes, format, trim)
         }
     };
 
@@ -208,10 +208,10 @@ async fn read_slice(path: &std::path::Path, off: u64, raw: bool) -> Result<(Stri
 }
 
 async fn is_finished(id: &str) -> bool {
-    matches!(
-        session::read_status(id).await.map(|s| s.state),
-        Ok(State::Exited | State::Killed)
-    )
+    session::read_status(id)
+        .await
+        .map(|s| s.state.is_terminal())
+        .unwrap_or(false)
 }
 
 /// Stream new log output to stdout until the session finishes (tail -f style).
