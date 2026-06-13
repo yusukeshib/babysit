@@ -41,6 +41,9 @@ _babysit() {
                 'stop:Terminate the wrapped command'
                 'send:Send text to the wrapped command stdin'
                 'type:Send text to the wrapped command stdin'
+                'attach:Attach your terminal to a session (detach: Ctrl-\ Ctrl-\)'
+                'a:Attach your terminal to a session (detach: Ctrl-\ Ctrl-\)'
+                'detach:Detach any terminal attached to a session'
                 'prune:Delete finished or dead sessions'
                 'upgrade:Self-update to the latest version'
                 'config:Output shell integration (eval "$(babysit config zsh)")'
@@ -70,7 +73,7 @@ _babysit() {
                         '--tail=[Show only the last N lines]:lines:' \
                         '--raw[Include raw ANSI escapes]'
                     ;;
-                restart|r|kill|stop|send|type)
+                restart|r|kill|stop|send|type|attach|a|detach)
                     _arguments \
                         '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions'
                     ;;
@@ -80,6 +83,7 @@ _babysit() {
                 config)
                     if (( CURRENT == 2 )); then
                         local -a shells
+                        # shellcheck disable=SC2034  # used by _describe below
                         shells=('zsh:Zsh integration' 'bash:Bash integration')
                         _describe 'shell' shells
                     fi

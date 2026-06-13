@@ -112,6 +112,8 @@ Commands:
   restart  Restart the wrapped command
   kill     Terminate the wrapped command
   send     Send text to the wrapped command's stdin (newline appended)
+  attach   Attach your terminal to a session (detach with Ctrl-\ Ctrl-\)
+  detach   Detach any terminal currently attached to a session
   prune    Delete sessions whose wrapped command has finished or whose owner died
   upgrade  Self-update to the latest version
   config   Print shell integration (completions)
@@ -133,23 +135,47 @@ ID は一意で、使える文字は英数字・`-`・`_`・`.` のみ。
 受け付ける。ラップされたコマンドの内側からは `$BABYSIT_SESSION_ID`
 経由でセッションが暗黙に決まるので、フラグは省略可能。
 
-## デタッチモード
+## アタッチ / デタッチ
+
+ラップしたコマンドは常に PTY を所有するバックグラウンドワーカー
+の下で走り、見ている端末はそのワーカーに**アタッチ**しているだけ
+（tmux 風）。なのでコマンドを止めずに出たり入ったりできる:
+
+```console
+$ babysit run -- make local-ci    # アタッチして実行（自動アタッチ）
+…                                 # Ctrl-\ Ctrl-\ でデタッチ
+$ babysit attach -s ci            # あとでどこからでも再アタッチ
+$ babysit detach -s ci            # アタッチ中の端末を外す（コマンドは継続）
+```
+
+- **デタッチホットキー:** `Ctrl-\ Ctrl-\`（Ctrl-バックスラッシュを 2 回）。
+  コマンドを走らせたままシェルに戻る。（Ctrl-Q はフロー制御、
+  Ctrl-P は pi 等の TUI が使うので避けた。）
+- **フルスクリーンの TUI**（エディタ、`pi` など）は拡張キーボード
+  モードを有効化して制御キーを別エンコードするため、ホットキーが
+  検出されないことがある。その場合は別端末から `babysit detach -s <id>`
+  でデタッチする（キー入力に依存しないので必ず効く）。デタッチ時に
+  babysit が端末（alt-screen/mouse など）をリセットするのでシェルは使える状態で戻る。
+- `babysit attach -s <id>` は直近の出力を再生してからライブを
+  ストリームし、キー入力・リサイズを転送する。
+- `babysit detach -s <id>` は別の端末からクライアントを外す。
+
+### デタッチで起動（`-d`）
 
 `babysit -d -- <cmd>`（または `babysit run -d -- <cmd>`）はコマンドを
-バックグラウンドで起動して即座に戻り、デタッチされた babysit ワーカー
-が監視を続ける:
+バックグラウンドで起動して即座に戻り、アタッチはしない:
 
 ```console
 $ babysit -d --id ci -- make local-ci
 babysit session ci: make local-ci
   babysit log -s ci --tail 200
-  babysit status -s ci
-$ # すぐにプロンプトが戻る。あとはエージェントが ci をポーリングする
+  babysit attach -s ci
+$ # すぐにプロンプトが戻る。エージェントが ci をポーリングしてもよいし、アタッチしてもよい
 ```
 
-ワーカーはこのシェルが終了しても生き残る。ライブ出力は端末には流れ
-ない（端末が繋がっていないため）が、セッションログには記録されるので、
-`babysit log`/`status`/`send`/`kill` はアタッチ時と同じように動く。
+ワーカーはこのシェルが終了しても生き残る。出力はアタッチの有無に
+関わらずセッションログに記録されるので、`babysit log`/`status`/`send`/`kill`
+はどちらでも同じように動く。
 
 `status` と `log` は babysit 自身が終了した後でも動く（ディスク上の
 状態ファイルにフォールバックする）。`restart`, `kill`, `send` はライブの
