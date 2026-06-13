@@ -117,10 +117,31 @@ Options:
 各コマンドのフラグやエイリアスは `babysit help <command>` で見られる。
 `babysit -- <cmd>` は `babysit run <cmd>` の短縮形。
 
-`-s <id>` は `--session <id>` の短縮形で、ID か `--name` で付けた名前、
-または `latest` という文字列を受け付ける。ラップされたコマンドの内側
-からは `$BABYSIT_SESSION_ID` 経由でセッションが暗黙に決まるので、
-フラグは省略可能。
+セッション ID はデフォルトで自動採番されるが、`run` に `--id <id>` を
+渡せば自分で指定できる（例: `babysit run --id ci -- make local-ci`）。
+ID は一意で、使える文字は英数字・`-`・`_`・`.` のみ。
+
+`-s <id>` は `--session <id>` の短縮形で、ID か `latest` という文字列を
+受け付ける。ラップされたコマンドの内側からは `$BABYSIT_SESSION_ID`
+経由でセッションが暗黙に決まるので、フラグは省略可能。
+
+## デタッチモード
+
+`babysit -d -- <cmd>`（または `babysit run -d -- <cmd>`）はコマンドを
+バックグラウンドで起動して即座に戻り、デタッチされた babysit ワーカー
+が監視を続ける:
+
+```console
+$ babysit -d --id ci -- make local-ci
+babysit session ci: make local-ci
+  babysit log -s ci --tail 200
+  babysit status -s ci
+$ # すぐにプロンプトが戻る。あとはエージェントが ci をポーリングする
+```
+
+ワーカーはこのシェルが終了しても生き残る。ライブ出力は端末には流れ
+ない（端末が繋がっていないため）が、セッションログには記録されるので、
+`babysit log`/`status`/`send`/`kill` はアタッチ時と同じように動く。
 
 `status` と `log` は babysit 自身が終了した後でも動く（ディスク上の
 状態ファイルにフォールバックする）。`restart`, `kill`, `send` はライブの

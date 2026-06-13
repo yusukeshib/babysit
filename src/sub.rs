@@ -32,7 +32,6 @@ pub async fn list(json: bool) -> Result<()> {
             .map(|(m, s)| {
                 serde_json::json!({
                     "id": m.id,
-                    "name": m.name,
                     "cmd": m.cmd,
                     "state": s.state,
                     "alive": is_owner_alive(m, s),
@@ -46,16 +45,12 @@ pub async fn list(json: bool) -> Result<()> {
     } else if entries.is_empty() {
         println!("(no sessions)");
     } else {
-        println!(
-            "{:<10} {:<14} {:<8} {:<10} CMD",
-            "ID", "NAME", "STATE", "AGE"
-        );
+        println!("{:<10} {:<8} {:<10} CMD", "ID", "STATE", "AGE");
         for (m, s) in &entries {
             let age = format_age(m.started_at, Utc::now());
             println!(
-                "{:<10} {:<14} {:<8} {:<10} {}",
+                "{:<10} {:<8} {:<10} {}",
                 m.id,
-                m.name.as_deref().unwrap_or("-"),
                 state_label_for(Some(m), s),
                 age,
                 m.cmd.join(" "),
@@ -85,9 +80,6 @@ pub async fn status(session: Option<String>, json: bool) -> Result<()> {
         println!("session: {id}");
         if let Some(m) = meta.as_ref() {
             println!("cmd:     {}", m.cmd.join(" "));
-            if let Some(name) = m.name.as_deref() {
-                println!("name:    {name}");
-            }
         }
         println!("state:   {}", state_label_for(meta.as_ref(), &s));
         if let Some(c) = s.exit_code {
