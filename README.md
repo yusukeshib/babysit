@@ -6,6 +6,9 @@ PTY and records everything it prints; from any terminal you can read its output,
 screenshot its current screen, send input, wait for it to exit, or attach to it
 interactively (tmux-style detach and re-attach).
 
+This makes it easy for a script — or an AI coding agent like Claude Code or
+Codex — to drive a command it didn't start and react to what it does.
+
 ```console
 $ babysit -- make local-ci       # wrap a command; prints a session id (e.g. ab12)
 $ babysit log -s ab12 --tail 20  # read recent output from anywhere
