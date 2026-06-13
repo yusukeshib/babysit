@@ -18,7 +18,7 @@ _babysit() {
 	local cur prev words cword
 	_init_completion || return
 
-	local subcommands="run list ls status st info log logs screenshot shot restart r kill stop send type wait attach a detach prune upgrade config help"
+	local subcommands="run list ls status st info log logs screenshot shot send type key expect wait-idle wait resize flag unflag restart r kill stop attach a detach prune upgrade config help"
 
 	if [[ $cword -eq 1 ]]; then
 		COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -34,12 +34,21 @@ _babysit() {
 	case "${words[1]}" in
 	run)
 		case "$cur" in
-		-*) COMPREPLY=($(compgen -W "--id -d --detach --no-tty --timeout" -- "$cur")) ;;
+		-*) COMPREPLY=($(compgen -W "--id -d --detach --no-tty --timeout --idle-timeout --size" -- "$cur")) ;;
 		*) COMPREPLY=($(compgen -c -- "$cur")) ;;
 		esac
 		;;
 	wait)
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --timeout" -- "$cur"))
+		;;
+	wait-idle)
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --settle --timeout" -- "$cur"))
+		;;
+	expect)
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --timeout --since --from-now --raw --json" -- "$cur"))
+		;;
+	key | resize | flag | unflag)
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session" -- "$cur"))
 		;;
 	list | ls)
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json" -- "$cur"))
@@ -48,7 +57,7 @@ _babysit() {
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --json" -- "$cur"))
 		;;
 	log | logs)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --tail --raw --since -f --follow --json" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --tail --grep --raw --since -f --follow --json" -- "$cur"))
 		;;
 	screenshot | shot)
 		case "$prev" in
@@ -59,7 +68,10 @@ _babysit() {
 		esac
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --format --trim" -- "$cur"))
 		;;
-	restart | r | kill | stop | send | type | attach | a | detach)
+	send | type)
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session -n --no-newline" -- "$cur"))
+		;;
+	restart | r | kill | stop | attach | a | detach)
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session" -- "$cur"))
 		;;
 	prune)

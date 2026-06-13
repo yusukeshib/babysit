@@ -43,7 +43,13 @@ _babysit() {
                 'stop:Terminate the wrapped command'
                 'send:Send text to the wrapped command stdin'
                 'type:Send text to the wrapped command stdin'
+                'key:Send named keys (Enter, Up, Esc, C-c, F1, …)'
+                'expect:Block until a regex appears in the output'
+                'wait-idle:Block until output has been quiet for a while'
                 'wait:Block until the command exits and return its code'
+                'resize:Resize the wrapped command terminal (COLSxROWS)'
+                'flag:Flag a session for human attention'
+                'unflag:Clear a session attention flag'
                 'attach:Attach your terminal to a session (detach: Ctrl-\ Ctrl-\)'
                 'a:Attach your terminal to a session (detach: Ctrl-\ Ctrl-\)'
                 'detach:Detach any terminal attached to a session'
@@ -61,6 +67,8 @@ _babysit() {
                         '(-d --detach)'{-d,--detach}'[Run detached in the background]' \
                         '--no-tty[Use pipes instead of a PTY (clean line output)]' \
                         '--timeout=[Auto-terminate after e.g. 30s, 10m, 2h]:duration:' \
+                        '--idle-timeout=[Auto-terminate after this long with no output]:duration:' \
+                        '--size=[Initial terminal size COLSxROWS]:size:' \
                         '(-)1:command:_command_names -e' \
                         '*::arguments:_normal'
                     ;;
@@ -76,6 +84,7 @@ _babysit() {
                     _arguments \
                         '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
                         '--tail=[Show only the last N lines]:lines:' \
+                        '--grep=[Only show lines matching this regex]:regex:' \
                         '--raw[Include raw ANSI escapes]' \
                         '--since=[Only output bytes after this raw-log offset]:bytes:' \
                         '(-f --follow)'{-f,--follow}'[Stream new output live until exit]' \
@@ -87,9 +96,29 @@ _babysit() {
                         '--format=[Output format]:format:(plain ansi json)' \
                         '--trim[Drop trailing blank lines and whitespace]'
                     ;;
-                restart|r|kill|stop|send|type|attach|a|detach)
+                send|type)
+                    _arguments \
+                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '(-n --no-newline)'{-n,--no-newline}'[Do not append a trailing newline]'
+                    ;;
+                restart|r|kill|stop|attach|a|detach|key|resize|flag|unflag)
                     _arguments \
                         '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions'
+                    ;;
+                expect)
+                    _arguments \
+                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--timeout=[Give up after e.g. 30s, 2m; exits 124]:duration:' \
+                        '--since=[Start scanning from this raw-log byte offset]:bytes:' \
+                        '--from-now[Only match output produced from now on]' \
+                        '--raw[Match against raw output incl. ANSI escapes]' \
+                        '--json[Emit JSON {matched, offset}]'
+                    ;;
+                wait-idle)
+                    _arguments \
+                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--settle=[Required quiet period, e.g. 500ms, 2s]:duration:' \
+                        '--timeout=[Give up after e.g. 30s; exits 124]:duration:'
                     ;;
                 wait)
                     _arguments \
