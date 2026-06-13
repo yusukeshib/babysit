@@ -28,6 +28,7 @@ pub async fn run(
     timeout: Option<String>,
     idle_timeout: Option<String>,
     size: Option<String>,
+    json: bool,
 ) -> Result<i32> {
     // Parse the inputs up front so a bad value errors before we spawn.
     let timeout = timeout.as_deref().map(parse_duration).transpose()?;
@@ -43,7 +44,13 @@ pub async fn run(
 
     // Parent: choose the id, announce it, spawn the worker.
     let session_id = session::make_id(id).await?;
-    print_banner(&session_id, &cmd.join(" "));
+    if json {
+        // Machine-readable: an agent captures `.id` without scraping prose.
+        println!("{}", serde_json::json!({ "id": session_id }));
+        let _ = std::io::stdout().flush();
+    } else {
+        print_banner(&session_id, &cmd.join(" "));
+    }
     spawn_worker_process(&cmd, &session_id, no_tty, timeout, idle_timeout, size)?;
 
     if detach {
@@ -290,6 +297,19 @@ fn spawn_worker_process(
     Ok(())
 }
 
+/// Parse a `--timeout` value into an optional deadline. The sentinels `0`,
+/// `none`, `off`, `never` (and the empty string) mean "no timeout" and yield
+/// `None`; everything else parses as a normal duration. A zero duration
+/// (e.g. `0s`) is also treated as "no timeout".
+pub fn parse_timeout(s: &str) -> Result<Option<Duration>> {
+    let t = s.trim();
+    if t.is_empty() || matches!(t.to_ascii_lowercase().as_str(), "none" | "off" | "never") {
+        return Ok(None);
+    }
+    let d = parse_duration(t)?;
+    Ok(if d.is_zero() { None } else { Some(d) })
+}
+
 /// Parse a human duration like `500ms`, `30s`, `10m`, `2h`, `1d`, or a bare
 /// number of seconds, into a `Duration`.
 pub fn parse_duration(s: &str) -> Result<Duration> {
@@ -341,8 +361,22 @@ pub fn parse_size(s: &str) -> Result<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_duration;
+    use super::{parse_duration, parse_timeout};
     use std::time::Duration;
+
+    #[test]
+    fn timeout_sentinels_mean_infinite() {
+        // `0`, zero durations and the word forms => no deadline.
+        assert_eq!(parse_timeout("0").unwrap(), None);
+        assert_eq!(parse_timeout("0s").unwrap(), None);
+        assert_eq!(parse_timeout("none").unwrap(), None);
+        assert_eq!(parse_timeout("OFF").unwrap(), None);
+        assert_eq!(parse_timeout("never").unwrap(), None);
+        assert_eq!(parse_timeout("").unwrap(), None);
+        // A real duration parses through.
+        assert_eq!(parse_timeout("30s").unwrap(), Some(Duration::from_secs(30)));
+        assert!(parse_timeout("abc").is_err());
+    }
 
     #[test]
     fn parses_units_and_bare_seconds() {

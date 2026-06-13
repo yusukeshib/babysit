@@ -28,23 +28,27 @@ MODEL
   re-attach, and query state from anywhere. State lives in ~/.babysit/sessions/<id>/.
 
 SELECTING A SESSION
-  `run` prints a session id. Other commands take `-s <id>` (or `latest`). Inside
-  the wrapped command the id is exported as $BABYSIT_SESSION_ID, so nested calls
-  can omit -s.
+  `run --json` prints the session id as JSON. Other commands take `-s <id>`;
+  there is no most-recent fallback, so name the session you mean. Inside the
+  wrapped command the id is in $BABYSIT_SESSION_ID, so nested calls can omit -s.
 
 AGENT LOOP (typical)
-  1. babysit run -d -- <cmd>           start detached; note the session id
+  1. babysit run -d --json -- <cmd>    start detached; capture .id from the JSON
   2. babysit expect -s ID 'prompt>'    block until the program is ready
      babysit wait-idle -s ID           …or block until output settles
   3. babysit screenshot -s ID --trim   read the CURRENT screen (TUIs redraw in place)
      babysit log -s ID --tail 50       …or the raw output stream
-  4. babysit send -s ID 'text'         type a line; or:
+  4. babysit send -s ID --json 'text'  type a line; returns {sent, offset}
      babysit key  -s ID Down Down Enter press named keys (arrows, Esc, C-c, F1…)
-  5. repeat 2–4 until done, then:
+  5. babysit expect -s ID --since OFF 're'   wait for the reply race-free, using
+                                             the `offset` returned by step 4
+  6. repeat 2–5 until done, then:
      babysit wait -s ID                block for the exit code
 
   Poll cheaply: `status --json` reports `output_bytes` and `screen_seq`; if they
-  haven't changed, nothing moved — no need to re-fetch a screenshot.
+  haven't changed, nothing moved — no need to re-fetch a screenshot. Blocking
+  commands (expect, wait-idle) time out after 30s by default so a stuck program
+  can't hang you; pass --timeout 0 to wait indefinitely.
 
 HUMAN HANDOFF
   Stuck or need approval? `babysit flag -s ID 'why'` marks the session (shown with
@@ -54,10 +58,11 @@ HUMAN HANDOFF
 
 /// Session selector flag, shared across read/operate subcommands.
 ///
-/// Resolution: --session arg → $BABYSIT_SESSION_ID env → most recently active.
+/// Resolution: --session arg → $BABYSIT_SESSION_ID env. There is no
+/// "most recently active" fallback — a missing selector errors out.
 #[derive(clap::Args, Debug, Clone)]
 pub struct SessionSel {
-    /// Session id (defaults to $BABYSIT_SESSION_ID or `latest`)
+    /// Session id (defaults to $BABYSIT_SESSION_ID; required otherwise)
     #[arg(short = 's', long, value_name = "ID")]
     pub session: Option<String>,
 }
@@ -96,6 +101,10 @@ pub enum Command {
         /// (default 80x24; an attaching client overrides it).
         #[arg(long, value_name = "COLSxROWS")]
         size: Option<String>,
+        /// Print the session id as JSON (`{"id":"..."}`) instead of the human
+        /// banner — the machine-readable way for an agent to capture the id.
+        #[arg(long)]
+        json: bool,
         /// The command to wrap, plus its arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         cmd: Vec<String>,
@@ -159,7 +168,9 @@ pub enum Command {
     Wait {
         #[command(flatten)]
         sel: SessionSel,
-        /// Give up waiting after this long (e.g. 30s, 10m); exits 124.
+        /// Give up waiting after this long; exits 124 (e.g. 30s, 10m). No
+        /// default — `wait` blocks until exit; guard long unattended runs with
+        /// `run --timeout`/`--idle-timeout`. `0`/`none` also mean wait forever.
         #[arg(long, value_name = "DUR")]
         timeout: Option<String>,
     },
@@ -168,12 +179,18 @@ pub enum Command {
     Restart {
         #[command(flatten)]
         sel: SessionSel,
+        /// Emit a JSON result instead of a human message
+        #[arg(long)]
+        json: bool,
     },
     /// Terminate the wrapped command
     #[command(alias = "stop")]
     Kill {
         #[command(flatten)]
         sel: SessionSel,
+        /// Emit a JSON result instead of a human message
+        #[arg(long)]
+        json: bool,
     },
     /// Send text to the wrapped command's stdin (newline appended)
     #[command(alias = "type")]
@@ -185,6 +202,11 @@ pub enum Command {
         /// Don't append a trailing newline
         #[arg(short = 'n', long = "no-newline")]
         no_newline: bool,
+        /// Emit JSON `{sent, offset}`. `offset` is the raw-log byte position
+        /// just before the input was injected — pass it to `expect --since`
+        /// to wait for the response race-free.
+        #[arg(long)]
+        json: bool,
     },
     /// Send named keys to the wrapped command (Enter, Tab, Esc, Up, Down,
     /// Left, Right, Home, End, PageUp, PageDown, Delete, Backspace, Space,
@@ -195,6 +217,10 @@ pub enum Command {
         /// One or more key names, applied in order
         #[arg(required = true, num_args = 1.., value_name = "KEY")]
         keys: Vec<String>,
+        /// Emit JSON `{sent, offset}`. `offset` is the raw-log byte position
+        /// just before the keys were injected — pass it to `expect --since`.
+        #[arg(long)]
+        json: bool,
     },
     /// Block until a regex appears in the output (expect-style)
     Expect {
@@ -203,12 +229,15 @@ pub enum Command {
         /// Regex to wait for
         #[arg(value_name = "REGEX")]
         pattern: String,
-        /// Give up after this long; exits 124 (e.g. 30s, 2m)
-        #[arg(long, value_name = "DUR")]
-        timeout: Option<String>,
+        /// Give up after this long; exits 124. Defaults to 30s so a missing
+        /// marker can't hang an agent forever; pass `0`/`none` to wait
+        /// indefinitely (e.g. 30s, 2m).
+        #[arg(long, value_name = "DUR", default_value = "30s")]
+        timeout: String,
         /// Start scanning from this raw-log byte offset. Capture it from
-        /// `status --json` (`output_bytes`) BEFORE the action that triggers the
-        /// output, to wait for that specific response race-free.
+        /// `send`/`key --json` (`offset`) or `status --json` (`output_bytes`)
+        /// BEFORE the action that triggers the output, to wait for that
+        /// specific response race-free.
         #[arg(long, value_name = "BYTES")]
         since: Option<u64>,
         /// Only match output produced from now on (ignore the existing log).
@@ -230,9 +259,10 @@ pub enum Command {
         /// Required quiet period (e.g. 500ms, 2s)
         #[arg(long, default_value = "500ms", value_name = "DUR")]
         settle: String,
-        /// Give up after this long; exits 124
-        #[arg(long, value_name = "DUR")]
-        timeout: Option<String>,
+        /// Give up after this long; exits 124. Defaults to 30s; pass
+        /// `0`/`none` to wait indefinitely.
+        #[arg(long, value_name = "DUR", default_value = "30s")]
+        timeout: String,
     },
     /// Resize the wrapped command's terminal
     Resize {
@@ -241,6 +271,9 @@ pub enum Command {
         /// New size as COLSxROWS (e.g. 120x40)
         #[arg(value_name = "COLSxROWS")]
         size: String,
+        /// Emit a JSON result instead of a human message
+        #[arg(long)]
+        json: bool,
     },
     /// Flag a session for human attention, with an optional note
     Flag {
@@ -249,11 +282,17 @@ pub enum Command {
         /// Note explaining why attention is needed
         #[arg(value_name = "MESSAGE")]
         message: Option<String>,
+        /// Emit a JSON result instead of a human message
+        #[arg(long)]
+        json: bool,
     },
     /// Clear a session's attention flag
     Unflag {
         #[command(flatten)]
         sel: SessionSel,
+        /// Emit a JSON result instead of a human message
+        #[arg(long)]
+        json: bool,
     },
     /// Attach your terminal to a session (detach with Ctrl-\ Ctrl-\)
     #[command(alias = "a")]
@@ -265,12 +304,18 @@ pub enum Command {
     Detach {
         #[command(flatten)]
         sel: SessionSel,
+        /// Emit a JSON result instead of a human message
+        #[arg(long)]
+        json: bool,
     },
     /// Delete sessions whose wrapped command has finished or whose owner died
     Prune {
         /// Print what would be deleted, but don't delete
         #[arg(long)]
         dry_run: bool,
+        /// Emit the deleted/would-delete sessions as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Self-update to the latest version
     Upgrade,

@@ -240,9 +240,23 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
         }
         Request::Screenshot { format, trim } => {
             let pane = handle.cmd_pane.lock().await.clone();
-            Ok(pane.screenshot(format, trim))
+            let mut data = pane.screenshot(format, trim);
+            // Stamp the frame sequence so an agent can dedup screenshots
+            // (skip re-rendering when `screen_seq` hasn't advanced).
+            if let serde_json::Value::Object(map) = &mut data {
+                map.insert("screen_seq".into(), pane.screen_seq().into());
+            }
+            Ok(data)
         }
         Request::Send { text, newline } => {
+            // Capture the log size BEFORE injecting input: this is the
+            // race-free offset to hand to `expect --since` so it scans only
+            // the output the command produces in response.
+            let path = paths::output_log_path(&handle.session_id)?;
+            let offset = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
             let pane = handle.cmd_pane.lock().await.clone();
             pane.write_input(text.as_bytes());
             let mut sent = text.len();
@@ -250,7 +264,7 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
                 pane.write_input(b"\n");
                 sent += 1;
             }
-            Ok(serde_json::json!({ "sent": sent }))
+            Ok(serde_json::json!({ "sent": sent, "offset": offset }))
         }
         Request::Resize { cols, rows } => {
             let pane = handle.cmd_pane.lock().await.clone();

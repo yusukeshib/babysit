@@ -1,8 +1,7 @@
 # Bash completion for babysit. Source via: eval "$(babysit config bash)"
 
-# Echo known session ids (directories under ~/.babysit/sessions) plus the
-# `latest` selector. Read straight from disk so completion never spawns
-# babysit.
+# Echo known session ids (directories under ~/.babysit/sessions). Read
+# straight from disk so completion never spawns babysit.
 __babysit_sessions() {
 	local dir="$HOME/.babysit/sessions" out=""
 	if [[ -d "$dir" ]]; then
@@ -11,7 +10,7 @@ __babysit_sessions() {
 			[[ -d "$sess" ]] && out+=" $(basename "$sess")"
 		done
 	fi
-	printf '%s latest' "$out"
+	printf '%s' "$out"
 }
 
 _babysit() {
@@ -34,7 +33,7 @@ _babysit() {
 	case "${words[1]}" in
 	run)
 		case "$cur" in
-		-*) COMPREPLY=($(compgen -W "--id -d --detach --no-tty --timeout --idle-timeout --size" -- "$cur")) ;;
+		-*) COMPREPLY=($(compgen -W "--id -d --detach --no-tty --timeout --idle-timeout --size --json" -- "$cur")) ;;
 		*) COMPREPLY=($(compgen -c -- "$cur")) ;;
 		esac
 		;;
@@ -48,7 +47,7 @@ _babysit() {
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --timeout --since --from-now --raw --json" -- "$cur"))
 		;;
 	key | resize | flag | unflag)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --json" -- "$cur"))
 		;;
 	list | ls)
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json" -- "$cur"))
@@ -69,13 +68,16 @@ _babysit() {
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --format --trim" -- "$cur"))
 		;;
 	send | type)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session -n --no-newline" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session -n --no-newline --json" -- "$cur"))
 		;;
-	restart | r | kill | stop | attach | a | detach)
+	restart | r | kill | stop | detach)
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --json" -- "$cur"))
+		;;
+	attach | a)
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session" -- "$cur"))
 		;;
 	prune)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--dry-run" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--dry-run --json" -- "$cur"))
 		;;
 	config)
 		[[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "zsh bash" -- "$cur"))

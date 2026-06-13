@@ -80,7 +80,21 @@ pub async fn status(session: Option<String>, json: bool) -> Result<()> {
     let resp = request(&id, &Request::Status).await;
     let data = match resp {
         Ok(r) if r.ok => r.data,
-        _ => serde_json::to_value(session::read_status(&id).await?)?,
+        _ => {
+            // Disk fallback (worker dead). Keep the same shape an agent polls
+            // for: `output_bytes` is always derivable from the log size;
+            // `screen_seq` is live-only, so report it as null.
+            let mut obj = serde_json::to_value(session::read_status(&id).await?)?;
+            if let serde_json::Value::Object(map) = &mut obj {
+                let output_bytes = match paths::output_log_path(&id) {
+                    Ok(p) => tokio::fs::metadata(&p).await.map(|m| m.len()).unwrap_or(0),
+                    Err(_) => 0,
+                };
+                map.insert("output_bytes".into(), output_bytes.into());
+                map.insert("screen_seq".into(), serde_json::Value::Null);
+            }
+            obj
+        }
     };
     if json {
         let mut out = serde_json::Map::new();
@@ -241,6 +255,12 @@ async fn emit_log(id: &str, text: String, offset: u64, json: bool) -> Result<()>
 
 /// Read the raw log from byte `off` to EOF. Returns the (optionally
 /// ANSI-stripped) text plus the new raw-byte offset to resume from.
+///
+/// To keep incremental readers (`--since`, `--follow`, `expect`) from
+/// splitting a multi-byte UTF-8 char or an ANSI escape across a chunk
+/// boundary, a partial trailing sequence is held back: only the safe prefix
+/// is returned and the resume offset stops before it, so the next read picks
+/// it up once the rest has been written.
 async fn read_slice(path: &std::path::Path, off: u64, raw: bool) -> Result<(String, u64)> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut f = match tokio::fs::File::open(path).await {
@@ -255,12 +275,58 @@ async fn read_slice(path: &std::path::Path, off: u64, raw: bool) -> Result<(Stri
     f.seek(std::io::SeekFrom::Start(off)).await?;
     let mut bytes = Vec::new();
     f.read_to_end(&mut bytes).await?;
+    let safe = safe_prefix_len(&bytes);
+    let chunk = &bytes[..safe];
     let processed = if raw {
-        bytes
+        chunk.to_vec()
     } else {
-        strip_ansi_escapes::strip(&bytes)
+        strip_ansi_escapes::strip(chunk)
     };
-    Ok((String::from_utf8_lossy(&processed).into_owned(), len))
+    Ok((
+        String::from_utf8_lossy(&processed).into_owned(),
+        off + safe as u64,
+    ))
+}
+
+/// How many leading bytes of `bytes` are safe to emit right now. Holds back a
+/// trailing unterminated ANSI escape and a trailing truncated UTF-8 char so
+/// an incremental reader never splits one. Genuinely invalid mid-stream bytes
+/// are NOT held back (they'd never complete) — they fall through to lossy
+/// replacement.
+fn safe_prefix_len(bytes: &[u8]) -> usize {
+    let mut end = bytes.len();
+    // 1) Unterminated ANSI escape: if the run from the last ESC has no
+    //    terminator yet, cut before it.
+    if let Some(esc) = bytes.iter().rposition(|&b| b == 0x1b)
+        && !escape_complete(&bytes[esc..])
+    {
+        end = esc;
+    }
+    // 2) Truncated trailing UTF-8 char within [0, end): back up to where the
+    //    bytes are still valid (only for an incomplete tail, not real junk).
+    if let Err(e) = std::str::from_utf8(&bytes[..end])
+        && e.error_len().is_none()
+    {
+        end = e.valid_up_to();
+    }
+    end
+}
+
+/// True if the ANSI escape run starting at `tail[0] == ESC (0x1b)` already
+/// carries its terminator. Conservative: unknown/short forms are treated as
+/// complete so a reader never stalls on output it can't classify.
+fn escape_complete(tail: &[u8]) -> bool {
+    match tail.get(1) {
+        None => false, // lone trailing ESC — more is coming
+        // CSI `ESC [ … final`: final byte is 0x40..=0x7e.
+        Some(b'[') => tail[2..].iter().any(|&b| (0x40..=0x7e).contains(&b)),
+        // OSC `ESC ] … (BEL | ST)`: terminated by 0x07 or `ESC \`.
+        Some(b']') => tail[2..].contains(&0x07) || tail.windows(2).any(|w| w == [0x1b, b'\\']),
+        // SS3 `ESC O <byte>` (e.g. F1–F4): needs the trailing byte.
+        Some(b'O') => tail.len() >= 3,
+        // Two-byte `ESC <byte>`: already complete.
+        Some(_) => true,
+    }
 }
 
 async fn is_finished(id: &str) -> bool {
@@ -309,31 +375,58 @@ async fn follow_log(
     Ok(())
 }
 
-pub async fn restart(session: Option<String>) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let r = request(&id, &Request::Restart).await?;
-    if !r.ok {
-        return Err(anyhow!(r.error.unwrap_or_else(|| "restart failed".into())));
+/// Send a control request that needs a live worker, mapping failures to an
+/// actionable message instead of a raw socket error.
+async fn operate(id: &str, req: &Request, action: &str) -> Result<serde_json::Value> {
+    match request(id, req).await {
+        Ok(r) if r.ok => Ok(r.data),
+        Ok(r) => Err(anyhow!(
+            r.error.unwrap_or_else(|| format!("{action} failed"))
+        )),
+        Err(e) => Err(dead_worker_error(id, action, e).await),
     }
-    println!("restart queued for session {id}");
+}
+
+/// Explain why a control op couldn't reach the worker: a finished session, or
+/// a worker that's gone. Falls back to the underlying error if state is
+/// unreadable.
+async fn dead_worker_error(id: &str, action: &str, err: anyhow::Error) -> anyhow::Error {
+    match session::read_status(id).await {
+        Ok(s) if s.state.is_terminal() => anyhow!(
+            "cannot {action}: session {id} has already finished — it no longer accepts input"
+        ),
+        _ => anyhow!("cannot {action}: session {id} is not running (its worker is gone): {err}"),
+    }
+}
+
+/// Print `data` as JSON when `json`, else the human message.
+fn emit_result(json: bool, data: serde_json::Value, human: impl FnOnce() -> String) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(&data)?);
+    } else {
+        println!("{}", human());
+    }
     Ok(())
 }
 
-pub async fn kill(session: Option<String>) -> Result<()> {
+pub async fn restart(session: Option<String>, json: bool) -> Result<()> {
     let id = session::resolve(session).await?;
-    let r = request(&id, &Request::Kill).await?;
-    if !r.ok {
-        return Err(anyhow!(r.error.unwrap_or_else(|| "kill failed".into())));
-    }
-    println!("killed session {id}");
-    Ok(())
+    let data = operate(&id, &Request::Restart, "restart").await?;
+    emit_result(json, data, || format!("restart queued for session {id}"))
 }
 
-pub async fn send(session: Option<String>, text: String, newline: bool) -> Result<()> {
+pub async fn kill(session: Option<String>, json: bool) -> Result<()> {
     let id = session::resolve(session).await?;
-    let r = request(&id, &Request::Send { text, newline }).await?;
-    if !r.ok {
-        return Err(anyhow!(r.error.unwrap_or_else(|| "send failed".into())));
+    let data = operate(&id, &Request::Kill, "kill").await?;
+    emit_result(json, data, || format!("killed session {id}"))
+}
+
+pub async fn send(session: Option<String>, text: String, newline: bool, json: bool) -> Result<()> {
+    let id = session::resolve(session).await?;
+    let data = operate(&id, &Request::Send { text, newline }, "send").await?;
+    // Non-JSON success stays silent (as before); JSON returns {sent, offset}.
+    if json {
+        println!("{}", serde_json::to_string(&data)?);
     }
     Ok(())
 }
@@ -341,7 +434,7 @@ pub async fn send(session: Option<String>, text: String, newline: bool) -> Resul
 /// Send one or more named keys (e.g. `Down Down Enter`, `C-c`) to the wrapped
 /// command by encoding them to their terminal byte sequences and writing them
 /// raw (no trailing newline).
-pub async fn key(session: Option<String>, keys: Vec<String>) -> Result<()> {
+pub async fn key(session: Option<String>, keys: Vec<String>, json: bool) -> Result<()> {
     let id = session::resolve(session).await?;
     let mut bytes = Vec::new();
     for name in &keys {
@@ -352,47 +445,50 @@ pub async fn key(session: Option<String>, keys: Vec<String>) -> Result<()> {
     // Key escape sequences are ASCII, so a lossless String round-trips them
     // over the JSON `send` op without a newline.
     let text = String::from_utf8(bytes).expect("key sequences are ASCII");
-    let r = request(
+    let data = operate(
         &id,
         &Request::Send {
             text,
             newline: false,
         },
+        "send keys",
     )
     .await?;
-    if !r.ok {
-        return Err(anyhow!(r.error.unwrap_or_else(|| "key failed".into())));
+    if json {
+        println!("{}", serde_json::to_string(&data)?);
     }
     Ok(())
 }
 
 /// Resize a session's terminal from a `COLSxROWS` string.
-pub async fn resize(session: Option<String>, size: String) -> Result<()> {
+pub async fn resize(session: Option<String>, size: String, json: bool) -> Result<()> {
     let id = session::resolve(session).await?;
     let (cols, rows) = crate::run::parse_size(&size)?;
-    let r = request(&id, &Request::Resize { cols, rows }).await?;
-    if !r.ok {
-        return Err(anyhow!(r.error.unwrap_or_else(|| "resize failed".into())));
-    }
-    println!("resized session {id} to {cols}x{rows}");
-    Ok(())
+    let data = operate(&id, &Request::Resize { cols, rows }, "resize").await?;
+    emit_result(json, data, || {
+        format!("resized session {id} to {cols}x{rows}")
+    })
 }
 
 /// Flag a session for human attention, with an optional note.
-pub async fn flag(session: Option<String>, message: Option<String>) -> Result<()> {
+pub async fn flag(session: Option<String>, message: Option<String>, json: bool) -> Result<()> {
     let id = session::resolve(session).await?;
     let msg = message.unwrap_or_else(|| "needs attention".to_string());
     session::write_note(&id, &msg).await?;
-    println!("flagged session {id}: {msg}");
-    Ok(())
+    emit_result(
+        json,
+        serde_json::json!({ "flagged": true, "note": msg }),
+        || format!("flagged session {id}: {msg}"),
+    )
 }
 
 /// Clear a session's attention flag.
-pub async fn unflag(session: Option<String>) -> Result<()> {
+pub async fn unflag(session: Option<String>, json: bool) -> Result<()> {
     let id = session::resolve(session).await?;
     session::clear_note(&id).await?;
-    println!("unflagged session {id}");
-    Ok(())
+    emit_result(json, serde_json::json!({ "unflagged": true }), || {
+        format!("unflagged session {id}")
+    })
 }
 
 /// Map a key name to the bytes a terminal sends for it. Names are
@@ -446,14 +542,15 @@ fn key_to_bytes(name: &str) -> Option<Vec<u8>> {
 }
 
 /// Block until `pattern` (a regex) appears in the output, or `timeout`
-/// elapses. Scans the raw log incrementally from `since` (or the current end,
-/// unless `from_start`). Returns 0 on match, 124 on timeout, 1 if the session
+/// elapses. Scans incrementally from `since` if given, else from the current
+/// end when `from_now`, else from the start of the log (so an already-printed
+/// marker still matches). Returns 0 on match, 124 on timeout, 1 if the session
 /// ends before the pattern appears.
 #[allow(clippy::too_many_arguments)]
 pub async fn expect(
     session: Option<String>,
     pattern: String,
-    timeout: Option<String>,
+    timeout: String,
     since: Option<u64>,
     from_now: bool,
     raw: bool,
@@ -462,10 +559,7 @@ pub async fn expect(
     let id = session::resolve(session).await?;
     let path = paths::output_log_path(&id)?;
     let re = Regex::new(&pattern).context("invalid expect regex")?;
-    let timeout = timeout
-        .as_deref()
-        .map(crate::run::parse_duration)
-        .transpose()?;
+    let timeout = crate::run::parse_timeout(&timeout)?;
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
 
     // Where to start scanning. Default: the whole log, so an already-printed
@@ -522,18 +616,11 @@ pub async fn expect(
 
 /// Block until the session's output has been quiet for `settle`. Returns
 /// immediately (idle) if the session already finished; exits 124 on timeout.
-pub async fn wait_idle(
-    session: Option<String>,
-    settle: String,
-    timeout: Option<String>,
-) -> Result<i32> {
+pub async fn wait_idle(session: Option<String>, settle: String, timeout: String) -> Result<i32> {
     let id = session::resolve(session).await?;
     let path = paths::output_log_path(&id)?;
     let settle = crate::run::parse_duration(&settle)?;
-    let timeout = timeout
-        .as_deref()
-        .map(crate::run::parse_duration)
-        .transpose()?;
+    let timeout = crate::run::parse_timeout(&timeout)?;
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
 
     let mut last_size = tokio::fs::metadata(&path)
@@ -574,10 +661,10 @@ pub async fn wait_idle(
 /// terminal state, returns 137.
 pub async fn wait(session: Option<String>, timeout: Option<String>) -> Result<i32> {
     let id = session::resolve(session).await?;
-    let timeout = timeout
-        .as_deref()
-        .map(crate::run::parse_duration)
-        .transpose()?;
+    let timeout = match timeout {
+        Some(s) => crate::run::parse_timeout(&s)?,
+        None => None,
+    };
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
 
     loop {
@@ -610,7 +697,7 @@ pub async fn wait(session: Option<String>, timeout: Option<String>) -> Result<i3
 /// (exited / killed) or whose owning babysit process has died.
 ///
 /// Live sessions (running, with a live owner) are never touched.
-pub async fn prune(dry_run: bool) -> Result<()> {
+pub async fn prune(dry_run: bool, json: bool) -> Result<()> {
     let ids = session::list_ids().await?;
     let mut targets: Vec<(String, Meta)> = Vec::new();
     for id in &ids {
@@ -635,22 +722,36 @@ pub async fn prune(dry_run: bool) -> Result<()> {
     }
 
     if targets.is_empty() {
-        println!("(nothing to prune)");
+        if json {
+            println!("[]");
+        } else {
+            println!("(nothing to prune)");
+        }
         return Ok(());
     }
 
+    let mut results = Vec::new();
     for (id, meta) in &targets {
         let cmd = meta.cmd.join(" ");
         if dry_run {
-            println!("would delete {id}  {cmd}");
+            if !json {
+                println!("would delete {id}  {cmd}");
+            }
+            results.push(serde_json::json!({ "id": id, "cmd": cmd, "deleted": false }));
         } else {
             let dir = paths::session_dir(id)?;
             if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
                 eprintln!("babysit: failed to remove {}: {e}", dir.display());
                 continue;
             }
-            println!("deleted {id}  {cmd}");
+            if !json {
+                println!("deleted {id}  {cmd}");
+            }
+            results.push(serde_json::json!({ "id": id, "cmd": cmd, "deleted": true }));
         }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
     }
     Ok(())
 }
@@ -720,7 +821,7 @@ fn format_age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{grep_filter, key_to_bytes};
+    use super::{escape_complete, grep_filter, key_to_bytes, safe_prefix_len};
     use regex::Regex;
 
     #[test]
@@ -751,5 +852,52 @@ mod tests {
     #[test]
     fn grep_filter_none_is_passthrough() {
         assert_eq!(grep_filter("a\nb\n".into(), None), "a\nb\n");
+    }
+
+    #[test]
+    fn safe_prefix_holds_back_truncated_utf8() {
+        // "héllo" where é (0xc3 0xa9) is split after the lead byte.
+        let full = "héllo".as_bytes();
+        let cut = full.len() - 4; // keep "h" + lead byte of é
+        let bytes = &full[..cut];
+        let safe = safe_prefix_len(bytes);
+        // The lone lead byte 0xc3 is held back; only "h" is safe.
+        assert_eq!(safe, 1);
+        assert_eq!(&bytes[..safe], b"h");
+    }
+
+    #[test]
+    fn safe_prefix_keeps_complete_utf8() {
+        let bytes = "héllo".as_bytes();
+        assert_eq!(safe_prefix_len(bytes), bytes.len());
+    }
+
+    #[test]
+    fn safe_prefix_passes_invalid_bytes_through() {
+        // A genuinely invalid byte (0xff) mid-stream is NOT held back — it
+        // would never complete — so the whole slice is emitted (lossy later).
+        let bytes = b"ab\xffcd";
+        assert_eq!(safe_prefix_len(bytes), bytes.len());
+    }
+
+    #[test]
+    fn safe_prefix_holds_back_partial_ansi() {
+        // CSI without its final byte must be held back.
+        let bytes = b"hi\x1b[31";
+        assert_eq!(safe_prefix_len(bytes), 2);
+        // Once the final byte arrives, the whole run is safe.
+        let done = b"hi\x1b[31m";
+        assert_eq!(safe_prefix_len(done), done.len());
+    }
+
+    #[test]
+    fn escape_complete_classifies_common_forms() {
+        assert!(!escape_complete(b"\x1b")); // lone ESC
+        assert!(!escape_complete(b"\x1b[31")); // CSI, no final
+        assert!(escape_complete(b"\x1b[31m")); // CSI complete
+        assert!(!escape_complete(b"\x1b]0;title")); // OSC, no terminator
+        assert!(escape_complete(b"\x1b]0;title\x07")); // OSC + BEL
+        assert!(!escape_complete(b"\x1bO")); // SS3 prefix only
+        assert!(escape_complete(b"\x1bOP")); // SS3 complete (F1)
     }
 }
