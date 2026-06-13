@@ -18,7 +18,7 @@ _babysit() {
     local cur prev words cword
     _init_completion || return
 
-    local subcommands="run list ls status st info log logs restart r kill stop send type prune upgrade config help"
+    local subcommands="run list ls status st info log logs restart r kill stop send type attach a detach prune upgrade config help"
 
     if [[ $cword -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -47,7 +47,7 @@ _babysit() {
         log|logs)
             [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --tail --raw" -- "$cur"))
             ;;
-        restart|r|kill|stop|send|type)
+        restart|r|kill|stop|send|type|attach|a|detach)
             [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session" -- "$cur"))
             ;;
         prune)
