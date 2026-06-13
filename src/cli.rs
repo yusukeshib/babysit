@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -89,6 +90,22 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Capture the current visible screen of the wrapped command.
+    ///
+    /// Unlike `log` (which replays the raw output stream), this renders a
+    /// virtual terminal grid — so TUIs that redraw in place (menus, full-screen
+    /// apps) come out as the single frame currently on screen.
+    #[command(alias = "shot")]
+    Screenshot {
+        #[command(flatten)]
+        sel: SessionSel,
+        /// Output format: plain text, ANSI (color escapes kept), or structured JSON
+        #[arg(long, value_enum, default_value = "plain")]
+        format: ShotFormat,
+        /// Drop trailing blank lines and trailing whitespace (smaller output)
+        #[arg(long)]
+        trim: bool,
+    },
     /// Block until the wrapped command exits, then return its exit code
     Wait {
         #[command(flatten)]
@@ -149,4 +166,16 @@ pub enum Command {
 pub enum Shell {
     Zsh,
     Bash,
+}
+
+/// Screenshot rendering format.
+#[derive(ValueEnum, Serialize, Deserialize, Debug, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum ShotFormat {
+    /// Plain text grid, no escapes — cheapest for an LLM to read.
+    Plain,
+    /// Text with ANSI/SGR color escapes preserved (visual fidelity).
+    Ansi,
+    /// Structured JSON: size, cursor, and per-cell text + colors/attributes.
+    Json,
 }

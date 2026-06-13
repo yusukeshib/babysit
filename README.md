@@ -115,6 +115,7 @@ Commands:
   list     List all babysit sessions
   status   Show status of a session
   log      Show recent output from the wrapped command
+  screenshot  Capture the current visible screen (virtual terminal grid)
   restart  Restart the wrapped command
   kill     Terminate the wrapped command
   send     Send text to the wrapped command's stdin (newline appended)
@@ -142,6 +143,41 @@ Ids must be unique and contain only letters, digits, `-`, `_`, `.`.
 or the literal string `latest`. From inside the wrapped command itself
 the session is implicit via `$BABYSIT_SESSION_ID`, so the flag can be
 omitted.
+
+## Screenshot (`babysit screenshot`)
+
+`babysit log` replays the raw output *stream*. For full-screen TUIs that
+redraw in place (menus, progress UIs, `htop`, an agent's own UI) that
+stream is a mess of overdrawn frames. `babysit screenshot` instead feeds
+the output through a virtual terminal (a real VT parser + screen grid,
+the same thing your terminal does) and renders the **single frame that is
+currently on screen** — what a human would see right now.
+
+```console
+$ babysit screenshot -s ab12 --trim
+  npm
+> pnpm
+  yarn
+```
+
+Formats (for the agent reading it):
+
+- `--format plain` (default) — plain text grid, cheapest to read.
+- `--format ansi` — keeps ANSI/SGR color escapes, when color carries
+  meaning (diff red/green, the highlighted/selected row, …).
+- `--format json` — structured: screen size, cursor position, and one
+  entry per non-blank cell with its `char` and any `fg`/`bg`/`bold`/
+  `inverse`/… attributes. Use this when an agent must reliably tell which
+  row is *selected* (TUIs often mark it only with inverse video, which
+  plain text can't convey).
+
+`--trim` drops trailing blank lines (and per-line trailing whitespace) to
+keep the output small. The geometry/cursor metadata is always present in
+the `json` form; `plain`/`ansi` print just the rendered screen.
+
+If the session has already exited, the screen is reconstructed by
+replaying the on-disk log (using a default 80×24 size, since the final
+PTY dimensions aren't recorded).
 
 ## Attach / detach
 
