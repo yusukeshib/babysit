@@ -30,6 +30,15 @@ pub enum Command {
         /// Optional name for the session (visible in `babysit list`)
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// Run detached: start the command in the background and return
+        /// immediately. babysit keeps supervising it; query later with
+        /// `babysit log`/`status`.
+        #[arg(short = 'd', long)]
+        detach: bool,
+        /// Internal: session id handed down by the parent when it re-execs
+        /// itself to run detached. Not for direct use.
+        #[arg(long = "detached-id", value_name = "ID", hide = true)]
+        detached_id: Option<String>,
         /// The command to wrap, plus its arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         cmd: Vec<String>,

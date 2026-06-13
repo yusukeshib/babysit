@@ -12,26 +12,38 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Short wrap form: `babysit -- <cmd> [args…]`. Handled before clap so
-    // that `babysit listt` (a typo of `list`) goes through clap and gets
-    // a proper "did you mean 'list'?" error instead of silently being
-    // treated as a wrap of the non-existent command `listt`.
+    // Short wrap forms: `babysit [-d] -- <cmd> [args…]`. Handled before clap
+    // so that `babysit listt` (a typo of `list`) goes through clap and gets a
+    // proper "did you mean 'list'?" error instead of silently being treated
+    // as a wrap of the non-existent command `listt`.
     let raw: Vec<String> = std::env::args().collect();
-    if raw.len() >= 2 && raw[1] == "--" {
-        let cmd: Vec<String> = raw[2..].to_vec();
+    let short = match raw.get(1).map(String::as_str) {
+        Some("--") => Some((false, 2)),
+        Some("-d") | Some("--detach") if raw.get(2).map(String::as_str) == Some("--") => {
+            Some((true, 3))
+        }
+        _ => None,
+    };
+    if let Some((detach, start)) = short {
+        let cmd: Vec<String> = raw[start..].to_vec();
         if cmd.is_empty() {
             eprintln!("babysit: empty command after `--`");
             std::process::exit(2);
         }
-        let code = run::run(cmd, None).await?;
+        let code = run::run(cmd, None, detach, None).await?;
         std::process::exit(code);
     }
 
     let cli = cli::Cli::parse();
 
     match cli.command {
-        cli::Command::Run { name, cmd } => {
-            let code = run::run(cmd, name).await?;
+        cli::Command::Run {
+            name,
+            detach,
+            detached_id,
+            cmd,
+        } => {
+            let code = run::run(cmd, name, detach, detached_id).await?;
             std::process::exit(code);
         }
         cli::Command::List { json } => sub::list(json).await,
