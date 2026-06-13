@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
             eprintln!("babysit: empty command after `--`");
             std::process::exit(2);
         }
-        let code = run::run(cmd, None, detach, None, false, None, None, None).await?;
+        let code = run::run(cmd, None, detach, None, false, None, None, None, false).await?;
         std::process::exit(code);
     }
 
@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
             timeout,
             idle_timeout,
             size,
+            json,
             cmd,
         } => {
             let code = run::run(
@@ -68,6 +69,7 @@ async fn main() -> Result<()> {
                 timeout,
                 idle_timeout,
                 size,
+                json,
             )
             .await?;
             std::process::exit(code);
@@ -86,14 +88,15 @@ async fn main() -> Result<()> {
         cli::Command::Screenshot { sel, format, trim } => {
             sub::screenshot(sel.session, format, trim).await
         }
-        cli::Command::Restart { sel } => sub::restart(sel.session).await,
-        cli::Command::Kill { sel } => sub::kill(sel.session).await,
+        cli::Command::Restart { sel, json } => sub::restart(sel.session, json).await,
+        cli::Command::Kill { sel, json } => sub::kill(sel.session, json).await,
         cli::Command::Send {
             sel,
             text,
             no_newline,
-        } => sub::send(sel.session, text, !no_newline).await,
-        cli::Command::Key { sel, keys } => sub::key(sel.session, keys).await,
+            json,
+        } => sub::send(sel.session, text, !no_newline, json).await,
+        cli::Command::Key { sel, keys, json } => sub::key(sel.session, keys, json).await,
         cli::Command::Expect {
             sel,
             pattern,
@@ -115,9 +118,9 @@ async fn main() -> Result<()> {
             let code = sub::wait_idle(sel.session, settle, timeout).await?;
             std::process::exit(code);
         }
-        cli::Command::Resize { sel, size } => sub::resize(sel.session, size).await,
-        cli::Command::Flag { sel, message } => sub::flag(sel.session, message).await,
-        cli::Command::Unflag { sel } => sub::unflag(sel.session).await,
+        cli::Command::Resize { sel, size, json } => sub::resize(sel.session, size, json).await,
+        cli::Command::Flag { sel, message, json } => sub::flag(sel.session, message, json).await,
+        cli::Command::Unflag { sel, json } => sub::unflag(sel.session, json).await,
         cli::Command::Wait { sel, timeout } => {
             let code = sub::wait(sel.session, timeout).await?;
             std::process::exit(code);
@@ -126,8 +129,8 @@ async fn main() -> Result<()> {
             let code = attach::attach(sel.session).await?;
             std::process::exit(code);
         }
-        cli::Command::Detach { sel } => attach::detach(sel.session).await,
-        cli::Command::Prune { dry_run } => sub::prune(dry_run).await,
+        cli::Command::Detach { sel, json } => attach::detach(sel.session, json).await,
+        cli::Command::Prune { dry_run, json } => sub::prune(dry_run, json).await,
         cli::Command::Upgrade => {
             let code = upgrade::run()?;
             std::process::exit(code);

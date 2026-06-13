@@ -105,7 +105,7 @@ fn resize_payload(cols: u16, rows: u16) -> Vec<u8> {
 
 /// Detach an attached terminal from session `id` (the `babysit detach`
 /// subcommand). Tells the worker to drop its currently-attached clients.
-pub async fn detach(session: Option<String>) -> Result<()> {
+pub async fn detach(session: Option<String>, json: bool) -> Result<()> {
     let id = session::resolve(session).await?;
     let path = paths::control_socket_path(&id)?;
     let mut stream = UnixStream::connect(&path)
@@ -116,12 +116,16 @@ pub async fn detach(session: Option<String>) -> Result<()> {
     // Best-effort: drain the one-line response.
     let mut buf = [0u8; 256];
     let _ = stream.read(&mut buf).await;
-    println!("detached clients of session {id}");
+    if json {
+        println!("{}", serde_json::json!({ "detached": true }));
+    } else {
+        println!("detached clients of session {id}");
+    }
     Ok(())
 }
 
-/// Resolve a user-supplied selector (id / `latest`) and attach to it. Errors
-/// if no such session exists — used by `babysit attach`.
+/// Resolve a user-supplied selector (id or $BABYSIT_SESSION_ID) and attach to
+/// it. Errors if no such session exists — used by `babysit attach`.
 pub async fn attach(session: Option<String>) -> Result<i32> {
     let id = session::resolve(session).await?;
     attach_to(id).await
