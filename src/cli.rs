@@ -90,7 +90,7 @@ pub enum Command {
         /// Text to send
         text: String,
     },
-    /// Attach your terminal to a session (detach with Ctrl-P Ctrl-Q)
+    /// Attach your terminal to a session (detach with Ctrl-\ Ctrl-\)
     #[command(alias = "a")]
     Attach {
         #[command(flatten)]

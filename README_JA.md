@@ -112,7 +112,7 @@ Commands:
   restart  Restart the wrapped command
   kill     Terminate the wrapped command
   send     Send text to the wrapped command's stdin (newline appended)
-  attach   Attach your terminal to a session (detach with Ctrl-P Ctrl-Q)
+  attach   Attach your terminal to a session (detach with Ctrl-\ Ctrl-\)
   detach   Detach any terminal currently attached to a session
   prune    Delete sessions whose wrapped command has finished or whose owner died
   upgrade  Self-update to the latest version
@@ -143,13 +143,14 @@ ID は一意で、使える文字は英数字・`-`・`_`・`.` のみ。
 
 ```console
 $ babysit run -- make local-ci    # アタッチして実行（自動アタッチ）
-…                                 # Ctrl-P Ctrl-Q でデタッチ
+…                                 # Ctrl-\ Ctrl-\ でデタッチ
 $ babysit attach -s ci            # あとでどこからでも再アタッチ
 $ babysit detach -s ci            # アタッチ中の端末を外す（コマンドは継続）
 ```
 
-- **デタッチホットキー:** `Ctrl-P Ctrl-Q`（Docker のデフォルト）。
-  コマンドを走らせたままシェルに戻る。
+- **デタッチホットキー:** `Ctrl-\ Ctrl-\`（Ctrl-バックスラッシュを 2 回）。
+  コマンドを走らせたままシェルに戻る。（Ctrl-Q はフロー制御、
+  Ctrl-P は pi 等の TUI が使うので避けた。）
 - `babysit attach -s <id>` は直近の出力を再生してからライブを
   ストリームし、キー入力・リサイズを転送する。
 - `babysit detach -s <id>` は別の端末からクライアントを外す。

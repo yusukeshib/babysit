@@ -7,10 +7,12 @@
 //!   server → client:  OUTPUT(bytes) · EXIT(signaled u8, code i32 BE) · DETACHED
 //!   client → server:  INPUT(bytes) · RESIZE(cols u16 BE, rows u16 BE)
 //!
-//! The detach hotkey (Docker's default, Ctrl-P Ctrl-Q) is handled entirely
-//! client-side: the client just closes the connection and the worker keeps
-//! running. `babysit detach` is the out-of-band equivalent driven from
-//! another terminal.
+//! The detach hotkey (Ctrl-\ pressed twice) is handled entirely client-side:
+//! the client just closes the connection and the worker keeps running.
+//! `babysit detach` is the out-of-band equivalent driven from another
+//! terminal. Ctrl-\ is used instead of a flow-control key like Ctrl-Q
+//! (XON, often swallowed by the terminal) or Ctrl-P (commonly bound by
+//! TUIs/shells, e.g. history) so it doesn't collide with the wrapped app.
 
 use crate::pane::ExitInfo;
 use crate::paths;
@@ -31,6 +33,11 @@ pub const S_DETACHED: u8 = 3;
 // client → server
 pub const C_INPUT: u8 = 1;
 pub const C_RESIZE: u8 = 2;
+
+/// Detach hotkey: Ctrl-\ (FS, 0x1c) pressed twice in a row. Chosen because
+/// it's not a flow-control key and is rarely bound by interactive programs;
+/// in raw mode ISIG is off, so it arrives as a byte rather than SIGQUIT.
+const DETACH_KEY: u8 = 0x1c;
 
 /// Write one frame: `[tag][len: u32 BE][payload]`.
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(
@@ -272,27 +279,24 @@ async fn fallback_finished(id: &str) -> Result<i32> {
     Ok(recorded_exit_code(id).await)
 }
 
-/// Strip the Ctrl-P Ctrl-Q detach sequence from a stdin chunk. Returns the
-/// bytes to forward to the PTY and whether the detach sequence completed.
-/// A lone Ctrl-P is withheld until the next byte (state carried in `saw_p`).
-fn filter_detach(saw_p: &mut bool, chunk: &[u8]) -> (Vec<u8>, bool) {
+/// Strip the `Ctrl-\ Ctrl-\` detach sequence from a stdin chunk. Returns the
+/// bytes to forward to the PTY and whether the detach sequence completed. A
+/// lone `Ctrl-\` is withheld until the next byte (state carried in `saw`);
+/// if the next byte isn't another `Ctrl-\`, both are forwarded.
+fn filter_detach(saw: &mut bool, chunk: &[u8]) -> (Vec<u8>, bool) {
     let mut out = Vec::with_capacity(chunk.len() + 1);
     for &b in chunk {
-        if *saw_p {
-            *saw_p = false;
-            if b == 0x11 {
-                // Ctrl-P Ctrl-Q → detach; drop both bytes.
+        if *saw {
+            *saw = false;
+            if b == DETACH_KEY {
+                // Two in a row → detach; drop both bytes.
                 return (out, true);
             }
-            // Not the sequence: emit the withheld Ctrl-P, then reconsider b.
-            out.push(0x10);
-            if b == 0x10 {
-                *saw_p = true;
-            } else {
-                out.push(b);
-            }
-        } else if b == 0x10 {
-            *saw_p = true;
+            // Not the sequence: emit the withheld key, then this byte.
+            out.push(DETACH_KEY);
+            out.push(b);
+        } else if b == DETACH_KEY {
+            *saw = true;
         } else {
             out.push(b);
         }
@@ -320,6 +324,8 @@ impl Drop for RawGuard {
 mod tests {
     use super::filter_detach;
 
+    const K: u8 = 0x1c; // Ctrl-\
+
     #[test]
     fn passes_normal_input() {
         let mut p = false;
@@ -330,25 +336,22 @@ mod tests {
     #[test]
     fn detects_detach_sequence_in_one_chunk() {
         let mut p = false;
-        assert_eq!(filter_detach(&mut p, &[0x10, 0x11]), (vec![], true));
+        assert_eq!(filter_detach(&mut p, &[K, K]), (vec![], true));
     }
 
     #[test]
     fn detects_detach_sequence_across_chunks() {
         let mut p = false;
-        assert_eq!(filter_detach(&mut p, &[0x10]), (vec![], false));
+        assert_eq!(filter_detach(&mut p, &[K]), (vec![], false));
         assert!(p);
-        assert_eq!(filter_detach(&mut p, &[0x11]), (vec![], true));
+        assert_eq!(filter_detach(&mut p, &[K]), (vec![], true));
     }
 
     #[test]
-    fn ctrl_p_then_other_is_forwarded() {
+    fn lone_ctrl_backslash_then_other_is_forwarded() {
         let mut p = false;
-        // Ctrl-P then 'a' → both forwarded, no detach.
-        assert_eq!(
-            filter_detach(&mut p, &[0x10, b'a']),
-            (vec![0x10, b'a'], false)
-        );
+        // Ctrl-\ then 'a' → both forwarded, no detach.
+        assert_eq!(filter_detach(&mut p, &[K, b'a']), (vec![K, b'a'], false));
         assert!(!p);
     }
 }

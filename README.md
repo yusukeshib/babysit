@@ -109,7 +109,7 @@ Commands:
   restart  Restart the wrapped command
   kill     Terminate the wrapped command
   send     Send text to the wrapped command's stdin (newline appended)
-  attach   Attach your terminal to a session (detach with Ctrl-P Ctrl-Q)
+  attach   Attach your terminal to a session (detach with Ctrl-\ Ctrl-\)
   detach   Detach any terminal currently attached to a session
   prune    Delete sessions whose wrapped command has finished or whose owner died
   upgrade  Self-update to the latest version
@@ -141,13 +141,14 @@ PTY; the terminal you see it in is just *attached* to that worker
 
 ```console
 $ babysit run -- make local-ci    # runs attached (auto-attaches)
-…                                 # press Ctrl-P Ctrl-Q to detach
+…                                 # press Ctrl-\ Ctrl-\ to detach
 $ babysit attach -s ci            # re-attach later, from anywhere
 $ babysit detach -s ci            # kick off whoever's attached, keep it running
 ```
 
-- **Detach hotkey:** `Ctrl-P Ctrl-Q` (Docker's default) — leaves the
-  command running and returns your shell.
+- **Detach hotkey:** `Ctrl-\ Ctrl-\` (press Ctrl-backslash twice) —
+  leaves the command running and returns your shell. (A flow-control key
+  like Ctrl-Q, or one TUIs grab like Ctrl-P, would be unreliable.)
 - `babysit attach -s <id>` replays the recent output, then streams live
   and forwards your keystrokes/resizes.
 - `babysit detach -s <id>` detaches clients from another terminal.
