@@ -4,6 +4,7 @@
 //! short-lived connection to the session's control socket and forward the
 //! request as a JSON line.
 
+use crate::cli::ShotFormat;
 use crate::control::{Request, Response, last_n_lines};
 use crate::paths;
 use crate::session::{self, Meta, State, Status};
@@ -138,6 +139,35 @@ pub async fn log(
             .unwrap_or(0);
         emit_log(&id, text, offset, json).await
     }
+}
+
+/// Capture the current visible screen of a session. Prefers the live worker
+/// (via the control socket); if the worker is gone, falls back to replaying
+/// the on-disk output log through a fresh virtual terminal.
+pub async fn screenshot(session: Option<String>, format: ShotFormat, trim: bool) -> Result<()> {
+    let id = session::resolve(session).await?;
+    let req = Request::Screenshot { format, trim };
+    let data = match request(&id, &req).await {
+        Ok(r) if r.ok => r.data,
+        _ => {
+            // Worker not running: render from the log on disk.
+            let path = paths::output_log_path(&id)?;
+            let bytes = tokio::fs::read(&path).await.unwrap_or_default();
+            crate::pane::render_log(&bytes, format, trim)
+        }
+    };
+
+    match format {
+        // For text formats the rendered screen is the payload; print it raw.
+        // JSON returns the full metadata object (size, cursor, cells).
+        ShotFormat::Plain | ShotFormat::Ansi => {
+            if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
+                println!("{text}");
+            }
+        }
+        ShotFormat::Json => println!("{}", serde_json::to_string_pretty(&data)?),
+    }
+    Ok(())
 }
 
 /// Print log output, either as raw text or as JSON `{text, offset, done}`

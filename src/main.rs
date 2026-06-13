@@ -69,6 +69,9 @@ async fn main() -> Result<()> {
             follow,
             json,
         } => sub::log(sel.session, tail, raw, since, follow, json).await,
+        cli::Command::Screenshot { sel, format, trim } => {
+            sub::screenshot(sel.session, format, trim).await
+        }
         cli::Command::Restart { sel } => sub::restart(sel.session).await,
         cli::Command::Kill { sel } => sub::kill(sel.session).await,
         cli::Command::Send { sel, text } => sub::send(sel.session, text).await,
