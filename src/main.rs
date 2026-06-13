@@ -12,6 +12,16 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Rust sets SIGPIPE to SIG_IGN at startup, which turns a closed pipe into
+    // a panic on the next write (`babysit log | head`) and is also inherited
+    // by the wrapped command. Restore the default so we exit quietly on a
+    // broken pipe and children get normal SIGPIPE behavior.
+    #[cfg(unix)]
+    unsafe {
+        use nix::sys::signal::{SigHandler, Signal, signal};
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
+    }
+
     // Short wrap forms: `babysit [-d] -- <cmd> [args…]`. Handled before clap
     // so that `babysit listt` (a typo of `list`) goes through clap and gets a
     // proper "did you mean 'list'?" error instead of silently being treated
