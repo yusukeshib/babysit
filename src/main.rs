@@ -61,7 +61,14 @@ async fn main() -> Result<()> {
         }
         cli::Command::List { json } => sub::list(json).await,
         cli::Command::Status { sel, json } => sub::status(sel.session, json).await,
-        cli::Command::Log { sel, tail, raw } => sub::log(sel.session, tail, raw).await,
+        cli::Command::Log {
+            sel,
+            tail,
+            raw,
+            since,
+            follow,
+            json,
+        } => sub::log(sel.session, tail, raw, since, follow, json).await,
         cli::Command::Restart { sel } => sub::restart(sel.session).await,
         cli::Command::Kill { sel } => sub::kill(sel.session).await,
         cli::Command::Send { sel, text } => sub::send(sel.session, text).await,

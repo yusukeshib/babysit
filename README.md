@@ -233,6 +233,21 @@ babysit wait -s ENG-123           # block until done; exit code = the agent's
 - **`babysit wait`** blocks until the command exits and returns its exit
   code, so an orchestrator can join on tasks instead of busy-polling. With
   `--timeout` it gives up and exits `124` (the session keeps running).
+- **`babysit log --since <offset> --json`** reads only what's new since a
+  raw-log byte offset and returns `{text, offset, done}`, so a poller can
+  resume from `offset` and stop when `done`. **`--follow`** (`-f`) streams
+  new output live until the session exits (like `tail -f`).
+
+```sh
+# Incremental polling loop for one task:
+off=0
+while :; do
+  r=$(babysit log -s ENG-123 --since "$off" --json)
+  printf '%s' "$(jq -r .text <<<"$r")"
+  off=$(jq .offset <<<"$r"); [ "$(jq .done <<<"$r")" = true ] && break
+  sleep 1
+done
+```
 
 Each wrapped command also sees `$BABYSIT_SESSION_ID`, so an agent can refer
 to its own session. For per-task isolation (separate git worktrees, etc.),

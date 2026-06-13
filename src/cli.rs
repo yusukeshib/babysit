@@ -78,6 +78,16 @@ pub enum Command {
         /// Include raw ANSI escapes (default: stripped)
         #[arg(long)]
         raw: bool,
+        /// Only output bytes after this raw-log offset. Pair with --json to
+        /// get the new offset back for incremental polling.
+        #[arg(long, value_name = "BYTES")]
+        since: Option<u64>,
+        /// Stream new output live until the session exits (like tail -f).
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Emit JSON `{text, offset, done}` instead of raw text.
+        #[arg(long)]
+        json: bool,
     },
     /// Block until the wrapped command exits, then return its exit code
     Wait {

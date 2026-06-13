@@ -89,33 +89,130 @@ pub async fn status(session: Option<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn log(session: Option<String>, tail: Option<usize>, raw: bool) -> Result<()> {
+pub async fn log(
+    session: Option<String>,
+    tail: Option<usize>,
+    raw: bool,
+    since: Option<u64>,
+    follow: bool,
+    json: bool,
+) -> Result<()> {
     let id = session::resolve(session).await?;
-    let resp = request(&id, &Request::Log { tail, raw }).await;
-    let text = match resp {
-        Ok(r) if r.ok => r
-            .data
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        _ => {
-            // Fallback: read the log file directly (handles dead session).
-            let path = paths::output_log_path(&id)?;
-            let bytes = tokio::fs::read(&path).await.unwrap_or_default();
-            let processed = if raw {
-                bytes
+    let path = paths::output_log_path(&id)?;
+
+    if follow {
+        return follow_log(&id, &path, raw, since.unwrap_or(0)).await;
+    }
+
+    if let Some(off) = since {
+        // Incremental read straight from the (append-only) log file.
+        let (text, offset) = read_slice(&path, off, raw).await?;
+        emit_log(&id, text, offset, json).await
+    } else {
+        // Whole log (or --tail). Prefer the live socket; fall back to disk.
+        let resp = request(&id, &Request::Log { tail, raw }).await;
+        let text = match resp {
+            Ok(r) if r.ok => r
+                .data
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            _ => {
+                let bytes = tokio::fs::read(&path).await.unwrap_or_default();
+                let processed = if raw {
+                    bytes
+                } else {
+                    strip_ansi_escapes::strip(&bytes)
+                };
+                let text = String::from_utf8_lossy(&processed).into_owned();
+                match tail {
+                    Some(n) => last_n_lines(&text, n),
+                    None => text,
+                }
+            }
+        };
+        let offset = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        emit_log(&id, text, offset, json).await
+    }
+}
+
+/// Print log output, either as raw text or as JSON `{text, offset, done}`
+/// (so a poller can resume from `offset` and stop when `done`).
+async fn emit_log(id: &str, text: String, offset: u64, json: bool) -> Result<()> {
+    if json {
+        let done = is_finished(id).await;
+        let obj = serde_json::json!({ "text": text, "offset": offset, "done": done });
+        println!("{}", serde_json::to_string(&obj)?);
+    } else {
+        print!("{text}");
+    }
+    Ok(())
+}
+
+/// Read the raw log from byte `off` to EOF. Returns the (optionally
+/// ANSI-stripped) text plus the new raw-byte offset to resume from.
+async fn read_slice(path: &std::path::Path, off: u64, raw: bool) -> Result<(String, u64)> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((String::new(), off)),
+        Err(e) => return Err(e.into()),
+    };
+    let len = f.metadata().await?.len();
+    if off >= len {
+        return Ok((String::new(), len));
+    }
+    f.seek(std::io::SeekFrom::Start(off)).await?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).await?;
+    let processed = if raw {
+        bytes
+    } else {
+        strip_ansi_escapes::strip(&bytes)
+    };
+    Ok((String::from_utf8_lossy(&processed).into_owned(), len))
+}
+
+async fn is_finished(id: &str) -> bool {
+    matches!(
+        session::read_status(id).await.map(|s| s.state),
+        Ok(State::Exited | State::Killed)
+    )
+}
+
+/// Stream new log output to stdout until the session finishes (tail -f style).
+async fn follow_log(id: &str, path: &std::path::Path, raw: bool, start: u64) -> Result<()> {
+    use std::io::Write as _;
+    let mut off = start;
+    let mut idle_after_done = 0u32;
+    loop {
+        let (text, new_off) = read_slice(path, off, raw).await?;
+        if !text.is_empty() {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(text.as_bytes());
+            let _ = out.flush();
+        }
+        let advanced = new_off > off;
+        off = new_off;
+        // The worker flips status to terminal slightly before its final
+        // post-exit flush completes, so wait for a couple of idle polls after
+        // `done` before stopping, to avoid cutting off the tail.
+        if is_finished(id).await {
+            if advanced {
+                idle_after_done = 0;
             } else {
-                strip_ansi_escapes::strip(&bytes)
-            };
-            let text = String::from_utf8_lossy(&processed).into_owned();
-            match tail {
-                Some(n) => last_n_lines(&text, n),
-                None => text,
+                idle_after_done += 1;
+                if idle_after_done >= 2 {
+                    break;
+                }
             }
         }
-    };
-    print!("{text}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     Ok(())
 }
 
