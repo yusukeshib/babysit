@@ -83,20 +83,14 @@ pub async fn make_id(requested: Option<String>) -> Result<String> {
     }
 }
 
-/// Reject ids that aren't safe as a directory name or that collide with
-/// reserved words. Keeps a user-supplied `--id` from escaping the sessions
-/// directory (path traversal) or shadowing `latest`.
+/// Reject ids that aren't safe as a directory name. Keeps a user-supplied
+/// `--id` from escaping the sessions directory (path traversal).
 fn validate_id(id: &str) -> Result<()> {
     if id.is_empty() {
         return Err(anyhow!("session id must not be empty"));
     }
     if id.len() > 64 {
         return Err(anyhow!("session id too long (max 64 characters)"));
-    }
-    if id == "latest" {
-        return Err(anyhow!(
-            "`latest` is reserved and can't be used as a session id"
-        ));
     }
     if id == "." || id == ".." {
         return Err(anyhow!("`.` and `..` are not valid session ids"));
@@ -225,7 +219,10 @@ pub async fn list_ids() -> Result<Vec<String>> {
 /// Resolution order:
 /// 1. The explicit argument, if Some.
 /// 2. `$BABYSIT_SESSION_ID`, if set.
-/// 3. `latest` — the session whose status was modified most recently.
+///
+/// There is intentionally no "most recently active" fallback: an agent that
+/// drives several sessions must name the one it means, so a forgotten `-s`
+/// fails loudly instead of silently operating on the wrong session.
 pub async fn resolve(session: Option<String>) -> Result<String> {
     if let Some(s) = session {
         return resolve_one(&s).await;
@@ -235,35 +232,15 @@ pub async fn resolve(session: Option<String>) -> Result<String> {
     {
         return resolve_one(&env_id).await;
     }
-    resolve_latest().await
+    Err(anyhow!(
+        "no session selected: pass -s <id> or set $BABYSIT_SESSION_ID (list ids with `babysit ls`)"
+    ))
 }
 
 async fn resolve_one(s: &str) -> Result<String> {
-    if s == "latest" {
-        return resolve_latest().await;
-    }
     let ids = list_ids().await?;
     if ids.iter().any(|i| i == s) {
         return Ok(s.to_string());
     }
     Err(anyhow!("no session matching `{s}`"))
-}
-
-async fn resolve_latest() -> Result<String> {
-    let ids = list_ids().await?;
-    if ids.is_empty() {
-        return Err(anyhow!("no sessions found"));
-    }
-    let mut best: Option<(String, std::time::SystemTime)> = None;
-    for id in ids {
-        let path = paths::status_path(&id)?;
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
-            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            if best.as_ref().map(|(_, t)| modified > *t).unwrap_or(true) {
-                best = Some((id.clone(), modified));
-            }
-        }
-    }
-    best.map(|(id, _)| id)
-        .ok_or_else(|| anyhow!("no sessions with status"))
 }
