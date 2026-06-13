@@ -44,7 +44,7 @@ Then `babysit upgrade` self-updates to the latest release.
 | `list` (`ls`) | List all sessions |
 | `status` | Show a session's state and exit code |
 | `log` | Show output; `--tail N`, `--grep <re>`, `--since <off> --json`, `--follow` for incremental/live reads |
-| `screenshot` (`shot`) | Render the *current* screen via a virtual terminal — see below |
+| `screenshot` (`shot`) | Render the *current* screen via a virtual terminal (readable for full-screen TUIs that redraw in place); `--format plain\|ansi\|json`, `--trim` |
 | `send` | Send text to the command's stdin (`-n`/`--no-newline` to omit the newline) |
 | `key` | Send named keys (`Enter`, `Up`, `Esc`, `C-c`, `F1`, …) |
 | `expect` | Block until a regex appears in the output |
@@ -82,28 +82,6 @@ Run `babysit help <command>` for flags and aliases.
 - `status --json` reports `output_bytes` and `screen_seq`; if neither changed
   since the last check, the command hasn't produced anything new.
 - `log --grep <re>` filters to matching lines.
-
-## Screenshots
-
-`log` replays the raw output *stream*, which is unreadable for full-screen TUIs
-that redraw in place (menus, progress bars, `htop`). `screenshot` feeds output
-through a virtual terminal and renders the **single frame currently on screen**:
-
-```console
-$ babysit screenshot -s ab12 --trim
-  npm
-> pnpm
-  yarn
-```
-
-- `--format plain` (default) — plain text.
-- `--format ansi` — keeps ANSI/SGR color escapes.
-- `--format json` — screen size, cursor, and per-cell `char` + attributes
-  (`fg`/`bg`/`bold`/`inverse`/…), so you can tell which row is selected even when
-  it's marked only by inverse video.
-- `--trim` drops trailing blank lines and whitespace.
-
-For an exited session the screen is reconstructed from the on-disk log.
 
 ## Build from source
 
