@@ -12,7 +12,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<i32> {
-    let id = session::new_id();
+    let id = session::new_unique_id().await;
     let cmd_title = cmd.join(" ");
 
     let meta = Meta {
