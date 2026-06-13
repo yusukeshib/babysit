@@ -6,6 +6,15 @@ Gives local terminal commands an API, so external AI agents (Claude
 Code, Codex, …) can query their live output and exit state — the same
 way they already query `gcloud` or `kubectl`.
 
+Two patterns it's built for:
+
+1. **Hand a run to an agent** — wrap a command, give the agent the
+   session id, and it pulls live output / exit state on demand (below).
+2. **Let an agent orchestrate** — an agent loop launches tasks in the
+   background (`babysit run -d`), lists them (`babysit ls`), reads their
+   logs (`babysit log`), and joins on them (`babysit wait`). See
+   [Driving agents in the background](#driving-agents-in-the-background).
+
 **Your shell** — wrap the command you'd normally run. babysit prints a
 session id, then runs the command transparently:
 
