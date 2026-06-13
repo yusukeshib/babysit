@@ -1,17 +1,77 @@
 //! A `Pane` wraps a PTY pair, the child process, and the threads that
-//! ferry bytes between the master fd and the user's terminal.
+//! ferry bytes between the master fd and attached clients.
 //!
-//! Output bytes from the PTY are written straight to stdout (and
-//! optionally tee'd to a log file). There is no terminal-emulator parser
-//! in babysit itself — the user's terminal renders the bytes directly.
+//! Output bytes from the PTY are tee'd to a log file and fanned out through
+//! an `OutputHub` to any attached clients. There is no terminal-emulator
+//! parser in babysit itself — the client's terminal renders the bytes
+//! directly.
 
 use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+/// Maximum bytes of recent PTY output retained for replay to a freshly
+/// attached client, so attaching shows the current screen/context. Older
+/// output is still on disk in the session log.
+const BACKLOG_CAP: usize = 1 << 20; // 1 MiB
+
+/// Fans PTY output out to attached clients and keeps a bounded backlog so a
+/// newly attached client can be caught up. The backlog and client list share
+/// one lock, so `subscribe` snapshots the backlog and registers atomically —
+/// a client sees the backlog then live output with no gap and no duplicate.
+#[derive(Default)]
+pub struct OutputHub {
+    inner: Mutex<HubInner>,
+}
+
+#[derive(Default)]
+struct HubInner {
+    backlog: VecDeque<u8>,
+    clients: Vec<UnboundedSender<Vec<u8>>>,
+}
+
+impl OutputHub {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Append a chunk to the backlog and push it to every attached client,
+    /// dropping any client whose receiver has gone away.
+    pub fn broadcast(&self, data: &[u8]) {
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        g.backlog.extend(data);
+        let overflow = g.backlog.len().saturating_sub(BACKLOG_CAP);
+        if overflow > 0 {
+            g.backlog.drain(..overflow);
+        }
+        if !g.clients.is_empty() {
+            let chunk = data.to_vec();
+            g.clients.retain(|tx| tx.send(chunk.clone()).is_ok());
+        }
+    }
+
+    /// Register a client. Returns a receiver that first yields the current
+    /// backlog (if any), then live output.
+    pub fn subscribe(&self) -> UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = unbounded_channel();
+        if let Ok(mut g) = self.inner.lock() {
+            if !g.backlog.is_empty() {
+                let snapshot: Vec<u8> = g.backlog.iter().copied().collect();
+                let _ = tx.send(snapshot);
+            }
+            g.clients.push(tx);
+        }
+        rx
+    }
+}
 
 pub struct Pane {
     pub writer: Mutex<Box<dyn Write + Send>>,
@@ -41,14 +101,15 @@ pub struct ExitInfo {
 
 impl Pane {
     /// Spawn `cmd[0]` with `cmd[1..]` as arguments inside a fresh PTY of the
-    /// given size. PTY output is streamed to stdout (and tee'd to
-    /// `output_log` if provided).
+    /// given size. PTY output is fanned out through `hub` to attached clients
+    /// and tee'd to `output_log` if provided.
     pub fn spawn(
         cmd: &[String],
         rows: u16,
         cols: u16,
         extra_env: &[(String, String)],
         output_log: Option<&Path>,
+        hub: Arc<OutputHub>,
     ) -> Result<Self> {
         anyhow::ensure!(!cmd.is_empty(), "empty command");
 
@@ -99,19 +160,17 @@ impl Pane {
         let reader_done = Arc::new(tokio::sync::Notify::new());
         {
             let reader_done = reader_done.clone();
+            let hub = hub.clone();
             thread::spawn(move || {
                 let mut log_file = log_path
                     .and_then(|p| OpenOptions::new().create(true).append(true).open(&p).ok());
-                let stdout = std::io::stdout();
                 let mut buf = [0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            // Best-effort; if stdout is closed there's nothing to do.
-                            let mut out = stdout.lock();
-                            let _ = out.write_all(&buf[..n]);
-                            let _ = out.flush();
+                            // Fan out to attached clients and tee to the log.
+                            hub.broadcast(&buf[..n]);
                             if let Some(f) = log_file.as_mut() {
                                 let _ = f.write_all(&buf[..n]);
                             }

@@ -109,6 +109,8 @@ Commands:
   restart  Restart the wrapped command
   kill     Terminate the wrapped command
   send     Send text to the wrapped command's stdin (newline appended)
+  attach   Attach your terminal to a session (detach with Ctrl-\ Ctrl-\)
+  detach   Detach any terminal currently attached to a session
   prune    Delete sessions whose wrapped command has finished or whose owner died
   upgrade  Self-update to the latest version
   config   Print shell integration (completions)
@@ -131,24 +133,48 @@ or the literal string `latest`. From inside the wrapped command itself
 the session is implicit via `$BABYSIT_SESSION_ID`, so the flag can be
 omitted.
 
-## Detached mode
+## Attach / detach
+
+The wrapped command always runs under a background worker that owns the
+PTY; the terminal you see it in is just *attached* to that worker
+(tmux-style). So you can come and go without stopping the command:
+
+```console
+$ babysit run -- make local-ci    # runs attached (auto-attaches)
+…                                 # press Ctrl-\ Ctrl-\ to detach
+$ babysit attach -s ci            # re-attach later, from anywhere
+$ babysit detach -s ci            # kick off whoever's attached, keep it running
+```
+
+- **Detach hotkey:** `Ctrl-\ Ctrl-\` (press Ctrl-backslash twice) —
+  leaves the command running and returns your shell. (A flow-control key
+  like Ctrl-Q, or one TUIs grab like Ctrl-P, would be unreliable.)
+- **Full-screen TUIs** (editors, `pi`, etc.) often enable an enhanced
+  keyboard mode that re-encodes control keys, so the hotkey may not be
+  detected. In that case detach from another terminal with
+  `babysit detach -s <id>` — that path is independent of the keyboard and
+  always works. babysit resets the terminal (alt-screen/mouse/…) on detach
+  so your shell is left usable.
+- `babysit attach -s <id>` replays the recent output, then streams live
+  and forwards your keystrokes/resizes.
+- `babysit detach -s <id>` detaches clients from another terminal.
+
+### Start detached (`-d`)
 
 `babysit -d -- <cmd>` (or `babysit run -d -- <cmd>`) starts the command
-in the background and returns immediately, leaving a detached babysit
-worker supervising it:
+in the background and returns immediately, without attaching:
 
 ```console
 $ babysit -d --id ci -- make local-ci
 babysit session ci: make local-ci
   babysit log -s ci --tail 200
-  babysit status -s ci
-$ # prompt returns right away; the agent polls `ci` on its own
+  babysit attach -s ci
+$ # prompt returns right away; the agent polls `ci`, or you can attach
 ```
 
-The worker survives this shell exiting. Its live output isn't mirrored
-to your terminal (there's no terminal attached), but it's still
-captured to the session log, so `babysit log`/`status`/`send`/`kill`
-work exactly as for an attached session.
+The worker survives this shell exiting. Output is captured to the
+session log regardless of whether anyone is attached, so
+`babysit log`/`status`/`send`/`kill` work the same either way.
 
 `status` and `log` work even after babysit has exited — they fall back
 to the on-disk state files. `restart`, `kill`, and `send` need the live

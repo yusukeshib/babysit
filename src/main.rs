@@ -1,3 +1,4 @@
+mod attach;
 mod cli;
 mod control;
 mod pane;
@@ -62,6 +63,11 @@ async fn main() -> Result<()> {
         cli::Command::Restart { sel } => sub::restart(sel.session).await,
         cli::Command::Kill { sel } => sub::kill(sel.session).await,
         cli::Command::Send { sel, text } => sub::send(sel.session, text).await,
+        cli::Command::Attach { sel } => {
+            let code = attach::attach(sel.session).await?;
+            std::process::exit(code);
+        }
+        cli::Command::Detach { sel } => attach::detach(sel.session).await,
         cli::Command::Prune { dry_run } => sub::prune(dry_run).await,
         cli::Command::Upgrade => {
             let code = upgrade::run()?;
