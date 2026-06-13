@@ -57,7 +57,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
     )
 }
 
-/// Generate a short, human-friendly session id ("babysit-3a7f"-style).
+/// Generate a short, human-friendly session id ("3a7f"-style).
 pub fn new_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -67,6 +67,23 @@ pub fn new_id() -> String {
     let pid = std::process::id() as u64;
     let mix = nanos.wrapping_mul(2862933555777941757).wrapping_add(pid);
     format!("{:04x}", (mix as u16))
+}
+
+/// Generate a short id that doesn't collide with an existing session dir.
+///
+/// The 16-bit space behind `new_id` is small, so without a check two
+/// concurrent sessions could hash to the same id and clobber each other's
+/// directory (meta/status/socket). Retry until we find a free one; fall
+/// back to a raw id if the space is somehow exhausted.
+pub async fn new_unique_id() -> String {
+    for _ in 0..10_000 {
+        let id = new_id();
+        match paths::session_dir(&id) {
+            Ok(dir) if tokio::fs::try_exists(&dir).await.unwrap_or(false) => continue,
+            _ => return id,
+        }
+    }
+    new_id()
 }
 
 pub async fn write_meta(meta: &Meta) -> Result<()> {

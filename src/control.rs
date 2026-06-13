@@ -39,7 +39,7 @@ pub enum Request {
     Send { text: String },
     /// Restart the wrapped command (kill + respawn with the same argv).
     Restart,
-    /// Terminate the wrapped command (SIGTERM).
+    /// Terminate the wrapped command (SIGHUP).
     Kill,
 }
 
@@ -202,17 +202,23 @@ async fn read_log(path: &Path, tail: Option<usize>, raw: bool) -> Result<serde_j
     Ok(serde_json::json!({"text": out}))
 }
 
-fn last_n_lines(text: &str, n: usize) -> String {
+/// Return the last `n` lines of `text`, preserving the original bytes.
+///
+/// A single trailing newline terminates the final line rather than starting
+/// an empty one, so `last_n_lines("a\nb\nc\n", 2)` is `"b\nc\n"` (two lines),
+/// not `"c\n"`.
+pub fn last_n_lines(text: &str, n: usize) -> String {
     if n == 0 {
         return String::new();
     }
-    let mut starts: Vec<usize> = text.match_indices('\n').map(|(i, _)| i + 1).collect();
-    starts.insert(0, 0);
-    let start = if starts.len() > n {
-        starts[starts.len() - n]
-    } else {
-        0
-    };
+    let trimmed = text.strip_suffix('\n').unwrap_or(text);
+    let mut start = 0;
+    for (seen, (i, _)) in trimmed.rmatch_indices('\n').enumerate() {
+        if seen + 1 == n {
+            start = i + 1;
+            break;
+        }
+    }
     text[start..].to_string()
 }
 
@@ -220,5 +226,37 @@ fn last_n_lines(text: &str, n: usize) -> String {
 pub fn cleanup(session_id: &str) {
     if let Ok(path) = paths::control_socket_path(session_id) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_n_lines;
+
+    #[test]
+    fn tail_respects_trailing_newline() {
+        // 3 logical lines + trailing newline: tail 2 keeps the last two.
+        assert_eq!(last_n_lines("a\nb\nc\n", 2), "b\nc\n");
+        assert_eq!(last_n_lines("a\nb\nc\n", 1), "c\n");
+    }
+
+    #[test]
+    fn tail_without_trailing_newline() {
+        assert_eq!(last_n_lines("a\nb\nc", 2), "b\nc");
+    }
+
+    #[test]
+    fn tail_larger_than_available_returns_all() {
+        assert_eq!(last_n_lines("a\nb\n", 10), "a\nb\n");
+    }
+
+    #[test]
+    fn tail_zero_is_empty() {
+        assert_eq!(last_n_lines("a\nb\n", 0), "");
+    }
+
+    #[test]
+    fn tail_empty_input() {
+        assert_eq!(last_n_lines("", 5), "");
     }
 }

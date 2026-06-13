@@ -4,7 +4,7 @@
 //! short-lived connection to the session's control socket and forward the
 //! request as a JSON line.
 
-use crate::control::{Request, Response};
+use crate::control::{Request, Response, last_n_lines};
 use crate::paths;
 use crate::session::{self, Meta, State, Status};
 use anyhow::{Context, Result, anyhow};
@@ -266,18 +266,4 @@ fn format_age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     } else {
         format!("{}d", secs / 86400)
     }
-}
-
-fn last_n_lines(text: &str, n: usize) -> String {
-    if n == 0 {
-        return String::new();
-    }
-    let mut starts: Vec<usize> = text.match_indices('\n').map(|(i, _)| i + 1).collect();
-    starts.insert(0, 0);
-    let start = if starts.len() > n {
-        starts[starts.len() - n]
-    } else {
-        0
-    };
-    text[start..].to_string()
 }
