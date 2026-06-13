@@ -30,6 +30,15 @@ pub enum State {
     Killed,
 }
 
+impl State {
+    /// True once the wrapped command has finished (exited or killed). A
+    /// terminal state is final: `status`/`log` then read from disk without
+    /// needing the worker alive.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, State::Exited | State::Killed)
+    }
+}
+
 impl Status {
     pub fn starting() -> Self {
         Self {

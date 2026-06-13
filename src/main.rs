@@ -3,6 +3,7 @@ mod cli;
 mod control;
 mod pane;
 mod paths;
+mod render;
 mod run;
 mod session;
 mod sub;

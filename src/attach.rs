@@ -271,10 +271,10 @@ async fn connect_retry(path: &std::path::Path, id: &str) -> Result<Option<UnixSt
 }
 
 async fn session_finished(id: &str) -> bool {
-    matches!(
-        session::read_status(id).await.map(|s| s.state),
-        Ok(State::Exited | State::Killed)
-    )
+    session::read_status(id)
+        .await
+        .map(|s| s.state.is_terminal())
+        .unwrap_or(false)
 }
 
 async fn recorded_exit_code(id: &str) -> i32 {
