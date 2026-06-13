@@ -3,11 +3,12 @@ use crate::control::{self, Handle, LoopMessage};
 use crate::pane::{ExitInfo, OutputHub, Pane};
 use crate::paths;
 use crate::session::{self, Meta, State, Status};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 /// Entry point for `babysit run` / `babysit -- …` / `babysit -d -- …`.
@@ -22,18 +23,23 @@ pub async fn run(
     id: Option<String>,
     detach: bool,
     detached_id: Option<String>,
+    no_tty: bool,
+    timeout: Option<String>,
 ) -> Result<i32> {
+    // Parse the timeout up front so a bad value errors before we spawn.
+    let timeout = timeout.as_deref().map(parse_duration).transpose()?;
+
     // We are the detached worker (re-exec'd with --detached-id): run the
     // headless server loop and never come back until the command exits.
     if let Some(worker_id) = detached_id {
-        serve_worker(cmd, worker_id).await?;
+        serve_worker(cmd, worker_id, !no_tty, timeout).await?;
         return Ok(0);
     }
 
     // Parent: choose the id, announce it, spawn the worker.
     let session_id = session::make_id(id).await?;
     print_banner(&session_id, &cmd.join(" "));
-    spawn_worker_process(&cmd, &session_id)?;
+    spawn_worker_process(&cmd, &session_id, no_tty, timeout)?;
 
     if detach {
         return Ok(0);
@@ -46,7 +52,12 @@ pub async fn run(
 
 /// The headless worker: owns the PTY + control socket, fans output out to
 /// attached clients, and supervises restarts until the command exits.
-async fn serve_worker(cmd: Vec<String>, id: String) -> Result<()> {
+async fn serve_worker(
+    cmd: Vec<String>,
+    id: String,
+    tty: bool,
+    timeout: Option<Duration>,
+) -> Result<()> {
     let meta = Meta {
         id: id.clone(),
         cmd: cmd.clone(),
@@ -63,7 +74,7 @@ async fn serve_worker(cmd: Vec<String>, id: String) -> Result<()> {
     let log_path = paths::output_log_path(&id)?;
     let env = vec![("BABYSIT_SESSION_ID".into(), id.clone())];
     let hub = OutputHub::new();
-    let pane = match Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone()) {
+    let pane = match Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone(), tty) {
         Ok(p) => Arc::new(p),
         Err(e) => {
             // Don't leave the session stuck in `starting` forever.
@@ -110,15 +121,28 @@ async fn serve_worker(cmd: Vec<String>, id: String) -> Result<()> {
 
     let mut current_pane = pane;
     let info: Option<ExitInfo>;
+    // Optional auto-kill deadline. Fires once; after that the branch is
+    // disabled so we don't busy-loop re-killing.
+    let timeout_at = timeout.map(|d| tokio::time::Instant::now() + d);
+    let mut timed_out = false;
 
     loop {
         let exit_notify = current_pane.exit_notify.clone();
         tokio::select! {
+            _ = async {
+                match timeout_at {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if !timed_out => {
+                timed_out = true;
+                current_pane.kill();
+            }
             Some(msg) = action_rx.recv() => match msg {
                 LoopMessage::Restart => {
                     current_pane.kill();
                     current_pane.exit_notify.notified().await;
-                    let new_pane = Arc::new(Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone())?);
+                    let new_pane = Arc::new(Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone(), tty)?);
                     handle.replace_cmd_pane(new_pane.clone()).await;
                     session::write_status(&id, &Status {
                         state: State::Running,
@@ -186,12 +210,23 @@ fn print_banner(id: &str, cmd_title: &str) {
 /// parent and the user's shell exiting, and its stdio is detached to
 /// /dev/null (output is captured to the log and fanned out to attached
 /// clients). The chosen `id` is handed down via --detached-id.
-fn spawn_worker_process(cmd: &[String], id: &str) -> Result<()> {
+fn spawn_worker_process(
+    cmd: &[String],
+    id: &str,
+    no_tty: bool,
+    timeout: Option<Duration>,
+) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe().context("locating the babysit executable")?;
     let mut command = Command::new(exe);
     command.arg("run").arg("--detached-id").arg(id);
+    if no_tty {
+        command.arg("--no-tty");
+    }
+    if let Some(d) = timeout {
+        command.arg("--timeout").arg(format!("{}s", d.as_secs()));
+    }
     command.arg("--").args(cmd);
     command
         .stdin(Stdio::null())
@@ -216,4 +251,47 @@ fn spawn_worker_process(cmd: &[String], id: &str) -> Result<()> {
         .spawn()
         .context("spawning detached babysit worker")?;
     Ok(())
+}
+
+/// Parse a human duration like `30s`, `10m`, `2h`, `1d`, or a bare number of
+/// seconds, into a `Duration`.
+pub fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("empty duration"));
+    }
+    let (num, unit_secs) = match s.as_bytes()[s.len() - 1] {
+        b's' | b'S' => (&s[..s.len() - 1], 1u64),
+        b'm' | b'M' => (&s[..s.len() - 1], 60),
+        b'h' | b'H' => (&s[..s.len() - 1], 3600),
+        b'd' | b'D' => (&s[..s.len() - 1], 86400),
+        _ => (s, 1),
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid duration `{s}` (use e.g. 30s, 10m, 2h)"))?;
+    Ok(Duration::from_secs(n * unit_secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_units_and_bare_seconds() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("10m").unwrap(), Duration::from_secs(600));
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
+        assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("10x").is_err());
+    }
 }

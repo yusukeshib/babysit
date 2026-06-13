@@ -148,6 +148,45 @@ pub async fn send(session: Option<String>, text: String) -> Result<()> {
     Ok(())
 }
 
+/// Block until the session's wrapped command exits, then return its exit
+/// code. Polls the on-disk status (so it works regardless of who owns the
+/// session) and gives up with exit 124 after `timeout`, mirroring coreutils
+/// `timeout`. If the owning babysit process dies without recording a
+/// terminal state, returns 137.
+pub async fn wait(session: Option<String>, timeout: Option<String>) -> Result<i32> {
+    let id = session::resolve(session).await?;
+    let timeout = timeout
+        .as_deref()
+        .map(crate::run::parse_duration)
+        .transpose()?;
+    let deadline = timeout.map(|d| std::time::Instant::now() + d);
+
+    loop {
+        if let Ok(status) = session::read_status(&id).await {
+            match status.state {
+                State::Exited => return Ok(status.exit_code.unwrap_or(0)),
+                State::Killed => return Ok(status.exit_code.unwrap_or(130)),
+                State::Starting | State::Running => {
+                    // Owner gone without a terminal state ⇒ it crashed.
+                    if let Ok(meta) = session::read_meta(&id).await
+                        && !session::is_pid_alive(meta.babysit_pid)
+                    {
+                        eprintln!("babysit: session {id} owner died before exiting");
+                        return Ok(137);
+                    }
+                }
+            }
+        }
+        if let Some(dl) = deadline
+            && std::time::Instant::now() >= dl
+        {
+            eprintln!("babysit: timed out waiting for session {id}");
+            return Ok(124);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Delete session directories for sessions that are in a terminal state
 /// (exited / killed) or whose owning babysit process has died.
 ///

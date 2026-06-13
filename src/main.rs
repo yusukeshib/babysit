@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
             eprintln!("babysit: empty command after `--`");
             std::process::exit(2);
         }
-        let code = run::run(cmd, None, detach, None).await?;
+        let code = run::run(cmd, None, detach, None, false, None).await?;
         std::process::exit(code);
     }
 
@@ -52,9 +52,11 @@ async fn main() -> Result<()> {
             id,
             detach,
             detached_id,
+            no_tty,
+            timeout,
             cmd,
         } => {
-            let code = run::run(cmd, id, detach, detached_id).await?;
+            let code = run::run(cmd, id, detach, detached_id, no_tty, timeout).await?;
             std::process::exit(code);
         }
         cli::Command::List { json } => sub::list(json).await,
@@ -63,6 +65,10 @@ async fn main() -> Result<()> {
         cli::Command::Restart { sel } => sub::restart(sel.session).await,
         cli::Command::Kill { sel } => sub::kill(sel.session).await,
         cli::Command::Send { sel, text } => sub::send(sel.session, text).await,
+        cli::Command::Wait { sel, timeout } => {
+            let code = sub::wait(sel.session, timeout).await?;
+            std::process::exit(code);
+        }
         cli::Command::Attach { sel } => {
             let code = attach::attach(sel.session).await?;
             std::process::exit(code);
