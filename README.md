@@ -6,6 +6,15 @@ Gives local terminal commands an API, so external AI agents (Claude
 Code, Codex, …) can query their live output and exit state — the same
 way they already query `gcloud` or `kubectl`.
 
+Two patterns it's built for:
+
+1. **Hand a run to an agent** — wrap a command, give the agent the
+   session id, and it pulls live output / exit state on demand (below).
+2. **Let an agent orchestrate** — an agent loop launches tasks in the
+   background (`babysit run -d`), lists them (`babysit ls`), reads their
+   logs (`babysit log`), and joins on them (`babysit wait`). See
+   [Driving agents in the background](#driving-agents-in-the-background).
+
 **Your shell** — wrap the command you'd normally run. babysit prints a
 session id, then runs the command transparently:
 
@@ -109,6 +118,7 @@ Commands:
   restart  Restart the wrapped command
   kill     Terminate the wrapped command
   send     Send text to the wrapped command's stdin (newline appended)
+  wait     Block until the wrapped command exits, then return its exit code
   attach   Attach your terminal to a session (detach with Ctrl-\ Ctrl-\)
   detach   Detach any terminal currently attached to a session
   prune    Delete sessions whose wrapped command has finished or whose owner died
@@ -200,6 +210,33 @@ This completes subcommands and their aliases, per-command flags, and —
 most usefully — live session ids for `-s` (read straight from
 `~/.babysit/sessions`, plus the `latest` selector). `babysit run`
 delegates to your shell's normal command completion.
+
+## Driving agents in the background
+
+babysit works well as a supervisor when an orchestrator (e.g. an agent
+loop) launches other agents in the background and watches them:
+
+```sh
+# Launch a task, named after e.g. a ticket, headless so the log is clean.
+babysit run -d --no-tty --id ENG-123 --timeout 30m -- my-agent --task ENG-123
+
+babysit ls --json                 # what's running, and each one's state
+babysit log -s ENG-123 --tail 50  # what is it doing right now
+babysit wait -s ENG-123           # block until done; exit code = the agent's
+```
+
+- **`--no-tty`** runs the command with plain pipes instead of a PTY, so
+  tools that detect a non-tty emit clean, line-oriented output that's much
+  easier to scrape from the log (no full-screen redraw noise).
+- **`--timeout <dur>`** auto-terminates a run that hangs (`30s`, `10m`,
+  `2h`, `1d`, or bare seconds) — a safety valve for unattended loops.
+- **`babysit wait`** blocks until the command exits and returns its exit
+  code, so an orchestrator can join on tasks instead of busy-polling. With
+  `--timeout` it gives up and exits `124` (the session keeps running).
+
+Each wrapped command also sees `$BABYSIT_SESSION_ID`, so an agent can refer
+to its own session. For per-task isolation (separate git worktrees, etc.),
+pair babysit with a workspace manager.
 
 ## Session state on disk
 

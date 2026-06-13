@@ -40,6 +40,15 @@ pub enum Command {
         /// itself to run detached. Not for direct use.
         #[arg(long = "detached-id", value_name = "ID", hide = true)]
         detached_id: Option<String>,
+        /// Run with plain pipes instead of a PTY. Programs that detect a
+        /// non-tty then emit clean, line-oriented output — nicer for log
+        /// scraping (e.g. by an agent). Disables interactive/TUI rendering.
+        #[arg(long = "no-tty")]
+        no_tty: bool,
+        /// Auto-terminate the command after this long (e.g. 30s, 10m, 2h).
+        /// A safety valve for unattended runs that may hang.
+        #[arg(long, value_name = "DUR")]
+        timeout: Option<String>,
         /// The command to wrap, plus its arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         cmd: Vec<String>,
@@ -69,6 +78,14 @@ pub enum Command {
         /// Include raw ANSI escapes (default: stripped)
         #[arg(long)]
         raw: bool,
+    },
+    /// Block until the wrapped command exits, then return its exit code
+    Wait {
+        #[command(flatten)]
+        sel: SessionSel,
+        /// Give up waiting after this long (e.g. 30s, 10m); exits 124.
+        #[arg(long, value_name = "DUR")]
+        timeout: Option<String>,
     },
     /// Restart the wrapped command
     #[command(alias = "r")]

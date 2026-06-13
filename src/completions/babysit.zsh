@@ -41,6 +41,7 @@ _babysit() {
                 'stop:Terminate the wrapped command'
                 'send:Send text to the wrapped command stdin'
                 'type:Send text to the wrapped command stdin'
+                'wait:Block until the command exits and return its code'
                 'attach:Attach your terminal to a session (detach: Ctrl-\ Ctrl-\)'
                 'a:Attach your terminal to a session (detach: Ctrl-\ Ctrl-\)'
                 'detach:Detach any terminal attached to a session'
@@ -56,6 +57,8 @@ _babysit() {
                     _arguments \
                         '--id=[Session id to assign]:id:' \
                         '(-d --detach)'{-d,--detach}'[Run detached in the background]' \
+                        '--no-tty[Use pipes instead of a PTY (clean line output)]' \
+                        '--timeout=[Auto-terminate after e.g. 30s, 10m, 2h]:duration:' \
                         '(-)1:command:_command_names -e' \
                         '*::arguments:_normal'
                     ;;
@@ -76,6 +79,11 @@ _babysit() {
                 restart|r|kill|stop|send|type|attach|a|detach)
                     _arguments \
                         '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions'
+                    ;;
+                wait)
+                    _arguments \
+                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--timeout=[Give up after e.g. 30s, 10m]:duration:'
                     ;;
                 prune)
                     _arguments '--dry-run[Print what would be deleted, but do not delete]'
