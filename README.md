@@ -10,11 +10,14 @@ This makes it easy for a script — or an AI coding agent like Claude Code or
 Codex — to drive a command it didn't start and react to what it does.
 
 ```console
-$ babysit -- make local-ci       # wrap a command; prints a session id (e.g. ab12)
-$ babysit log -s ab12 --tail 20  # read recent output from anywhere
-$ babysit screenshot -s ab12     # render the current screen of a full-screen TUI
-$ babysit wait -s ab12           # block until it exits; returns its exit code
+$ babysit run -d --json -- make local-ci   # wrap detached; prints {"id":"ab12"}
+$ babysit log -s ab12 --tail 20            # read recent output from anywhere
+$ babysit screenshot -s ab12               # render the current screen of a TUI
+$ babysit wait -s ab12                     # block until it exits; returns exit code
 ```
+
+(`babysit -- make local-ci` is the interactive shorthand; for scripting/agents
+use `run -d --json` and capture the `id`.)
 
 ## How it works
 
@@ -28,8 +31,10 @@ State lives in `~/.babysit/sessions/<id>/` (`meta.json`, `status.json`,
 the worker exits (they fall back to the files); `send`, `key`, `restart`, and
 `kill` need it alive.
 
-`-s <id>` selects a session (or `latest`). Inside the wrapped command the id is
-exported as `$BABYSIT_SESSION_ID`, so nested calls can omit `-s`.
+`-s <id>` selects a session. There is no "most recent" fallback: a command with
+neither `-s` nor `$BABYSIT_SESSION_ID` errors out, so a forgotten selector fails
+loudly instead of acting on the wrong session. Inside the wrapped command the id
+is exported as `$BABYSIT_SESSION_ID`, so nested calls can omit `-s`.
 
 ## Install
 
@@ -47,12 +52,12 @@ latest release (Nix installs are managed by Nix instead).
 
 | Command | Description |
 | --- | --- |
-| `run` | Wrap a command in a PTY (`babysit -- <cmd>` is shorthand; `-d` runs it detached in the background) |
+| `run` | Wrap a command in a PTY (`babysit -- <cmd>` is shorthand; `-d` runs it detached; `--json` prints `{"id":"…"}`) |
 | `list` (`ls`) | List all sessions |
 | `status` | Show a session's state and exit code |
 | `log` | Show output; `--tail N`, `--grep <re>`, `--since <off> --json`, `--follow` for incremental/live reads |
 | `screenshot` (`shot`) | Render the *current* screen via a virtual terminal (readable for full-screen TUIs that redraw in place); `--format plain\|ansi\|json`, `--trim` |
-| `send` | Send text to the command's stdin (`-n`/`--no-newline` to omit the newline) |
+| `send` | Send text to the command's stdin (`-n`/`--no-newline` to omit the newline; `--json` returns `{sent, offset}`) |
 | `key` | Send named keys (`Enter`, `Up`, `Esc`, `C-c`, `F1`, …) |
 | `expect` | Block until a regex appears in the output |
 | `wait-idle` | Block until output has been quiet for `--settle` |
@@ -82,13 +87,24 @@ Run `babysit help <command>` for flags and aliases.
 ## Waiting on output
 
 - `expect <regex>` scans the whole log by default, so a marker that has already
-  been printed still matches. Pass `--since <bytes>` (the `output_bytes` from
-  `status --json`, captured before whatever triggers the output) to wait for a
-  specific response without races, or `--from-now` to ignore the existing log.
+  been printed still matches. To wait for a *specific* response without races,
+  capture an offset before the action and pass it as `--since <bytes>`: either
+  the `offset` returned by `send`/`key --json` (the byte position just before
+  your input was injected) or `output_bytes` from `status --json`. `--from-now`
+  ignores the existing log entirely.
+- `expect` and `wait-idle` time out after **30s by default** so a stuck program
+  can't hang an agent; pass `--timeout 0` (or `none`) to wait indefinitely.
+  `wait` has no default timeout — guard long unattended runs with
+  `run --timeout`/`--idle-timeout` instead.
 - `wait-idle --settle <dur>` returns once output has been quiet for that long.
 - `status --json` reports `output_bytes` and `screen_seq`; if neither changed
-  since the last check, the command hasn't produced anything new.
+  since the last check, the command hasn't produced anything new. (`screen_seq`
+  is live-only — it is `null` once the worker has exited.)
+- `screenshot --format json` also carries `screen_seq`, so you can fetch a frame
+  and its sequence number in one call.
 - `log --grep <re>` filters to matching lines.
+- Mutating commands (`send`, `key`, `kill`, `restart`, `resize`, `flag`,
+  `unflag`, `detach`, `prune`) accept `--json` for a machine-readable result.
 
 ## Build from source
 

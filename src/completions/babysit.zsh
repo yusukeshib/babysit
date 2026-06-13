@@ -1,8 +1,7 @@
 #compdef babysit
 
-# Complete known session ids (directories under ~/.babysit/sessions) plus the
-# `latest` selector. Read straight from disk so completion stays fast and
-# never has to spawn babysit.
+# Complete known session ids (directories under ~/.babysit/sessions). Read
+# straight from disk so completion stays fast and never has to spawn babysit.
 __babysit_sessions() {
     local -a sessions
     local __bs_dir="$HOME/.babysit/sessions"
@@ -11,7 +10,6 @@ __babysit_sessions() {
             sessions+=("${sess:t}")
         done
     fi
-    sessions+=("latest")
     _describe 'session' sessions
 }
 
@@ -69,6 +67,7 @@ _babysit() {
                         '--timeout=[Auto-terminate after e.g. 30s, 10m, 2h]:duration:' \
                         '--idle-timeout=[Auto-terminate after this long with no output]:duration:' \
                         '--size=[Initial terminal size COLSxROWS]:size:' \
+                        '--json[Print the session id as JSON]' \
                         '(-)1:command:_command_names -e' \
                         '*::arguments:_normal'
                     ;;
@@ -99,9 +98,15 @@ _babysit() {
                 send|type)
                     _arguments \
                         '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
-                        '(-n --no-newline)'{-n,--no-newline}'[Do not append a trailing newline]'
+                        '(-n --no-newline)'{-n,--no-newline}'[Do not append a trailing newline]' \
+                        '--json[Emit JSON {sent, offset}]'
                     ;;
-                restart|r|kill|stop|attach|a|detach|key|resize|flag|unflag)
+                restart|r|kill|stop|detach|key|resize|flag|unflag)
+                    _arguments \
+                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--json[Emit a JSON result]'
+                    ;;
+                attach|a)
                     _arguments \
                         '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions'
                     ;;
@@ -126,7 +131,9 @@ _babysit() {
                         '--timeout=[Give up after e.g. 30s, 10m]:duration:'
                     ;;
                 prune)
-                    _arguments '--dry-run[Print what would be deleted, but do not delete]'
+                    _arguments \
+                        '--dry-run[Print what would be deleted, but do not delete]' \
+                        '--json[Emit the deleted/would-delete sessions as JSON]'
                     ;;
                 config)
                     if (( CURRENT == 2 )); then
