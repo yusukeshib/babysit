@@ -114,10 +114,33 @@ Options:
 Run `babysit help <command>` for flags and aliases. `babysit -- <cmd>`
 is a short form for `babysit run <cmd>`.
 
-`-s <id>` is shorthand for `--session <id>` and accepts either the id,
-a name set via `--name`, or the literal string `latest`. From inside
-the wrapped command itself the session is implicit via
-`$BABYSIT_SESSION_ID`, so the flag can be omitted.
+By default a session gets an auto-generated id; pass `--id <id>` to
+`run` to choose your own (e.g. `babysit run --id ci -- make local-ci`).
+Ids must be unique and contain only letters, digits, `-`, `_`, `.`.
+
+`-s <id>` is shorthand for `--session <id>` and accepts either the id
+or the literal string `latest`. From inside the wrapped command itself
+the session is implicit via `$BABYSIT_SESSION_ID`, so the flag can be
+omitted.
+
+## Detached mode
+
+`babysit -d -- <cmd>` (or `babysit run -d -- <cmd>`) starts the command
+in the background and returns immediately, leaving a detached babysit
+worker supervising it:
+
+```console
+$ babysit -d --id ci -- make local-ci
+babysit session ci: make local-ci
+  babysit log -s ci --tail 200
+  babysit status -s ci
+$ # prompt returns right away; the agent polls `ci` on its own
+```
+
+The worker survives this shell exiting. Its live output isn't mirrored
+to your terminal (there's no terminal attached), but it's still
+captured to the session log, so `babysit log`/`status`/`send`/`kill`
+work exactly as for an attached session.
 
 `status` and `log` work even after babysit has exited — they fall back
 to the on-disk state files. `restart`, `kill`, and `send` need the live
