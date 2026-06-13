@@ -84,6 +84,13 @@ build from source:
 cargo install --git https://github.com/yusukeshib/babysit
 ```
 
+With Nix (flakes):
+
+```
+nix run github:yusukeshib/babysit        # run without installing
+nix profile install github:yusukeshib/babysit
+```
+
 Once installed, `babysit upgrade` self-updates to the latest release.
 
 ## Subcommands

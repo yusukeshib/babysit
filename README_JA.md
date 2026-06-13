@@ -86,6 +86,13 @@ curl -fsSL https://raw.githubusercontent.com/yusukeshib/babysit/main/install.sh 
 cargo install --git https://github.com/yusukeshib/babysit
 ```
 
+Nix（flakes）を使う場合:
+
+```
+nix run github:yusukeshib/babysit        # インストールせずに実行
+nix profile install github:yusukeshib/babysit
+```
+
 インストール後は `babysit upgrade` で最新リリースに自己アップデート
 できる。
 
