@@ -48,7 +48,7 @@ _babysit() {
             [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --json" -- "$cur"))
             ;;
         log|logs)
-            [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --tail --raw" -- "$cur"))
+            [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --tail --raw --since -f --follow --json" -- "$cur"))
             ;;
         restart|r|kill|stop|send|type|attach|a|detach)
             [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session" -- "$cur"))

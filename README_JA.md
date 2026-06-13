@@ -234,6 +234,21 @@ babysit wait -s ENG-123           # 終了までブロック。終了コード�
 - **`babysit wait`** … 終了までブロックして終了コードを返す。orchestrator が
   ポーリングせずタスクを join できる。`--timeout` で見切り、その場合は
   `124` で終了（セッションは走り続ける）。
+- **`babysit log --since <offset> --json`** … 生ログのバイト offset 以降の
+  差分だけを読み、`{text, offset, done}` を返す。ポーラーは `offset` から
+  再開し、`done` で止められる。**`--follow`**（`-f`）は終了までライブを
+  ストリーム（`tail -f` 相当）。
+
+```sh
+# 1 タスクの差分ポーリングループ:
+off=0
+while :; do
+  r=$(babysit log -s ENG-123 --since "$off" --json)
+  printf '%s' "$(jq -r .text <<<"$r")"
+  off=$(jq .offset <<<"$r"); [ "$(jq .done <<<"$r")" = true ] && break
+  sleep 1
+done
+```
 
 ラップされたコマンドは `$BABYSIT_SESSION_ID` を参照できるので、エージェントが
 自分のセッションを扱える。タスクごとの分離（git worktree 等）が欲しければ
