@@ -2,10 +2,12 @@
 //! ferry bytes between the master fd and attached clients.
 //!
 //! Output bytes from the PTY are tee'd to a log file and fanned out through
-//! an `OutputHub` to any attached clients. There is no terminal-emulator
-//! parser in babysit itself — the client's terminal renders the bytes
-//! directly.
+//! an `OutputHub` to any attached clients. They are also fed into a `vt100`
+//! virtual-terminal parser so `babysit screenshot` can render the current
+//! on-screen grid (the client's own terminal still renders the live bytes
+//! directly for `attach`).
 
+use crate::cli::ShotFormat;
 use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::VecDeque;
@@ -92,6 +94,9 @@ pub struct Pane {
     /// and the log) and seen EOF. Lets shutdown wait for the final bytes
     /// instead of racing `process::exit` against the last flush.
     pub reader_done: Arc<tokio::sync::Notify>,
+    /// Virtual terminal: every output byte is fed here so we can render the
+    /// current visible screen for `babysit screenshot`.
+    screen: Arc<Mutex<vt100::Parser>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,6 +204,9 @@ impl Pane {
         let exit_notify = Arc::new(tokio::sync::Notify::new());
         let reader_done = Arc::new(tokio::sync::Notify::new());
         let log_path: Option<PathBuf> = output_log.map(|p| p.to_path_buf());
+        // Virtual terminal sized to the PTY (no scrollback: a screenshot is a
+        // single visible frame). Kept in sync with the PTY via `resize`.
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
 
         // One reader thread per output stream (PTY: 1; pipe: stdout + stderr).
         // `reader_done` fires when the last of them drains and sees EOF.
@@ -208,6 +216,7 @@ impl Pane {
                 reader,
                 log_path.clone(),
                 hub.clone(),
+                screen.clone(),
                 remaining.clone(),
                 reader_done.clone(),
             );
@@ -264,6 +273,7 @@ impl Pane {
             exit_status,
             exit_notify,
             reader_done,
+            screen,
         })
     }
 
@@ -292,6 +302,20 @@ impl Pane {
                 pixel_height: 0,
             });
         }
+        // Keep the virtual terminal in lock-step with the PTY so screenshots
+        // reflect the dimensions the program is actually drawing for.
+        if let Ok(mut s) = self.screen.lock() {
+            s.screen_mut().set_size(rows, cols);
+        }
+    }
+
+    /// Render the current visible screen of the virtual terminal in the
+    /// requested `format`. See `render_screen` for the output shape.
+    pub fn screenshot(&self, format: ShotFormat, trim: bool) -> serde_json::Value {
+        match self.screen.lock() {
+            Ok(p) => render_screen(p.screen(), format, trim),
+            Err(_) => serde_json::json!({ "error": "screen lock poisoned" }),
+        }
     }
 
     /// `Some(_)` once the child has exited.
@@ -315,6 +339,7 @@ fn spawn_output_reader(
     mut reader: Box<dyn Read + Send>,
     log_path: Option<PathBuf>,
     hub: Arc<OutputHub>,
+    screen: Arc<Mutex<vt100::Parser>>,
     remaining: Arc<AtomicUsize>,
     reader_done: Arc<tokio::sync::Notify>,
 ) {
@@ -328,6 +353,9 @@ fn spawn_output_reader(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Ok(mut p) = screen.lock() {
+                        p.process(&buf[..n]);
+                    }
                     hub.broadcast(&buf[..n]);
                     if let Some(f) = log_file.as_mut() {
                         let _ = f.write_all(&buf[..n]);
@@ -342,4 +370,199 @@ fn spawn_output_reader(
             reader_done.notify_one();
         }
     });
+}
+
+/// Fallback size used when rendering a screenshot for a session whose worker
+/// is no longer running (we replay the on-disk log through a fresh parser and
+/// have no record of the final PTY dimensions).
+pub const DEFAULT_SCREENSHOT_SIZE: (u16, u16) = (24, 80);
+
+/// Render a finished session's screen by replaying its raw output log through
+/// a fresh virtual terminal. Imperfect (the final PTY size is unknown, so we
+/// assume a default), but lets `screenshot` work after the command exits.
+pub fn render_log(bytes: &[u8], format: ShotFormat, trim: bool) -> serde_json::Value {
+    let (rows, cols) = DEFAULT_SCREENSHOT_SIZE;
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(bytes);
+    render_screen(parser.screen(), format, trim)
+}
+
+/// Serialize a vt100 color to a compact, agent-friendly string:
+/// `"default"`, `"idxN"` (palette index), or `"#rrggbb"` (true color).
+fn color_str(c: vt100::Color) -> String {
+    match c {
+        vt100::Color::Default => "default".to_string(),
+        vt100::Color::Idx(i) => format!("idx{i}"),
+        vt100::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+    }
+}
+
+/// Index of the last row with any visible content (for trimming trailing
+/// blank lines). Returns 0 when the whole screen is blank.
+fn last_nonblank(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map_or(0, |i| i + 1)
+}
+
+/// Render the visible grid of `screen` in the requested format. All variants
+/// carry `rows`, `cols`, and `cursor` so an agent knows the geometry and
+/// where focus currently is.
+fn render_screen(screen: &vt100::Screen, format: ShotFormat, trim: bool) -> serde_json::Value {
+    let (rows, cols) = screen.size();
+    let (cur_row, cur_col) = screen.cursor_position();
+    let meta = serde_json::json!({
+        "rows": rows,
+        "cols": cols,
+        "cursor": { "row": cur_row, "col": cur_col, "hidden": screen.hide_cursor() },
+        "alternate_screen": screen.alternate_screen(),
+    });
+
+    match format {
+        ShotFormat::Plain => {
+            let mut lines: Vec<String> = screen.rows(0, cols).collect();
+            if trim {
+                lines.truncate(last_nonblank(&lines));
+            }
+            let mut out = meta;
+            out["format"] = "plain".into();
+            out["text"] = lines.join("\n").into();
+            out
+        }
+        ShotFormat::Ansi => {
+            let formatted: Vec<Vec<u8>> = screen.rows_formatted(0, cols).collect();
+            let mut lines: Vec<String> = formatted
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect();
+            if trim {
+                // Decide what to keep from the plain rows (escape codes make a
+                // formatted row never look "blank").
+                let plain: Vec<String> = screen.rows(0, cols).collect();
+                lines.truncate(last_nonblank(&plain));
+            }
+            // Each formatted row carries its own SGR state but no cursor
+            // movement, so a plain newline joins them cleanly; reset at the end
+            // so the caller's terminal isn't left in a stray attribute.
+            let text = format!("{}\x1b[0m", lines.join("\n"));
+            let mut out = meta;
+            out["format"] = "ansi".into();
+            out["text"] = text.into();
+            out
+        }
+        ShotFormat::Json => {
+            // Only emit cells that carry content or non-default styling, so the
+            // payload stays small for an agent to read.
+            let mut cells = Vec::new();
+            for r in 0..rows {
+                for c in 0..cols {
+                    let Some(cell) = screen.cell(r, c) else {
+                        continue;
+                    };
+                    if cell.is_wide_continuation() {
+                        continue;
+                    }
+                    let styled = cell.bold()
+                        || cell.italic()
+                        || cell.underline()
+                        || cell.inverse()
+                        || !matches!(cell.fgcolor(), vt100::Color::Default)
+                        || !matches!(cell.bgcolor(), vt100::Color::Default);
+                    if !cell.has_contents() && !styled {
+                        continue;
+                    }
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("row".into(), r.into());
+                    obj.insert("col".into(), c.into());
+                    obj.insert("char".into(), cell.contents().into());
+                    if !matches!(cell.fgcolor(), vt100::Color::Default) {
+                        obj.insert("fg".into(), color_str(cell.fgcolor()).into());
+                    }
+                    if !matches!(cell.bgcolor(), vt100::Color::Default) {
+                        obj.insert("bg".into(), color_str(cell.bgcolor()).into());
+                    }
+                    for (k, v) in [
+                        ("bold", cell.bold()),
+                        ("italic", cell.italic()),
+                        ("underline", cell.underline()),
+                        ("inverse", cell.inverse()),
+                    ] {
+                        if v {
+                            obj.insert(k.into(), true.into());
+                        }
+                    }
+                    cells.push(serde_json::Value::Object(obj));
+                }
+            }
+            let mut out = meta;
+            out["format"] = "json".into();
+            out["cells"] = cells.into();
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a screen by feeding `bytes` into a fresh parser.
+    fn screen_of(bytes: &[u8]) -> vt100::Parser {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(bytes);
+        p
+    }
+
+    #[test]
+    fn plain_reflects_in_place_redraw_not_the_raw_stream() {
+        // Print 3 lines, move up 2 and overwrite the middle one. The raw
+        // stream has 4 lines; the *screen* has 3. (CRLF models the bytes a PTY
+        // actually logs, after the line discipline's \n→\r\n translation.)
+        let p = screen_of(b"A\r\nB\r\nC\r\n\x1b[2A\x1b[2KB2\r\n");
+        let out = render_screen(p.screen(), ShotFormat::Plain, true);
+        assert_eq!(out["text"], "A\nB2\nC");
+        assert_eq!(out["format"], "plain");
+    }
+
+    #[test]
+    fn trim_drops_trailing_blank_lines() {
+        let p = screen_of(b"hi\r\n");
+        let trimmed = render_screen(p.screen(), ShotFormat::Plain, true);
+        assert_eq!(trimmed["text"], "hi");
+        // Untrimmed keeps the full grid height (24 rows = 23 separators).
+        let full = render_screen(p.screen(), ShotFormat::Plain, false);
+        let text = full["text"].as_str().unwrap();
+        assert!(text.starts_with("hi\n"));
+        assert_eq!(text.matches('\n').count(), 23);
+    }
+
+    #[test]
+    fn json_records_inverse_and_color_for_a_selected_row() {
+        // An inverse-video red 'X' — the shape a TUI uses to mark a selection.
+        let p = screen_of(b"\x1b[31;7mX\x1b[0m");
+        let out = render_screen(p.screen(), ShotFormat::Json, true);
+        let cells = out["cells"].as_array().unwrap();
+        let cell = &cells[0];
+        assert_eq!(cell["char"], "X");
+        assert_eq!(cell["fg"], "idx1");
+        assert_eq!(cell["inverse"], true);
+        // Default-styled blank cells are omitted to keep the payload small.
+        assert_eq!(cells.len(), 1);
+    }
+
+    #[test]
+    fn ansi_preserves_escapes_and_resets_at_end() {
+        let p = screen_of(b"\x1b[31mred\x1b[0m");
+        let out = render_screen(p.screen(), ShotFormat::Ansi, true);
+        let text = out["text"].as_str().unwrap();
+        assert!(text.contains('\x1b'), "escapes should be preserved");
+        assert!(text.ends_with("\x1b[0m"), "should reset SGR at the end");
+    }
+
+    #[test]
+    fn render_log_replays_a_finished_session() {
+        let out = render_log(b"done\n", ShotFormat::Plain, true);
+        assert_eq!(out["text"], "done");
+    }
 }

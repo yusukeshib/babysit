@@ -35,6 +35,8 @@ _babysit() {
                 'info:Show status of a session'
                 'log:Show recent output from the wrapped command'
                 'logs:Show recent output from the wrapped command'
+                'screenshot:Capture the current visible screen'
+                'shot:Capture the current visible screen'
                 'restart:Restart the wrapped command'
                 'r:Restart the wrapped command'
                 'kill:Terminate the wrapped command'
@@ -78,6 +80,12 @@ _babysit() {
                         '--since=[Only output bytes after this raw-log offset]:bytes:' \
                         '(-f --follow)'{-f,--follow}'[Stream new output live until exit]' \
                         '--json[Emit JSON {text, offset, done}]'
+                    ;;
+                screenshot|shot)
+                    _arguments \
+                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--format=[Output format]:format:(plain ansi json)' \
+                        '--trim[Drop trailing blank lines and whitespace]'
                     ;;
                 restart|r|kill|stop|send|type|attach|a|detach)
                     _arguments \

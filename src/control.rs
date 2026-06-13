@@ -37,6 +37,12 @@ pub enum Request {
         #[serde(default)]
         raw: bool,
     },
+    /// Render the current visible screen (virtual terminal grid).
+    Screenshot {
+        format: crate::cli::ShotFormat,
+        #[serde(default)]
+        trim: bool,
+    },
     /// Send text + newline to the wrapped command's stdin.
     Send { text: String },
     /// Restart the wrapped command (kill + respawn with the same argv).
@@ -206,6 +212,10 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
         Request::Log { tail, raw } => {
             let path = paths::output_log_path(&handle.session_id)?;
             read_log(&path, tail, raw).await
+        }
+        Request::Screenshot { format, trim } => {
+            let pane = handle.cmd_pane.lock().await.clone();
+            Ok(pane.screenshot(format, trim))
         }
         Request::Send { text } => {
             let pane = handle.cmd_pane.lock().await.clone();
