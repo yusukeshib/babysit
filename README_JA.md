@@ -112,6 +112,7 @@ Commands:
   restart  Restart the wrapped command
   kill     Terminate the wrapped command
   send     Send text to the wrapped command's stdin (newline appended)
+  wait     Block until the wrapped command exits, then return its exit code
   attach   Attach your terminal to a session (detach with Ctrl-\ Ctrl-\)
   detach   Detach any terminal currently attached to a session
   prune    Delete sessions whose wrapped command has finished or whose owner died
@@ -201,6 +202,33 @@ eval "$(babysit config bash)"
 サブコマンドとそのエイリアス、各コマンドのフラグ、そして最も便利な点として
 `-s` のセッション ID 補完（`~/.babysit/sessions` を直接読む。`latest` も含む）
 が効くようになる。`babysit run` はシェル本来のコマンド補完に委譲する。
+
+## エージェントをバックグラウンドで回す
+
+orchestrator（例: エージェントループ）が他のエージェントをバックグラウンド
+で起動して監視する、という使い方に向いている:
+
+```sh
+# チケット名などで名付けて起動。ログを清潔に保つため --no-tty。
+babysit run -d --no-tty --id ENG-123 --timeout 30m -- my-agent --task ENG-123
+
+babysit ls --json                 # 何が動いてて、それぞれの状態
+babysit log -s ENG-123 --tail 50  # 今何をしているか
+babysit wait -s ENG-123           # 終了までブロック。終了コード＝エージェントのもの
+```
+
+- **`--no-tty`** … PTY でなくパイプで起動。非 tty を検出するツールは
+  行指向のクリーンな出力を出すので、ログから拾いやすい（フルスクリーン
+  再描画のノイズがない）。
+- **`--timeout <dur>`** … ハングした run を自動終了（`30s`/`10m`/`2h`/`1d`/
+  素の秒）。無人ループの安全弁。
+- **`babysit wait`** … 終了までブロックして終了コードを返す。orchestrator が
+  ポーリングせずタスクを join できる。`--timeout` で見切り、その場合は
+  `124` で終了（セッションは走り続ける）。
+
+ラップされたコマンドは `$BABYSIT_SESSION_ID` を参照できるので、エージェントが
+自分のセッションを扱える。タスクごとの分離（git worktree 等）が欲しければ
+ワークスペース管理ツールと併用するとよい。
 
 ## ディスク上のセッション状態
 
