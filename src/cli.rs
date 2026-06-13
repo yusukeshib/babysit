@@ -90,6 +90,17 @@ pub enum Command {
         /// Text to send
         text: String,
     },
+    /// Attach your terminal to a session (detach with Ctrl-P Ctrl-Q)
+    #[command(alias = "a")]
+    Attach {
+        #[command(flatten)]
+        sel: SessionSel,
+    },
+    /// Detach any terminal currently attached to a session
+    Detach {
+        #[command(flatten)]
+        sel: SessionSel,
+    },
     /// Delete sessions whose wrapped command has finished or whose owner died
     Prune {
         /// Print what would be deleted, but don't delete
