@@ -183,6 +183,11 @@ pub async fn attach_to(id: String) -> Result<i32> {
     let mut winch = signal(SignalKind::window_change())?;
     let mut saw_ctrl_p = false;
     let exit_code: i32;
+    // Whether we left the session running (detached / worker vanished) vs the
+    // command actually exiting. On the former the wrapped program is still
+    // holding terminal modes (alt-screen, enhanced keyboard, …) that it never
+    // tore down for us, so we clean the terminal ourselves afterwards.
+    let mut restore_terminal = false;
 
     loop {
         tokio::select! {
@@ -194,11 +199,12 @@ pub async fn attach_to(id: String) -> Result<i32> {
                     let _ = out.flush();
                 }
                 Ok(Some((S_EXIT, payload))) => { exit_code = parse_exit(&payload); break; }
-                Ok(Some((S_DETACHED, _))) => { exit_code = 0; break; }
+                Ok(Some((S_DETACHED, _))) => { exit_code = 0; restore_terminal = true; break; }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => {
                     // Worker closed unexpectedly; fall back to the recorded code.
                     exit_code = recorded_exit_code(&id).await;
+                    restore_terminal = true;
                     break;
                 }
             },
@@ -208,7 +214,7 @@ pub async fn attach_to(id: String) -> Result<i32> {
                     if !forward.is_empty() {
                         write_frame(&mut wr, C_INPUT, &forward).await?;
                     }
-                    if do_detach { exit_code = 0; break; }
+                    if do_detach { exit_code = 0; restore_terminal = true; break; }
                 }
                 None => { /* stdin closed; keep streaming output */ }
             },
@@ -220,7 +226,26 @@ pub async fn attach_to(id: String) -> Result<i32> {
         }
     }
 
+    if restore_terminal {
+        restore_terminal_modes();
+    }
     Ok(exit_code)
+}
+
+/// After detaching (or the worker vanishing), the wrapped program is still
+/// running and never reset the terminal modes it had enabled, so the shell we
+/// return to would be left in alt-screen / mouse / bracketed-paste /
+/// enhanced-keyboard mode. Emit a best-effort cleanup, like tmux does on
+/// detach. Harmless if the program hadn't enabled these.
+fn restore_terminal_modes() {
+    use std::io::Write as _;
+    // exit alt screens; show cursor; disable mouse (1000/1002/1003/1006/1015);
+    // disable bracketed paste (2004) and focus reporting (1004); pop the kitty
+    // keyboard protocol stack; reset SGR; carriage return.
+    const CLEANUP: &[u8] = b"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[0m\r";
+    let mut out = std::io::stdout();
+    let _ = out.write_all(CLEANUP);
+    let _ = out.flush();
 }
 
 /// Connect to the worker's socket, retrying briefly while it binds. Returns

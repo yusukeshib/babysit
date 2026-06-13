@@ -149,6 +149,12 @@ $ babysit detach -s ci            # kick off whoever's attached, keep it running
 - **Detach hotkey:** `Ctrl-\ Ctrl-\` (press Ctrl-backslash twice) —
   leaves the command running and returns your shell. (A flow-control key
   like Ctrl-Q, or one TUIs grab like Ctrl-P, would be unreliable.)
+- **Full-screen TUIs** (editors, `pi`, etc.) often enable an enhanced
+  keyboard mode that re-encodes control keys, so the hotkey may not be
+  detected. In that case detach from another terminal with
+  `babysit detach -s <id>` — that path is independent of the keyboard and
+  always works. babysit resets the terminal (alt-screen/mouse/…) on detach
+  so your shell is left usable.
 - `babysit attach -s <id>` replays the recent output, then streams live
   and forwards your keystrokes/resizes.
 - `babysit detach -s <id>` detaches clients from another terminal.
