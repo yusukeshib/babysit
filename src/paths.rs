@@ -30,3 +30,9 @@ pub fn output_log_path(id: &str) -> Result<PathBuf> {
 pub fn control_socket_path(id: &str) -> Result<PathBuf> {
     Ok(session_dir(id)?.join("control.sock"))
 }
+
+/// Optional attention note set by `babysit flag`. Its presence means the
+/// session is flagged for a human; its contents are the message.
+pub fn note_path(id: &str) -> Result<PathBuf> {
+    Ok(session_dir(id)?.join("note"))
+}

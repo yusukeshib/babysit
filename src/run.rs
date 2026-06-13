@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, watch};
 /// output fan-out. Foreground terminals are just *clients* attached over the
 /// socket. `run` spawns the worker and (unless `-d`) attaches to it; `-d`
 /// spawns the worker and returns immediately.
+#[allow(clippy::too_many_arguments)] // top-level CLI entry; each arg is a distinct flag
 pub async fn run(
     cmd: Vec<String>,
     id: Option<String>,
@@ -25,21 +26,25 @@ pub async fn run(
     detached_id: Option<String>,
     no_tty: bool,
     timeout: Option<String>,
+    idle_timeout: Option<String>,
+    size: Option<String>,
 ) -> Result<i32> {
-    // Parse the timeout up front so a bad value errors before we spawn.
+    // Parse the inputs up front so a bad value errors before we spawn.
     let timeout = timeout.as_deref().map(parse_duration).transpose()?;
+    let idle_timeout = idle_timeout.as_deref().map(parse_duration).transpose()?;
+    let size = size.as_deref().map(parse_size).transpose()?;
 
     // We are the detached worker (re-exec'd with --detached-id): run the
     // headless server loop and never come back until the command exits.
     if let Some(worker_id) = detached_id {
-        serve_worker(cmd, worker_id, !no_tty, timeout).await?;
+        serve_worker(cmd, worker_id, !no_tty, timeout, idle_timeout, size).await?;
         return Ok(0);
     }
 
     // Parent: choose the id, announce it, spawn the worker.
     let session_id = session::make_id(id).await?;
     print_banner(&session_id, &cmd.join(" "));
-    spawn_worker_process(&cmd, &session_id, no_tty, timeout)?;
+    spawn_worker_process(&cmd, &session_id, no_tty, timeout, idle_timeout, size)?;
 
     if detach {
         return Ok(0);
@@ -57,6 +62,8 @@ async fn serve_worker(
     id: String,
     tty: bool,
     timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    size: Option<(u16, u16)>,
 ) -> Result<()> {
     let meta = Meta {
         id: id.clone(),
@@ -67,9 +74,9 @@ async fn serve_worker(
     session::write_meta(&meta).await?;
     session::write_status(&id, &Status::starting()).await?;
 
-    // No terminal here (stdio is /dev/null); start at a sane default. Attached
-    // clients send their real size via a resize frame.
-    let (cols, rows) = (80u16, 24u16);
+    // No terminal here (stdio is /dev/null); start at the requested size or a
+    // sane default. Attached clients send their real size via a resize frame.
+    let (cols, rows) = size.unwrap_or((80, 24));
 
     let log_path = paths::output_log_path(&id)?;
     let env = vec![("BABYSIT_SESSION_ID".into(), id.clone())];
@@ -126,6 +133,13 @@ async fn serve_worker(
     let timeout_at = timeout.map(|d| tokio::time::Instant::now() + d);
     let mut timed_out = false;
 
+    // Optional inactivity watchdog: poll the pane's idle time and kill once it
+    // exceeds the limit. Polled (rather than event-driven) since output
+    // arrives on a blocking reader thread.
+    let idle_limit_ms = idle_timeout.map(|d| d.as_millis() as u64);
+    let mut idle_tick = idle_limit_ms.map(|_| tokio::time::interval(Duration::from_millis(500)));
+    let mut idle_killed = false;
+
     loop {
         let exit_notify = current_pane.exit_notify.clone();
         tokio::select! {
@@ -137,6 +151,19 @@ async fn serve_worker(
             }, if !timed_out => {
                 timed_out = true;
                 current_pane.kill();
+            }
+            _ = async {
+                match idle_tick.as_mut() {
+                    Some(t) => { t.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            }, if !idle_killed => {
+                if let Some(limit) = idle_limit_ms
+                    && current_pane.idle_ms() >= limit
+                {
+                    idle_killed = true;
+                    current_pane.kill();
+                }
             }
             Some(msg) = action_rx.recv() => match msg {
                 LoopMessage::Restart => {
@@ -215,6 +242,8 @@ fn spawn_worker_process(
     id: &str,
     no_tty: bool,
     timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    size: Option<(u16, u16)>,
 ) -> Result<()> {
     use std::process::{Command, Stdio};
 
@@ -226,6 +255,14 @@ fn spawn_worker_process(
     }
     if let Some(d) = timeout {
         command.arg("--timeout").arg(format!("{}s", d.as_secs()));
+    }
+    if let Some(d) = idle_timeout {
+        command
+            .arg("--idle-timeout")
+            .arg(format!("{}ms", d.as_millis()));
+    }
+    if let Some((c, r)) = size {
+        command.arg("--size").arg(format!("{c}x{r}"));
     }
     command.arg("--").args(cmd);
     command
@@ -253,12 +290,21 @@ fn spawn_worker_process(
     Ok(())
 }
 
-/// Parse a human duration like `30s`, `10m`, `2h`, `1d`, or a bare number of
-/// seconds, into a `Duration`.
+/// Parse a human duration like `500ms`, `30s`, `10m`, `2h`, `1d`, or a bare
+/// number of seconds, into a `Duration`.
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
     if s.is_empty() {
         return Err(anyhow!("empty duration"));
+    }
+    // Milliseconds first, since `ms` ends in `s` and would otherwise be read
+    // as seconds.
+    if let Some(num) = s.strip_suffix("ms").or_else(|| s.strip_suffix("MS")) {
+        let n: u64 = num
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("invalid duration `{s}` (use e.g. 500ms, 30s, 10m, 2h)"))?;
+        return Ok(Duration::from_millis(n));
     }
     let (num, unit_secs) = match s.as_bytes()[s.len() - 1] {
         b's' | b'S' => (&s[..s.len() - 1], 1u64),
@@ -270,8 +316,27 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     let n: u64 = num
         .trim()
         .parse()
-        .map_err(|_| anyhow!("invalid duration `{s}` (use e.g. 30s, 10m, 2h)"))?;
+        .map_err(|_| anyhow!("invalid duration `{s}` (use e.g. 500ms, 30s, 10m, 2h)"))?;
     Ok(Duration::from_secs(n * unit_secs))
+}
+
+/// Parse a `COLSxROWS` geometry string like `120x40` into `(cols, rows)`.
+pub fn parse_size(s: &str) -> Result<(u16, u16)> {
+    let (c, r) = s
+        .split_once(['x', 'X'])
+        .ok_or_else(|| anyhow!("invalid size `{s}` (use COLSxROWS, e.g. 120x40)"))?;
+    let cols: u16 = c
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid columns in `{s}`"))?;
+    let rows: u16 = r
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid rows in `{s}`"))?;
+    if cols == 0 || rows == 0 {
+        return Err(anyhow!("size must be non-zero (got `{s}`)"));
+    }
+    Ok((cols, rows))
 }
 
 #[cfg(test)]
@@ -293,5 +358,24 @@ mod tests {
         assert!(parse_duration("").is_err());
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("10x").is_err());
+    }
+
+    #[test]
+    fn parses_milliseconds() {
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("0ms").unwrap(), Duration::from_millis(0));
+        // `ms` must win over the `s`-suffix branch.
+        assert_ne!(parse_duration("500ms").unwrap(), Duration::from_secs(500));
+        assert!(parse_duration("ms").is_err());
+    }
+
+    #[test]
+    fn parses_size() {
+        use super::parse_size;
+        assert_eq!(parse_size("120x40").unwrap(), (120, 40));
+        assert_eq!(parse_size("80X24").unwrap(), (80, 24));
+        assert!(parse_size("120").is_err());
+        assert!(parse_size("0x10").is_err());
+        assert!(parse_size("axb").is_err());
     }
 }

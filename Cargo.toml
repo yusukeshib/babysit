@@ -32,6 +32,7 @@ nix = { version = "0.29", features = ["signal", "process"] }
 chrono = { version = "0.4", features = ["serde"] }
 strip-ansi-escapes = "0.2"
 vt100 = "0.16"
+regex = "1"
 self_update = { version = "0.42", default-features = false, features = [
   "rustls",
 ] }

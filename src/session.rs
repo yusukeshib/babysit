@@ -176,6 +176,32 @@ pub async fn read_status(id: &str) -> Result<Status> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Write an attention note for a session (`babysit flag`). Creates the
+/// session dir if needed so it works regardless of the worker's state.
+pub async fn write_note(id: &str, message: &str) -> Result<()> {
+    let dir = paths::session_dir(id)?;
+    tokio::fs::create_dir_all(&dir).await?;
+    tokio::fs::write(paths::note_path(id)?, message.as_bytes()).await?;
+    Ok(())
+}
+
+/// Clear a session's attention note (`babysit unflag`). Missing note is fine.
+pub async fn clear_note(id: &str) -> Result<()> {
+    match tokio::fs::remove_file(paths::note_path(id)?).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read a session's attention note, if flagged. A present-but-empty file
+/// still counts as flagged and yields an empty string.
+pub async fn read_note(id: &str) -> Option<String> {
+    let path = paths::note_path(id).ok()?;
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    Some(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
 /// Enumerate all session ids by listing ~/.babysit/sessions/.
 pub async fn list_ids() -> Result<Vec<String>> {
     let dir = paths::sessions_dir()?;
