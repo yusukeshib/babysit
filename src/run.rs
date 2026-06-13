@@ -64,7 +64,7 @@ pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<i32> {
         &id,
         &Status {
             state: State::Running,
-            child_pid: None,
+            child_pid: pane.pid,
             exit_code: None,
             last_change: Utc::now(),
         },
@@ -122,7 +122,7 @@ pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<i32> {
                     handle.replace_cmd_pane(new_pane.clone()).await;
                     session::write_status(&id, &Status {
                         state: State::Running,
-                        child_pid: None,
+                        child_pid: new_pane.pid,
                         exit_code: None,
                         last_change: Utc::now(),
                     }).await?;
