@@ -34,10 +34,14 @@ exported as `$BABYSIT_SESSION_ID`, so nested calls can omit `-s`.
 ## Install
 
 ```sh
-cargo install babysit
+cargo install babysit                            # from crates.io
+nix profile install github:yusukeshib/babysit    # with Nix flakes
 ```
 
-Then `babysit upgrade` self-updates to the latest release.
+Or run it without installing: `nix run github:yusukeshib/babysit -- -- make local-ci`.
+
+For a `cargo install` / released binary, `babysit upgrade` self-updates to the
+latest release (Nix installs are managed by Nix instead).
 
 ## Subcommands
 
