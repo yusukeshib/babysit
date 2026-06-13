@@ -1,157 +1,72 @@
 # babysit
 
-[日本語版 README](README_JA.md)
-
-Gives local terminal commands an API, so external AI agents (Claude
-Code, Codex, …) can query their live output and exit state — the same
-way they already query `gcloud` or `kubectl`.
-
-Two patterns it's built for:
-
-1. **Hand a run to an agent** — wrap a command, give the agent the
-   session id, and it pulls live output / exit state on demand (below).
-2. **Let an agent orchestrate** — an agent loop launches tasks in the
-   background (`babysit run -d`), lists them (`babysit ls`), reads their
-   logs (`babysit log`), and joins on them (`babysit wait`). See
-   [Driving agents in the background](#driving-agents-in-the-background).
-
-**Your shell** — wrap the command you'd normally run. babysit prints a
-session id, then runs the command transparently:
+Wrap a local command in a PTY and expose its live output and exit state
+through a small CLI — so an AI agent (Claude Code, Codex, …) can query a
+running command on demand, the same way it already queries `gcloud` or
+`kubectl`.
 
 ```console
-$ babysit -- make local-ci
-babysit session ab12: make local-ci
-  babysit log -s ab12 --tail 200
-  babysit status -s ab12
-Running tests...
-✓ test_a
-✗ test_b: assertion failed
-make: *** [local-ci] Error 1
+$ babysit -- make local-ci      # wrap a command; prints a session id (e.g. ab12)
+$ babysit log -s ab12 --tail 20 # another terminal/agent pulls output on demand
+$ babysit status -s ab12        # state + exit code
+$ babysit wait -s ab12          # block until it exits; returns its exit code
 ```
 
-**Your agent, in another terminal** — hand it the session id (`ab12`)
-and it can pull state on demand:
+## How it works
 
-```console
-$ babysit status -s ab12
-session: ab12
-cmd:     make local-ci
-state:   exit:2
-exit:    2
+The wrapped command runs under a background worker that owns the PTY,
+captures all output to a log, and serves a Unix control socket. The
+terminal you launched from is just *attached* to that worker (tmux-style),
+so you can detach and re-attach, and an agent in another terminal can read
+state at any time. babysit does no monitoring of its own — it just exposes
+the command as a queryable CLI.
 
-$ babysit log -s ab12 --tail 3
-✓ test_a
-✗ test_b: assertion failed
-make: *** [local-ci] Error 1
-```
-
-babysit does no monitoring of its own — it exposes the wrapped command
-as a small CLI/file API; the agent decides when and how to use it.
-
-## Example prompts
-
-Once you've handed your agent the session id, the prompts that work
-well are the kind you'd give a coworker keeping an eye on the run:
-
-> Watch session `ab12` with the `babysit` CLI. Tell me when
-> `make local-ci` finishes, and if it fails, summarize which tests
-> broke and why.
-
-> Keep an eye on session `ab12` using the `babysit` command. Ping me
-> only if something goes wrong.
-
-The agent polls `babysit status` / `babysit log` on its own loop —
-babysit itself does not push notifications.
-
-## Why
-
-Remote execution platforms (`gcloud`, `kubectl`, CI providers, …) ship
-APIs that let an AI agent pull logs and status on demand. Local
-execution doesn't: a command running in your terminal is a black box to
-any agent that isn't already attached to that TTY, so analyzing an
-in-progress run usually means copy-pasting scrollback by hand.
-
-babysit closes that gap. Wrap a command once, and its live output and
-exit state become queryable through a small CLI an agent already knows
-how to drive — no scraping, no screen sharing, no extra daemon.
+State lives in `~/.babysit/sessions/<id>/` (`meta.json`, `status.json`,
+`output.log`, `control.sock`). `status`/`log` work even after the worker
+exits (they fall back to the files); `restart`/`kill`/`send` need it alive.
 
 ## Install
 
-```
-curl -fsSL https://raw.githubusercontent.com/yusukeshib/babysit/main/install.sh | sh
-```
-
-Drops a checksum-verified binary at `~/.local/bin/babysit` (override
-with `BABYSIT_INSTALL_DIR`, pin a version with `BABYSIT_VERSION=v0.2.4`).
-macOS / Linux on x86_64 or aarch64.
-
-Or grab a prebuilt binary directly from
-[GitHub Releases](https://github.com/yusukeshib/babysit/releases), or
-build from source:
-
-```
-cargo install --git https://github.com/yusukeshib/babysit
+```sh
+cargo install babysit
 ```
 
-With Nix (flakes):
-
-```
-nix run github:yusukeshib/babysit        # run without installing
-nix profile install github:yusukeshib/babysit
-```
-
-Once installed, `babysit upgrade` self-updates to the latest release.
+Then `babysit upgrade` self-updates to the latest release.
 
 ## Subcommands
 
-```
-$ babysit help
-Wrap a shell command in a PTY and expose it to external agents via subcommands
+| Command | Description |
+| --- | --- |
+| `run` | Wrap a command in a PTY (`babysit -- <cmd>` is shorthand; `-d` starts it detached in the background) |
+| `list` (`ls`) | List all sessions |
+| `status` | Show a session's state and exit code |
+| `log` | Show output; `--tail N`, `--since <off> --json`, `--follow` for incremental/live reads |
+| `screenshot` (`shot`) | Render the *current* screen via a virtual terminal — see below |
+| `send` | Send text to the command's stdin |
+| `wait` | Block until the command exits, returning its exit code |
+| `restart` | Restart the wrapped command |
+| `kill` | Terminate the wrapped command |
+| `attach` / `detach` | Attach your terminal to a session (detach: `Ctrl-\ Ctrl-\`) / detach others |
+| `prune` | Delete finished or dead sessions |
+| `upgrade` | Self-update to the latest release |
+| `config` | Print shell completions: `eval "$(babysit config zsh\|bash)"` |
 
-Usage: babysit <COMMAND>
+Run `babysit help <command>` for flags and aliases. `-s <id>` selects a
+session (or `latest`); inside the wrapped command it's implicit via
+`$BABYSIT_SESSION_ID`.
 
-Commands:
-  run      Wrap a shell command in a PTY and expose it via the other subcommands
-  list     List all babysit sessions
-  status   Show status of a session
-  log      Show recent output from the wrapped command
-  screenshot  Capture the current visible screen (virtual terminal grid)
-  restart  Restart the wrapped command
-  kill     Terminate the wrapped command
-  send     Send text to the wrapped command's stdin (newline appended)
-  wait     Block until the wrapped command exits, then return its exit code
-  attach   Attach your terminal to a session (detach with Ctrl-\ Ctrl-\)
-  detach   Detach any terminal currently attached to a session
-  prune    Delete sessions whose wrapped command has finished or whose owner died
-  upgrade  Self-update to the latest version
-  config   Print shell integration (completions)
-  help     Print this message or the help of the given subcommand(s)
+### Useful flags for background agent loops
 
-Options:
-  -h, --help     Print help
-  -V, --version  Print version
-```
+- `babysit run -d` — start detached, return immediately (survives your shell).
+- `--no-tty` — use plain pipes instead of a PTY, for clean line-oriented logs.
+- `--timeout <30s|10m|2h>` — auto-terminate a hung run.
 
-Run `babysit help <command>` for flags and aliases. `babysit -- <cmd>`
-is a short form for `babysit run <cmd>`.
+## `babysit screenshot`
 
-By default a session gets an auto-generated id; pass `--id <id>` to
-`run` to choose your own (e.g. `babysit run --id ci -- make local-ci`).
-Ids must be unique and contain only letters, digits, `-`, `_`, `.`.
-
-`-s <id>` is shorthand for `--session <id>` and accepts either the id
-or the literal string `latest`. From inside the wrapped command itself
-the session is implicit via `$BABYSIT_SESSION_ID`, so the flag can be
-omitted.
-
-## Screenshot (`babysit screenshot`)
-
-`babysit log` replays the raw output *stream*. For full-screen TUIs that
-redraw in place (menus, progress UIs, `htop`, an agent's own UI) that
-stream is a mess of overdrawn frames. `babysit screenshot` instead feeds
-the output through a virtual terminal (a real VT parser + screen grid,
-the same thing your terminal does) and renders the **single frame that is
-currently on screen** — what a human would see right now.
+`log` replays the raw output *stream*, which is unreadable for full-screen
+TUIs that redraw in place (menus, progress bars, `htop`). `screenshot`
+feeds output through a virtual terminal and renders the **single frame
+currently on screen**:
 
 ```console
 $ babysit screenshot -s ab12 --trim
@@ -160,154 +75,17 @@ $ babysit screenshot -s ab12 --trim
   yarn
 ```
 
-Formats (for the agent reading it):
+- `--format plain` (default) — plain text, cheapest for an agent to read.
+- `--format ansi` — keeps ANSI/SGR color escapes.
+- `--format json` — screen size, cursor, and per-cell `char` + attributes
+  (`fg`/`bg`/`bold`/`inverse`/…), so an agent can tell e.g. which row is
+  selected (often marked only by inverse video).
+- `--trim` drops trailing blank lines/whitespace.
 
-- `--format plain` (default) — plain text grid, cheapest to read.
-- `--format ansi` — keeps ANSI/SGR color escapes, when color carries
-  meaning (diff red/green, the highlighted/selected row, …).
-- `--format json` — structured: screen size, cursor position, and one
-  entry per non-blank cell with its `char` and any `fg`/`bg`/`bold`/
-  `inverse`/… attributes. Use this when an agent must reliably tell which
-  row is *selected* (TUIs often mark it only with inverse video, which
-  plain text can't convey).
-
-`--trim` drops trailing blank lines (and per-line trailing whitespace) to
-keep the output small. The geometry/cursor metadata is always present in
-the `json` form; `plain`/`ansi` print just the rendered screen.
-
-If the session has already exited, the screen is reconstructed by
-replaying the on-disk log (using a default 80×24 size, since the final
-PTY dimensions aren't recorded).
-
-## Attach / detach
-
-The wrapped command always runs under a background worker that owns the
-PTY; the terminal you see it in is just *attached* to that worker
-(tmux-style). So you can come and go without stopping the command:
-
-```console
-$ babysit run -- make local-ci    # runs attached (auto-attaches)
-…                                 # press Ctrl-\ Ctrl-\ to detach
-$ babysit attach -s ci            # re-attach later, from anywhere
-$ babysit detach -s ci            # kick off whoever's attached, keep it running
-```
-
-- **Detach hotkey:** `Ctrl-\ Ctrl-\` (press Ctrl-backslash twice) —
-  leaves the command running and returns your shell. (A flow-control key
-  like Ctrl-Q, or one TUIs grab like Ctrl-P, would be unreliable.)
-- **Full-screen TUIs** (editors, `pi`, etc.) often enable an enhanced
-  keyboard mode that re-encodes control keys, so the hotkey may not be
-  detected. In that case detach from another terminal with
-  `babysit detach -s <id>` — that path is independent of the keyboard and
-  always works. babysit resets the terminal (alt-screen/mouse/…) on detach
-  so your shell is left usable.
-- `babysit attach -s <id>` replays the recent output, then streams live
-  and forwards your keystrokes/resizes.
-- `babysit detach -s <id>` detaches clients from another terminal.
-
-### Start detached (`-d`)
-
-`babysit -d -- <cmd>` (or `babysit run -d -- <cmd>`) starts the command
-in the background and returns immediately, without attaching:
-
-```console
-$ babysit -d --id ci -- make local-ci
-babysit session ci: make local-ci
-  babysit log -s ci --tail 200
-  babysit attach -s ci
-$ # prompt returns right away; the agent polls `ci`, or you can attach
-```
-
-The worker survives this shell exiting. Output is captured to the
-session log regardless of whether anyone is attached, so
-`babysit log`/`status`/`send`/`kill` work the same either way.
-
-`status` and `log` work even after babysit has exited — they fall back
-to the on-disk state files. `restart`, `kill`, and `send` need the live
-control socket and will fail if the babysit process is gone.
-
-`babysit <unknown>` is treated as an unknown subcommand (with a
-`did you mean …?` hint), not as a wrap attempt — use `babysit -- <cmd>`
-or `babysit run <cmd>` to wrap.
-
-## Shell integration
-
-Add completions to your shell by eval'ing `babysit config`:
-
-```sh
-# zsh (~/.zshrc)
-eval "$(babysit config zsh)"
-
-# bash (~/.bashrc)
-eval "$(babysit config bash)"
-```
-
-This completes subcommands and their aliases, per-command flags, and —
-most usefully — live session ids for `-s` (read straight from
-`~/.babysit/sessions`, plus the `latest` selector). `babysit run`
-delegates to your shell's normal command completion.
-
-## Driving agents in the background
-
-babysit works well as a supervisor when an orchestrator (e.g. an agent
-loop) launches other agents in the background and watches them:
-
-```sh
-# Launch a task, named after e.g. a ticket, headless so the log is clean.
-babysit run -d --no-tty --id ENG-123 --timeout 30m -- my-agent --task ENG-123
-
-babysit ls --json                 # what's running, and each one's state
-babysit log -s ENG-123 --tail 50  # what is it doing right now
-babysit wait -s ENG-123           # block until done; exit code = the agent's
-```
-
-- **`--no-tty`** runs the command with plain pipes instead of a PTY, so
-  tools that detect a non-tty emit clean, line-oriented output that's much
-  easier to scrape from the log (no full-screen redraw noise).
-- **`--timeout <dur>`** auto-terminates a run that hangs (`30s`, `10m`,
-  `2h`, `1d`, or bare seconds) — a safety valve for unattended loops.
-- **`babysit wait`** blocks until the command exits and returns its exit
-  code, so an orchestrator can join on tasks instead of busy-polling. With
-  `--timeout` it gives up and exits `124` (the session keeps running).
-- **`babysit log --since <offset> --json`** reads only what's new since a
-  raw-log byte offset and returns `{text, offset, done}`, so a poller can
-  resume from `offset` and stop when `done`. **`--follow`** (`-f`) streams
-  new output live until the session exits (like `tail -f`).
-
-```sh
-# Incremental polling loop for one task:
-off=0
-while :; do
-  r=$(babysit log -s ENG-123 --since "$off" --json)
-  printf '%s' "$(jq -r .text <<<"$r")"
-  off=$(jq .offset <<<"$r"); [ "$(jq .done <<<"$r")" = true ] && break
-  sleep 1
-done
-```
-
-Each wrapped command also sees `$BABYSIT_SESSION_ID`, so an agent can refer
-to its own session. For per-task isolation (separate git worktrees, etc.),
-pair babysit with a workspace manager.
-
-## Session state on disk
-
-Each session writes to `~/.babysit/sessions/<id>/`:
-
-```
-meta.json       # static info (cmd, started_at, …)
-status.json     # live state (running / exited / killed, exit_code)
-output.log      # raw output from the wrapped command
-control.sock    # Unix socket the subcommands talk to
-```
-
-`babysit list` flags sessions whose owning babysit process has died as
-`dead` (e.g. crash, kill -9, reboot before a clean exit could be
-recorded). Run `babysit prune` to clear out anything that's no longer
-running.
+For an exited session the screen is reconstructed from the on-disk log.
 
 ## Build from source
 
-```
-cargo build --release
-# binary at target/release/babysit
+```sh
+cargo build --release   # binary at target/release/babysit
 ```
