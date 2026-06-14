@@ -104,10 +104,20 @@ async fn main() -> Result<()> {
             since,
             from_now,
             raw,
+            screen,
             json,
         } => {
-            let code =
-                sub::expect(sel.session, pattern, timeout, since, from_now, raw, json).await?;
+            let code = sub::expect(
+                sel.session,
+                pattern,
+                timeout,
+                since,
+                from_now,
+                raw,
+                screen,
+                json,
+            )
+            .await?;
             std::process::exit(code);
         }
         cli::Command::WaitIdle {

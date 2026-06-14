@@ -591,8 +591,10 @@ fn key_to_bytes(name: &str) -> Option<Vec<u8>> {
 /// Block until `pattern` (a regex) appears in the output, or `timeout`
 /// elapses. Scans incrementally from `since` if given, else from the current
 /// end when `from_now`, else from the start of the log (so an already-printed
-/// marker still matches). Returns 0 on match, 124 on timeout, 1 if the session
-/// ends before the pattern appears.
+/// marker still matches). With `screen`, matches against the rendered
+/// virtual-terminal grid instead of the raw stream (for full-screen TUIs).
+/// Returns 0 on match, 124 on timeout, 1 if the session ends before the
+/// pattern appears.
 #[allow(clippy::too_many_arguments)]
 pub async fn expect(
     session: Option<String>,
@@ -601,6 +603,7 @@ pub async fn expect(
     since: Option<u64>,
     from_now: bool,
     raw: bool,
+    screen: bool,
     json: bool,
 ) -> Result<i32> {
     let id = session::resolve(session).await?;
@@ -608,6 +611,10 @@ pub async fn expect(
     let re = Regex::new(&pattern).context("invalid expect regex")?;
     let timeout = crate::run::parse_timeout(&timeout)?;
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
+
+    if screen {
+        return expect_screen(&id, &re, &pattern, deadline, json).await;
+    }
 
     // Where to start scanning. Default: the whole log, so an already-printed
     // marker still matches (the send→expect response usually lands before this
@@ -659,6 +666,72 @@ pub async fn expect(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// `expect --screen`: poll the rendered virtual-terminal grid and match the
+/// regex against the on-screen text. Used for full-screen TUIs that redraw in
+/// place, where the visible text never appears as a contiguous run in the raw
+/// output stream. Returns 0 on match, 124 on timeout, 1 if the session ends
+/// without the pattern showing.
+async fn expect_screen(
+    id: &str,
+    re: &Regex,
+    pattern: &str,
+    deadline: Option<std::time::Instant>,
+    json: bool,
+) -> Result<i32> {
+    loop {
+        let text = current_screen_text(id).await;
+        if let Some(m) = re.find(&text) {
+            if json {
+                let obj = serde_json::json!({ "matched": m.as_str() });
+                println!("{}", serde_json::to_string(&obj)?);
+            } else {
+                println!("{}", m.as_str());
+            }
+            return Ok(0);
+        }
+        if is_finished(id).await {
+            // One last look in case the final frame landed after the check.
+            let text = current_screen_text(id).await;
+            if re.is_match(&text) {
+                return Ok(0);
+            }
+            eprintln!("babysit: session {id} ended before matching /{pattern}/ on screen");
+            return Ok(1);
+        }
+        if let Some(dl) = deadline
+            && std::time::Instant::now() >= dl
+        {
+            eprintln!("babysit: timed out waiting for /{pattern}/ on screen of session {id}");
+            return Ok(124);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Fetch the current rendered screen as plain text. Prefers the live worker
+/// (which holds the authoritative virtual terminal); falls back to replaying
+/// the on-disk log through a fresh parser when the worker is gone.
+async fn current_screen_text(id: &str) -> String {
+    let req = Request::Screenshot {
+        format: ShotFormat::Plain,
+        trim: false,
+    };
+    let data = match request(id, &req).await {
+        Ok(r) if r.ok => r.data,
+        _ => match paths::output_log_path(id) {
+            Ok(path) => {
+                let bytes = tokio::fs::read(&path).await.unwrap_or_default();
+                crate::render::render_log(&bytes, ShotFormat::Plain, false)
+            }
+            Err(_) => return String::new(),
+        },
+    };
+    data.get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Block until the session's output has been quiet for `settle`. Returns
@@ -805,11 +878,16 @@ pub async fn prune(dry_run: bool, json: bool) -> Result<()> {
 
 /// Open a short-lived connection to the session's control socket, send a
 /// single JSON request, and parse the JSON response.
+///
+/// Briefly retries the connect: a worker spawned by `babysit run -d` writes
+/// meta/status and spawns the PTY before it binds the control socket, so a
+/// command issued immediately after `run -d` can race the bind. Without the
+/// retry that surfaces as a misleading "worker is gone" error. We stop early
+/// once the session reaches a terminal state or its owner is gone, so a
+/// genuinely dead session still fails fast.
 async fn request(id: &str, req: &Request) -> Result<Response> {
     let path = paths::control_socket_path(id)?;
-    let mut stream = UnixStream::connect(&path)
-        .await
-        .with_context(|| format!("connecting to control socket {}", path.display()))?;
+    let mut stream = connect_with_retry(id, &path).await?;
     let mut bytes = serde_json::to_vec(req)?;
     bytes.push(b'\n');
     stream.write_all(&bytes).await?;
@@ -820,6 +898,40 @@ async fn request(id: &str, req: &Request) -> Result<Response> {
     br.read_line(&mut line).await?;
     let resp: Response = serde_json::from_str(line.trim())?;
     Ok(resp)
+}
+
+/// Connect to a session's control socket, retrying for up to ~1s while the
+/// worker is still binding it. Bails immediately if the session is already in
+/// a terminal state or its owner process has died (no socket is coming).
+async fn connect_with_retry(id: &str, path: &std::path::Path) -> Result<UnixStream> {
+    // ~1s total: 25 attempts × 40ms. Covers fork+exec+tokio+PTY spawn before
+    // the worker binds, without hanging on a truly absent worker.
+    for attempt in 0..25 {
+        match UnixStream::connect(path).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                // Don't keep retrying a session that will never bind.
+                if let Ok(status) = session::read_status(id).await {
+                    if status.state.is_terminal() {
+                        return Err(anyhow!("{e}"));
+                    }
+                    if let Ok(meta) = session::read_meta(id).await
+                        && !session::is_pid_alive(meta.babysit_pid)
+                    {
+                        return Err(anyhow!("{e}"));
+                    }
+                }
+                if attempt < 24 {
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                } else {
+                    return Err::<UnixStream, _>(e).with_context(|| {
+                        format!("connecting to control socket {}", path.display())
+                    });
+                }
+            }
+        }
+    }
+    unreachable!("loop returns on the final attempt")
 }
 
 /// ANSI SGR color for a state label (see `state_label_for`). Green for
