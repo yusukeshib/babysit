@@ -49,25 +49,72 @@ pub async fn list(json: bool) -> Result<()> {
     } else if entries.is_empty() {
         println!("(no sessions)");
     } else {
-        println!("{:<10} {:<8} {:<10} CMD", "ID", "STATE", "AGE");
-        for (m, s, note) in &entries {
-            let age = format_age(m.started_at, Utc::now());
-            let cmd = m.cmd.join(" ");
-            // A flagged session is prefixed with ⚑ and its note appended, so a
-            // human scanning `babysit ls` sees what needs attention.
-            let suffix = match note {
-                Some(n) if !n.is_empty() => format!("  ⚑ {n}"),
-                Some(_) => "  ⚑".to_string(),
-                None => String::new(),
+        // Precompute each row's display columns so we can size each column to
+        // its widest value; fixed widths break alignment when an id is long.
+        let rows: Vec<(String, String, String, String)> = entries
+            .iter()
+            .map(|(m, s, note)| {
+                let age = format_age(m.started_at, Utc::now());
+                let cmd = m.cmd.join(" ");
+                // A flagged session is prefixed with ⚑ and its note appended, so
+                // a human scanning `babysit ls` sees what needs attention.
+                let suffix = match note {
+                    Some(n) if !n.is_empty() => format!("  ⚑ {n}"),
+                    Some(_) => "  ⚑".to_string(),
+                    None => String::new(),
+                };
+                (
+                    m.id.clone(),
+                    state_label_for(Some(m), s),
+                    age,
+                    format!("{cmd}{suffix}"),
+                )
+            })
+            .collect();
+
+        let id_w = rows
+            .iter()
+            .map(|r| r.0.chars().count())
+            .chain(std::iter::once("ID".len()))
+            .max()
+            .unwrap_or(2);
+        let state_w = rows
+            .iter()
+            .map(|r| r.1.chars().count())
+            .chain(std::iter::once("STATE".len()))
+            .max()
+            .unwrap_or(5);
+        let age_w = rows
+            .iter()
+            .map(|r| r.2.chars().count())
+            .chain(std::iter::once("AGE".len()))
+            .max()
+            .unwrap_or(3);
+
+        use std::io::IsTerminal as _;
+        let color = std::io::stdout().is_terminal();
+        let dim = if color { "\x1b[2m" } else { "" };
+        let reset = if color { "\x1b[0m" } else { "" };
+
+        println!(
+            "{dim}{:<id_w$} {:<state_w$} {:<age_w$} CMD{reset}",
+            "ID", "STATE", "AGE"
+        );
+        for (id, state, age, cmd) in &rows {
+            // Pad first, then wrap the trimmed label in color so the SGR codes
+            // don't count toward the column width.
+            let state_cell = if color {
+                let padded = format!("{state:<state_w$}");
+                format!(
+                    "{}{state}{}{}",
+                    state_color(state),
+                    reset,
+                    &padded[state.len()..]
+                )
+            } else {
+                format!("{state:<state_w$}")
             };
-            println!(
-                "{:<10} {:<8} {:<10} {}{}",
-                m.id,
-                state_label_for(Some(m), s),
-                age,
-                cmd,
-                suffix,
-            );
+            println!("{id:<id_w$} {state_cell} {age:<age_w$} {cmd}");
         }
     }
     Ok(())
@@ -773,6 +820,19 @@ async fn request(id: &str, req: &Request) -> Result<Response> {
     br.read_line(&mut line).await?;
     let resp: Response = serde_json::from_str(line.trim())?;
     Ok(resp)
+}
+
+/// ANSI SGR color for a state label (see `state_label_for`). Green for
+/// healthy/clean-exit, yellow for transient/unknown, red for failure.
+fn state_color(label: &str) -> &'static str {
+    if label == "exit:0" || label == "running" {
+        "\x1b[32m" // green
+    } else if label == "starting" || label == "exited" {
+        "\x1b[33m" // yellow
+    } else {
+        // exit:<nonzero>, killed, dead
+        "\x1b[31m" // red
+    }
 }
 
 fn state_label_for(meta: Option<&Meta>, s: &Status) -> String {
