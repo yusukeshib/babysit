@@ -1,141 +1,80 @@
 # babysit
 
-Wrap a command in a PTY and control it from the outside through a small CLI.
-The command keeps running in the background under a worker process that owns the
-PTY and records everything it prints; from any terminal you can read its output,
-screenshot its current screen, send input, wait for it to exit, or attach to it
-interactively (tmux-style detach and re-attach).
+Wrap a command in a PTY and control it from another terminal. The command runs
+in the background under a worker that owns the PTY and records its output. From
+anywhere you can read the output, screenshot the screen, send input, wait for
+exit, or attach interactively.
 
-This makes it easy for a script — or an AI coding agent like Claude Code or
-Codex — to drive a command it didn't start and react to what it does.
+Useful for scripts and coding agents that need to drive a command they didn't
+start.
 
 ![babysit demo](assets/demo.gif)
 
 ```console
-$ babysit run -d --json -- make local-ci   # wrap detached; prints {"id":"ab12"}
-$ babysit log -s ab12 --tail 20            # read recent output from anywhere
-$ babysit screenshot -s ab12               # render the current screen of a TUI
-$ babysit wait -s ab12                     # block until it exits; returns exit code
+$ babysit run -d --json -- make local-ci   # {"id":"ab12"}
+$ babysit log -s ab12 --tail 20
+$ babysit screenshot -s ab12
+$ babysit wait -s ab12
 ```
 
-(`babysit -- make local-ci` is the interactive shorthand; for scripting/agents
-use `run -d --json` and capture the `id`.)
+`babysit -- make local-ci` is the interactive shorthand. For scripting, use
+`run -d --json` and capture the `id`.
 
 ## How it works
 
-The wrapped command runs under a background worker that owns the PTY, captures
-all output to a log, and serves a Unix control socket. The terminal you launched
-from is just *attached* to that worker, so you can detach and re-attach, and
-read state from another terminal at any time.
+The command runs under a background worker that owns the PTY, logs all output,
+and serves a Unix control socket. Your terminal is just attached to it, so you
+can detach, re-attach, and query from other terminals.
 
-State lives in `~/.babysit/sessions/<id>/` (`meta.json`, `status.json`,
-`output.log`, `control.sock`). Set `$BABYSIT_DIR` (an absolute path) to use a
-different root — handy for tests, demos, or isolating CI from your real
-sessions. `status`, `log`, and `screenshot` work even after the worker exits
-(they fall back to the files); `send`, `key`, `restart`, and `kill` need it
-alive.
+State lives in `~/.babysit/sessions/<id>/`. Set `$BABYSIT_DIR` (absolute path) to
+change the root. `status`, `log`, and `screenshot` work after the worker exits;
+`send`, `key`, `restart`, and `kill` need it alive.
 
-`-s <id>` selects a session. There is no "most recent" fallback: a command with
-neither `-s` nor `$BABYSIT_SESSION_ID` errors out, so a forgotten selector fails
-loudly instead of acting on the wrong session. Inside the wrapped command the id
-is exported as `$BABYSIT_SESSION_ID`, so nested calls can omit `-s`.
+`-s <id>` selects a session; there is no "most recent" fallback. Inside the
+wrapped command the id is exported as `$BABYSIT_SESSION_ID`.
 
 ## Install
 
 ```sh
-cargo install babysit                            # from crates.io
-nix profile install github:yusukeshib/babysit    # with Nix flakes
-```
-
-No Rust toolchain? Download a prebuilt release binary instead (macOS/Linux,
-x86_64/aarch64) — installs to `~/.local/bin`:
-
-```sh
+cargo install babysit                            # crates.io
+nix profile install github:yusukeshib/babysit    # Nix flakes
 curl -fsSL https://raw.githubusercontent.com/yusukeshib/babysit/main/install.sh | sh
 ```
 
-Override the location with `BABYSIT_INSTALL_DIR`, or pin a version with
-`BABYSIT_VERSION=v0.2.4` (default: latest release).
+The install script drops a prebuilt binary in `~/.local/bin` (override with
+`BABYSIT_INSTALL_DIR`, pin with `BABYSIT_VERSION`). `babysit upgrade`
+self-updates cargo/binary installs; Nix installs are managed by Nix.
 
-Or run it without installing: `nix run github:yusukeshib/babysit -- -- make local-ci`.
-
-For a `cargo install` / released binary, `babysit upgrade` self-updates to the
-latest release (Nix installs are managed by Nix instead).
+Run without installing: `nix run github:yusukeshib/babysit -- -- make local-ci`.
 
 ## Subcommands
 
 | Command | Description |
 | --- | --- |
-| `run` | Wrap a command in a PTY (`babysit -- <cmd>` is shorthand; `-d` runs it detached; `--json` prints `{"id":"…"}`) |
-| `list` (`ls`) | List all sessions |
-| `status` | Show a session's state and exit code |
-| `log` | Show output; `--tail N`, `--grep <re>`, `--follow` (live, like `tail -f`); `--since` for incremental reads (see [Waiting on output](#waiting-on-output)) |
-| `screenshot` (`shot`) | Render the *current* screen via a virtual terminal (readable for full-screen TUIs that redraw in place); `--format plain\|ansi\|json`, `--trim` |
-| `send` | Send text to the command's stdin (`-n`/`--no-newline` to omit the newline; `--json` returns `{sent, offset}`) |
+| `run` | Wrap a command in a PTY (`babysit -- <cmd>` shorthand; `-d` detached; `--json` prints the id) |
+| `list` (`ls`) | List sessions |
+| `status` | Session state and exit code |
+| `log` | Show output; `--tail`, `--grep`, `--follow`, `--since` |
+| `screenshot` (`shot`) | Render the current screen; `--format plain\|ansi\|json`, `--trim` |
+| `send` | Send text to stdin (`-n` no newline; `--json`) |
 | `key` | Send named keys (`Enter`, `Up`, `Esc`, `C-c`, `F1`, …) |
-| `expect` | Block until a regex appears in the output (`--screen` matches the rendered TUI screen instead of the raw stream) |
-| `wait-idle` | Block until output has been quiet for `--settle` |
-| `wait` | Block until the command exits, returning its exit code |
-| `resize` | Resize the wrapped command's terminal (`COLSxROWS`) |
-| `flag` / `unflag` | Flag a session with a note (shown with ⚑ in `ls`) / clear it |
-| `restart` | Restart the wrapped command |
-| `kill` | Terminate the wrapped command |
-| `attach` / `detach` | Attach your terminal to a session (detach: `Ctrl-\ Ctrl-\`) / detach others |
+| `expect` | Block until a regex appears (`--screen` matches the rendered TUI) |
+| `wait-idle` | Block until output is quiet for `--settle` |
+| `wait` | Block until exit, return the exit code |
+| `resize` | Resize the terminal (`COLSxROWS`) |
+| `flag` / `unflag` | Flag a session for attention / clear it |
+| `restart` | Restart the command |
+| `kill` | Terminate the command |
+| `attach` / `detach` | Attach your terminal (detach: `Ctrl-\ Ctrl-\`) / detach others |
 | `prune` | Delete finished or dead sessions |
-| `upgrade` | Self-update to the latest release |
-| `config` | Print shell completions: `eval "$(babysit config zsh\|bash)"` |
+| `upgrade` | Self-update |
+| `config` | Shell completions: `eval "$(babysit config zsh\|bash)"` |
 
-Run `babysit help <command>` for flags and aliases.
-
-## Run options
-
-- `-d` — run detached: start in the background and return immediately (survives
-  your shell).
-- `--no-tty` — use plain pipes instead of a PTY, for clean line-oriented output.
-- `--timeout <30s|10m|2h>` — auto-terminate after a fixed duration.
-- `--idle-timeout <5m>` — auto-terminate if the command produces no output for
-  that long.
-- `--size <120x40>` — fix the terminal size so a full-screen program lays out
-  deterministically (an attaching terminal overrides it).
-
-## Waiting on output
-
-- `expect <regex>` scans the whole log by default, so a marker that has already
-  been printed still matches. To wait for a *specific* response without races,
-  capture an offset before the action and pass it as `--since <bytes>`: either
-  the `offset` returned by `send`/`key --json` (the byte position just before
-  your input was injected) or `output_bytes` from `status --json`. `--from-now`
-  ignores the existing log entirely.
-- **Don't `expect` the text you just `send`** — a PTY echoes input back, so the
-  raw stream contains your own keystrokes; wait for the program's *reply*
-  marker, not what you typed.
-- **Full-screen TUIs:** `expect` (and `--grep`) scan the raw output *stream*,
-  where a menu that redraws in place never appears as contiguous text. Use
-  `expect --screen <regex>` to match against the *rendered* virtual-terminal
-  grid (what `screenshot` shows) instead.
-- `expect` and `wait-idle` time out after **30s by default** so a stuck program
-  can't hang an agent; pass `--timeout 0` (or `none`) to wait indefinitely.
-  `wait` has no default timeout — guard long unattended runs with
-  `run --timeout`/`--idle-timeout` instead.
-- `wait-idle --settle <dur>` returns once output has been quiet for that long.
-  Note it measures output *volume*, so a spinner or progress bar that keeps
-  redrawing never settles — for those, poll `screenshot`'s `screen_hash`
-  (below) instead.
-- `status --json` reports `output_bytes` and `screen_seq`; if neither changed
-  since the last check, the command hasn't produced anything new. (`screen_seq`
-  is live-only — it is `null` once the worker has exited.)
-- `screenshot --format json` also carries `screen_seq` and `screen_hash`. Unlike
-  `screen_seq` (which bumps on every output chunk, even identical redraws),
-  `screen_hash` only changes when the on-screen *text* changes — so equal
-  hashes across two frames mean the screen is genuinely settled.
-- `log --grep <re>` filters to matching lines. `log --since <bytes> --json`
-  returns `{text, offset, done}` for incremental polling — pass the returned
-  `offset` back as the next `--since` to read only what's new.
-- Mutating commands (`send`, `key`, `kill`, `restart`, `resize`, `flag`,
-  `unflag`, `detach`, `prune`) accept `--json` for a machine-readable result.
+Each command documents its own flags and gotchas: `babysit help <command>`.
+`babysit --help` covers the model and the typical agent loop.
 
 ## Build from source
 
 ```sh
-cargo build --release   # binary at target/release/babysit
+cargo build --release   # target/release/babysit
 ```
