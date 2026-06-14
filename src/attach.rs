@@ -132,8 +132,8 @@ pub async fn attach(session: Option<String>) -> Result<i32> {
 }
 
 /// Attach the current terminal to the session with the exact id `id` and
-/// stream until the wrapped command exits, the user detaches (Ctrl-P
-/// Ctrl-Q), or `babysit detach` kicks us off. Returns the wrapped command's
+/// stream until the wrapped command exits, the user detaches (Ctrl-\
+/// Ctrl-\), or `babysit detach` kicks us off. Returns the wrapped command's
 /// exit code on exit, else 0.
 ///
 /// Does not pre-check that the session exists: `connect_retry` waits for the
@@ -185,7 +185,9 @@ pub async fn attach_to(id: String) -> Result<i32> {
     });
 
     let mut winch = signal(SignalKind::window_change())?;
-    let mut saw_ctrl_p = false;
+    // Carries the "first Ctrl-\ seen" state across stdin chunks for the
+    // two-press detach sequence (see filter_detach).
+    let mut saw_detach_key = false;
     let exit_code: i32;
     // Whether we left the session running (detached / worker vanished) vs the
     // command actually exiting. On the former the wrapped program is still
@@ -214,7 +216,7 @@ pub async fn attach_to(id: String) -> Result<i32> {
             },
             chunk = stdin_rx.recv() => match chunk {
                 Some(bytes) => {
-                    let (forward, do_detach) = filter_detach(&mut saw_ctrl_p, &bytes);
+                    let (forward, do_detach) = filter_detach(&mut saw_detach_key, &bytes);
                     if !forward.is_empty() {
                         write_frame(&mut wr, C_INPUT, &forward).await?;
                     }
