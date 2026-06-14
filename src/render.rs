@@ -33,6 +33,20 @@ fn color_str(c: vt100::Color) -> String {
     }
 }
 
+/// Stable hash of the visible text grid, rendered as a short hex string.
+/// Color/attribute-only differences don't change it (it hashes plain text),
+/// which is what an agent wants for "did the screen content change?".
+fn text_hash(screen: &vt100::Screen) -> String {
+    use std::hash::{Hash, Hasher};
+    let (_, cols) = screen.size();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for line in screen.rows(0, cols) {
+        line.hash(&mut hasher);
+        0u8.hash(&mut hasher); // row separator so "ab"+"" != "a"+"b"
+    }
+    format!("{:016x}", hasher.finish())
+}
+
 /// Index of the last row with any visible content (for trimming trailing
 /// blank lines). Returns 0 when the whole screen is blank.
 fn last_nonblank(lines: &[String]) -> usize {
@@ -48,11 +62,17 @@ fn last_nonblank(lines: &[String]) -> usize {
 pub fn render_screen(screen: &vt100::Screen, format: ShotFormat, trim: bool) -> serde_json::Value {
     let (rows, cols) = screen.size();
     let (cur_row, cur_col) = screen.cursor_position();
+    // Content hash of the visible text grid. Unlike `screen_seq` (which bumps
+    // on every output chunk, including spinners that redraw identical frames),
+    // this only changes when the on-screen *text* changes, so an agent can use
+    // it to dedup screenshots and detect a genuinely settled screen.
+    let screen_hash = text_hash(screen);
     let meta = serde_json::json!({
         "rows": rows,
         "cols": cols,
         "cursor": { "row": cur_row, "col": cur_col, "hidden": screen.hide_cursor() },
         "alternate_screen": screen.alternate_screen(),
+        "screen_hash": screen_hash,
     });
 
     match format {
@@ -200,5 +220,19 @@ mod tests {
     fn render_log_replays_a_finished_session() {
         let out = render_log(b"done\n", ShotFormat::Plain, true);
         assert_eq!(out["text"], "done");
+    }
+
+    #[test]
+    fn screen_hash_tracks_text_not_color() {
+        let plain = screen_of(b"hello");
+        let h1 = render_screen(plain.screen(), ShotFormat::Plain, true)["screen_hash"].clone();
+        // Same text, different color → same hash (hash is over plain text).
+        let colored = screen_of(b"\x1b[31mhello\x1b[0m");
+        let h2 = render_screen(colored.screen(), ShotFormat::Plain, true)["screen_hash"].clone();
+        assert_eq!(h1, h2);
+        // Different text → different hash.
+        let other = screen_of(b"world");
+        let h3 = render_screen(other.screen(), ShotFormat::Plain, true)["screen_hash"].clone();
+        assert_ne!(h1, h3);
     }
 }

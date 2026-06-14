@@ -50,6 +50,17 @@ AGENT LOOP (typical)
   commands (expect, wait-idle) time out after 30s by default so a stuck program
   can't hang you; pass --timeout 0 to wait indefinitely.
 
+MATCHING TUIs vs STREAMS (gotchas)
+  • `expect` scans the raw OUTPUT STREAM. Full-screen TUIs (menus, pickers)
+    redraw in place, so the text you SEE isn't a contiguous run in the stream —
+    use `babysit expect --screen 're'`, which matches the rendered screen grid.
+  • Don't `expect` the text you just `send`: the PTY usually echoes your input
+    back, so you'd match your own keystrokes. Wait for the program's reply
+    marker instead.
+  • `wait-idle` measures output VOLUME, so a spinner/progress bar that keeps
+    redrawing never settles. For those, poll `screenshot`'s `screen_hash`
+    (stable until the on-screen text changes) instead.
+
 HUMAN HANDOFF
   Stuck or need approval? `babysit flag -s ID 'why'` marks the session (shown with
   a ⚑ in `babysit ls`); a human runs `babysit attach -s ID` to take over, then
@@ -251,6 +262,14 @@ pub enum Command {
         /// Match against raw output including ANSI escapes (default: stripped)
         #[arg(long)]
         raw: bool,
+        /// Match against the RENDERED screen (the virtual-terminal grid)
+        /// instead of the raw output stream. Use this for full-screen TUIs
+        /// that redraw in place (menus, pickers), where the text you see on
+        /// screen never appears as a contiguous run in the byte stream.
+        /// Matches the whole current screen each poll; `--since`/`--from-now`
+        /// (stream offsets) don't apply and are ignored.
+        #[arg(long)]
+        screen: bool,
         /// Emit JSON `{matched, offset}` instead of the matched text
         #[arg(long)]
         json: bool,

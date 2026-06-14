@@ -69,7 +69,7 @@ latest release (Nix installs are managed by Nix instead).
 | `screenshot` (`shot`) | Render the *current* screen via a virtual terminal (readable for full-screen TUIs that redraw in place); `--format plain\|ansi\|json`, `--trim` |
 | `send` | Send text to the command's stdin (`-n`/`--no-newline` to omit the newline; `--json` returns `{sent, offset}`) |
 | `key` | Send named keys (`Enter`, `Up`, `Esc`, `C-c`, `F1`, …) |
-| `expect` | Block until a regex appears in the output |
+| `expect` | Block until a regex appears in the output (`--screen` matches the rendered TUI screen instead of the raw stream) |
 | `wait-idle` | Block until output has been quiet for `--settle` |
 | `wait` | Block until the command exits, returning its exit code |
 | `resize` | Resize the wrapped command's terminal (`COLSxROWS`) |
@@ -102,16 +102,28 @@ Run `babysit help <command>` for flags and aliases.
   the `offset` returned by `send`/`key --json` (the byte position just before
   your input was injected) or `output_bytes` from `status --json`. `--from-now`
   ignores the existing log entirely.
+- **Don't `expect` the text you just `send`** — a PTY echoes input back, so the
+  raw stream contains your own keystrokes; wait for the program's *reply*
+  marker, not what you typed.
+- **Full-screen TUIs:** `expect` (and `--grep`) scan the raw output *stream*,
+  where a menu that redraws in place never appears as contiguous text. Use
+  `expect --screen <regex>` to match against the *rendered* virtual-terminal
+  grid (what `screenshot` shows) instead.
 - `expect` and `wait-idle` time out after **30s by default** so a stuck program
   can't hang an agent; pass `--timeout 0` (or `none`) to wait indefinitely.
   `wait` has no default timeout — guard long unattended runs with
   `run --timeout`/`--idle-timeout` instead.
 - `wait-idle --settle <dur>` returns once output has been quiet for that long.
+  Note it measures output *volume*, so a spinner or progress bar that keeps
+  redrawing never settles — for those, poll `screenshot`'s `screen_hash`
+  (below) instead.
 - `status --json` reports `output_bytes` and `screen_seq`; if neither changed
   since the last check, the command hasn't produced anything new. (`screen_seq`
   is live-only — it is `null` once the worker has exited.)
-- `screenshot --format json` also carries `screen_seq`, so you can fetch a frame
-  and its sequence number in one call.
+- `screenshot --format json` also carries `screen_seq` and `screen_hash`. Unlike
+  `screen_seq` (which bumps on every output chunk, even identical redraws),
+  `screen_hash` only changes when the on-screen *text* changes — so equal
+  hashes across two frames mean the screen is genuinely settled.
 - `log --grep <re>` filters to matching lines. `log --since <bytes> --json`
   returns `{text, offset, done}` for incremental polling — pass the returned
   `offset` back as the next `--since` to read only what's new.
