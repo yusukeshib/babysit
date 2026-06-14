@@ -8,7 +8,7 @@ Output assets/screenshot.gif
 
 Set Shell "bash"
 Set FontSize 16
-Set Width 1200
+Set Width 900
 Set Height 760
 Set Padding 20
 Set TypingSpeed 45ms
@@ -22,10 +22,10 @@ Type "clear" Enter
 Show
 
 # --- demo ---
-Type "# Start a full-screen TUI in a fixed 120x40 PTY — runs in the background"
+Type "# Start a full-screen TUI in a fixed 80x40 PTY — runs in the background"
 Sleep 700ms
 Enter
-Type "babysit run -d --id top --size 120x40 -- btm"
+Type "babysit run -d --id top --size 80x40 -- btm"
 Sleep 300ms
 Enter
 Sleep 2500ms
