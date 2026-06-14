@@ -12,7 +12,7 @@ exit, or attach interactively.
 Useful for scripts and coding agents that need to drive a command they didn't
 start.
 
-![babysit demo](assets/screenshot.gif)
+![babysit demo](assets/demo.gif)
 
 ```console
 $ babysit run -d --json -- make local-ci   # {"id":"ab12"}
