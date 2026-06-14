@@ -39,20 +39,23 @@ wrapped command the id is exported as `$BABYSIT_SESSION_ID`.
 
 ## Install
 
-Pick one:
+Pick one.
+
+From crates.io:
 
 ```sh
-# crates.io
 cargo install babysit
 ```
 
+With Nix flakes:
+
 ```sh
-# Nix flakes
 nix profile install github:yusukeshib/babysit
 ```
 
+Prebuilt binary via the install script:
+
 ```sh
-# Prebuilt binary via install script
 curl -fsSL https://raw.githubusercontent.com/yusukeshib/babysit/main/install.sh | sh
 ```
 
