@@ -44,7 +44,7 @@ _babysit() {
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --settle --timeout" -- "$cur"))
 		;;
 	expect)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --timeout --since --from-now --raw --json" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --timeout --since --from-now --raw --screen --json" -- "$cur"))
 		;;
 	key | resize | flag | unflag)
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --json" -- "$cur"))
@@ -81,6 +81,10 @@ _babysit() {
 		;;
 	config)
 		[[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "zsh bash" -- "$cur"))
+		;;
+	help)
+		# help takes a subcommand name as its argument.
+		[[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "run list status log screenshot send key expect wait-idle wait resize flag unflag restart kill attach detach prune upgrade config" -- "$cur"))
 		;;
 	esac
 }

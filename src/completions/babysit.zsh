@@ -79,6 +79,7 @@ _babysit() {
                 'prune:Delete finished or dead sessions'
                 'upgrade:Self-update to the latest version'
                 'config:Output shell integration (eval "$(babysit config zsh)")'
+                'help:Show help for a subcommand'
             )
             _describe 'subcommand' subcmds
             ;;
@@ -142,6 +143,7 @@ _babysit() {
                         '--since=[Start scanning from this raw-log byte offset]:bytes:' \
                         '--from-now[Only match output produced from now on]' \
                         '--raw[Match against raw output incl. ANSI escapes]' \
+                        '--screen[Match against the rendered TUI screen]' \
                         '--json[Emit JSON {matched, offset}]'
                     ;;
                 wait-idle)
@@ -166,6 +168,19 @@ _babysit() {
                         # shellcheck disable=SC2034  # used by _describe below
                         shells=('zsh:Zsh integration' 'bash:Bash integration')
                         _describe 'shell' shells
+                    fi
+                    ;;
+                help)
+                    if (( CURRENT == 2 )); then
+                        # help takes a subcommand name as its argument.
+                        local -a helpcmds
+                        # shellcheck disable=SC2034  # used by _describe below
+                        helpcmds=(
+                            run list status log screenshot send key expect
+                            wait-idle wait resize flag unflag restart kill
+                            attach detach prune upgrade config
+                        )
+                        _describe 'subcommand' helpcmds
                     fi
                     ;;
             esac
