@@ -132,6 +132,13 @@ pub enum Command {
         json: bool,
     },
     /// Show status of a session
+    ///
+    /// `--json` reports `output_bytes` (raw-log size) and `screen_seq` (a
+    /// counter bumped on every output chunk). Poll cheaply: if neither changed
+    /// since your last check, the command produced nothing new — no need to
+    /// re-screenshot. `screen_seq` is live-only; it is `null` once the worker
+    /// has exited. Use `output_bytes` as the `--since` offset for `expect`/`log`
+    /// to read only what arrives after a point.
     #[command(aliases = ["st", "info"])]
     Status {
         #[command(flatten)]
@@ -169,6 +176,12 @@ pub enum Command {
     /// Unlike `log` (which replays the raw output stream), this renders a
     /// virtual terminal grid — so TUIs that redraw in place (menus, full-screen
     /// apps) come out as the single frame currently on screen.
+    ///
+    /// `--format json` also carries `screen_seq` and `screen_hash`. `screen_seq`
+    /// bumps on every output chunk (even identical redraws); `screen_hash` only
+    /// changes when the on-screen *text* changes — so equal hashes across two
+    /// frames mean the screen is genuinely settled (useful for spinners/progress
+    /// bars that `wait-idle` can't detect).
     #[command(alias = "shot")]
     Screenshot {
         #[command(flatten)]
@@ -239,6 +252,12 @@ pub enum Command {
         json: bool,
     },
     /// Block until a regex appears in the output (expect-style)
+    ///
+    /// Don't `expect` the text you just `send`: a PTY echoes input back, so the
+    /// raw stream contains your own keystrokes — wait for the program's *reply*
+    /// marker, not what you typed. By default the whole log is scanned, so an
+    /// already-printed marker still matches; use `--since`/`--from-now` to wait
+    /// for a specific new response race-free.
     Expect {
         #[command(flatten)]
         sel: SessionSel,
@@ -276,6 +295,10 @@ pub enum Command {
         json: bool,
     },
     /// Block until the output has been quiet for a while (settled)
+    ///
+    /// Measures output *volume*: a spinner or progress bar that keeps redrawing
+    /// never settles. For those, poll `screenshot --format json`'s `screen_hash`
+    /// instead (stable until the on-screen text changes).
     #[command(name = "wait-idle")]
     WaitIdle {
         #[command(flatten)]
