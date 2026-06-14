@@ -2,7 +2,26 @@ use anyhow::{Context, Result};
 use directories::BaseDirs;
 use std::path::PathBuf;
 
+/// Root of babysit's state (`meta.json`, `status.json`, `output.log`,
+/// `control.sock` per session live under `<root>/sessions/<id>/`).
+///
+/// Defaults to `~/.babysit`, but `$BABYSIT_DIR` overrides it — handy for
+/// tests, demos, and CI that shouldn't touch the real state dir. The override
+/// must be an absolute path so a worker re-exec'd with a different cwd still
+/// resolves the same location.
 pub fn root() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("BABYSIT_DIR")
+        && !dir.is_empty()
+    {
+        let path = PathBuf::from(dir);
+        if !path.is_absolute() {
+            anyhow::bail!(
+                "$BABYSIT_DIR must be an absolute path (got `{}`)",
+                path.display()
+            );
+        }
+        return Ok(path);
+    }
     let base = BaseDirs::new().context("could not determine home directory")?;
     Ok(base.home_dir().join(".babysit"))
 }
