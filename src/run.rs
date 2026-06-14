@@ -31,8 +31,15 @@ pub async fn run(
     json: bool,
 ) -> Result<i32> {
     // Parse the inputs up front so a bad value errors before we spawn.
-    let timeout = timeout.as_deref().map(parse_duration).transpose()?;
-    let idle_timeout = idle_timeout.as_deref().map(parse_duration).transpose()?;
+    // Use parse_timeout (not parse_duration) so `0`/`none`/`off`/`never` mean
+    // "no timeout" here too, consistent with wait/expect/wait-idle — otherwise
+    // `--timeout 0s` would auto-kill the command immediately.
+    let timeout = timeout.as_deref().map(parse_timeout).transpose()?.flatten();
+    let idle_timeout = idle_timeout
+        .as_deref()
+        .map(parse_timeout)
+        .transpose()?
+        .flatten();
     let size = size.as_deref().map(parse_size).transpose()?;
 
     // We are the detached worker (re-exec'd with --detached-id): run the
@@ -261,7 +268,9 @@ fn spawn_worker_process(
         command.arg("--no-tty");
     }
     if let Some(d) = timeout {
-        command.arg("--timeout").arg(format!("{}s", d.as_secs()));
+        // Pass milliseconds so a sub-second timeout isn't truncated to 0s when
+        // re-exec'd into the worker.
+        command.arg("--timeout").arg(format!("{}ms", d.as_millis()));
     }
     if let Some(d) = idle_timeout {
         command
