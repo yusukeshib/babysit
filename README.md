@@ -9,6 +9,8 @@ interactively (tmux-style detach and re-attach).
 This makes it easy for a script — or an AI coding agent like Claude Code or
 Codex — to drive a command it didn't start and react to what it does.
 
+![babysit demo](assets/demo.gif)
+
 ```console
 $ babysit run -d --json -- make local-ci   # wrap detached; prints {"id":"ab12"}
 $ babysit log -s ab12 --tail 20            # read recent output from anywhere
@@ -27,9 +29,11 @@ from is just *attached* to that worker, so you can detach and re-attach, and
 read state from another terminal at any time.
 
 State lives in `~/.babysit/sessions/<id>/` (`meta.json`, `status.json`,
-`output.log`, `control.sock`). `status`, `log`, and `screenshot` work even after
-the worker exits (they fall back to the files); `send`, `key`, `restart`, and
-`kill` need it alive.
+`output.log`, `control.sock`). Set `$BABYSIT_DIR` (an absolute path) to use a
+different root — handy for tests, demos, or isolating CI from your real
+sessions. `status`, `log`, and `screenshot` work even after the worker exits
+(they fall back to the files); `send`, `key`, `restart`, and `kill` need it
+alive.
 
 `-s <id>` selects a session. There is no "most recent" fallback: a command with
 neither `-s` nor `$BABYSIT_SESSION_ID` errors out, so a forgotten selector fails

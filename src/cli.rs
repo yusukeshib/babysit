@@ -25,7 +25,8 @@ MODEL
   The command runs under a headless background worker that owns the PTY, records
   all output to a log, and serves a per-session control socket. Your terminal (or
   an agent's `babysit` calls) are just clients of that worker, so you can detach,
-  re-attach, and query state from anywhere. State lives in ~/.babysit/sessions/<id>/.
+  re-attach, and query state from anywhere. State lives in ~/.babysit/sessions/<id>/
+  (override the ~/.babysit root with $BABYSIT_DIR, e.g. for tests or demos).
 
 SELECTING A SESSION
   `run --json` prints the session id as JSON. Other commands take `-s <id>`;
