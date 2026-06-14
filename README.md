@@ -12,7 +12,7 @@ exit, or attach interactively.
 Useful for scripts and coding agents that need to drive a command they didn't
 start.
 
-![babysit general usage](assets/demo.gif)
+![babysit demo](assets/screenshot.gif)
 
 ```console
 $ babysit run -d --json -- make local-ci   # {"id":"ab12"}
@@ -61,11 +61,6 @@ The install script drops a prebuilt binary in `~/.local/bin` (override with
 self-updates cargo/binary installs; Nix installs are managed by Nix.
 
 Run without installing: `nix run github:yusukeshib/babysit -- -- make local-ci`.
-
-Read the live screen of a full-screen TUI from another terminal, attach to take
-over, then detach (`Ctrl-\ Ctrl-\`) and leave it running:
-
-![babysit screenshot](assets/screenshot.gif)
 
 ## Subcommands
 
