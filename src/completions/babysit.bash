@@ -17,7 +17,7 @@ _babysit() {
 	local cur prev words cword
 	_init_completion || return
 
-	local subcommands="run list ls status st info log logs screenshot shot send type key expect wait-idle wait resize flag unflag restart r kill stop attach a detach prune upgrade config help"
+	local subcommands="run list status log screenshot send key expect wait-idle wait resize flag unflag restart kill attach detach prune upgrade config help"
 
 	if [[ $cword -eq 1 ]]; then
 		COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -33,30 +33,30 @@ _babysit() {
 	case "${words[1]}" in
 	run)
 		case "$cur" in
-		-*) COMPREPLY=($(compgen -W "--id -d --detach --no-tty --timeout --idle-timeout --size --json" -- "$cur")) ;;
+		-*) COMPREPLY=($(compgen -W "--id --detach --no-tty --timeout --idle-timeout --size --json" -- "$cur")) ;;
 		*) COMPREPLY=($(compgen -c -- "$cur")) ;;
 		esac
 		;;
 	wait)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --timeout" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --timeout" -- "$cur"))
 		;;
 	wait-idle)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --settle --timeout" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --settle --timeout" -- "$cur"))
 		;;
 	expect)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --timeout --since --from-now --raw --json" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --timeout --since --from-now --raw --json" -- "$cur"))
 		;;
 	key | resize | flag | unflag)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --json" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --json" -- "$cur"))
 		;;
 	list | ls)
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json" -- "$cur"))
 		;;
 	status | st | info)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --json" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --json" -- "$cur"))
 		;;
 	log | logs)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --tail --grep --raw --since -f --follow --json" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --tail --grep --raw --since --follow --json" -- "$cur"))
 		;;
 	screenshot | shot)
 		case "$prev" in
@@ -65,16 +65,16 @@ _babysit() {
 			return
 			;;
 		esac
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --format --trim" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --format --trim" -- "$cur"))
 		;;
 	send | type)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session -n --no-newline --json" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --no-newline --json" -- "$cur"))
 		;;
 	restart | r | kill | stop | detach)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session --json" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session --json" -- "$cur"))
 		;;
 	attach | a)
-		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "-s --session" -- "$cur"))
+		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--session" -- "$cur"))
 		;;
 	prune)
 		[[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--dry-run --json" -- "$cur"))
