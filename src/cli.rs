@@ -54,6 +54,10 @@ HUMAN HANDOFF
   Stuck or need approval? `babysit flag -s ID 'why'` marks the session (shown with
   a ⚑ in `babysit ls`); a human runs `babysit attach -s ID` to take over, then
   detaches (Ctrl-\\ Ctrl-\\). Clear it with `babysit unflag -s ID`.
+
+MORE
+  Every command has more flags than the loop above shows — run
+  `babysit help <command>` (e.g. `babysit help expect`) before guessing.
 ";
 
 /// Session selector flag, shared across read/operate subcommands.

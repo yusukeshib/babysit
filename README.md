@@ -43,6 +43,16 @@ cargo install babysit                            # from crates.io
 nix profile install github:yusukeshib/babysit    # with Nix flakes
 ```
 
+No Rust toolchain? Download a prebuilt release binary instead (macOS/Linux,
+x86_64/aarch64) — installs to `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yusukeshib/babysit/main/install.sh | sh
+```
+
+Override the location with `BABYSIT_INSTALL_DIR`, or pin a version with
+`BABYSIT_VERSION=v0.2.4` (default: latest release).
+
 Or run it without installing: `nix run github:yusukeshib/babysit -- -- make local-ci`.
 
 For a `cargo install` / released binary, `babysit upgrade` self-updates to the
@@ -55,7 +65,7 @@ latest release (Nix installs are managed by Nix instead).
 | `run` | Wrap a command in a PTY (`babysit -- <cmd>` is shorthand; `-d` runs it detached; `--json` prints `{"id":"…"}`) |
 | `list` (`ls`) | List all sessions |
 | `status` | Show a session's state and exit code |
-| `log` | Show output; `--tail N`, `--grep <re>`, `--since <off> --json`, `--follow` for incremental/live reads |
+| `log` | Show output; `--tail N`, `--grep <re>`, `--follow` (live, like `tail -f`); `--since` for incremental reads (see [Waiting on output](#waiting-on-output)) |
 | `screenshot` (`shot`) | Render the *current* screen via a virtual terminal (readable for full-screen TUIs that redraw in place); `--format plain\|ansi\|json`, `--trim` |
 | `send` | Send text to the command's stdin (`-n`/`--no-newline` to omit the newline; `--json` returns `{sent, offset}`) |
 | `key` | Send named keys (`Enter`, `Up`, `Esc`, `C-c`, `F1`, …) |
@@ -102,7 +112,9 @@ Run `babysit help <command>` for flags and aliases.
   is live-only — it is `null` once the worker has exited.)
 - `screenshot --format json` also carries `screen_seq`, so you can fetch a frame
   and its sequence number in one call.
-- `log --grep <re>` filters to matching lines.
+- `log --grep <re>` filters to matching lines. `log --since <bytes> --json`
+  returns `{text, offset, done}` for incremental polling — pass the returned
+  `offset` back as the next `--since` to read only what's new.
 - Mutating commands (`send`, `key`, `kill`, `restart`, `resize`, `flag`,
   `unflag`, `detach`, `prune`) accept `--json` for a machine-readable result.
 
