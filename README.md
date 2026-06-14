@@ -14,10 +14,6 @@ start.
 
 ![babysit general usage](assets/demo.gif)
 
-Read the live screen of a full-screen TUI from another terminal:
-
-![babysit screenshot](assets/screenshot.gif)
-
 ```console
 $ babysit run -d --json -- make local-ci   # {"id":"ab12"}
 $ babysit log -s ab12 --tail 20
@@ -65,6 +61,11 @@ The install script drops a prebuilt binary in `~/.local/bin` (override with
 self-updates cargo/binary installs; Nix installs are managed by Nix.
 
 Run without installing: `nix run github:yusukeshib/babysit -- -- make local-ci`.
+
+Read the live screen of a full-screen TUI from another terminal, attach to take
+over, then detach (`Ctrl-\ Ctrl-\`) and leave it running:
+
+![babysit screenshot](assets/screenshot.gif)
 
 ## Subcommands
 

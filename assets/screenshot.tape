@@ -38,6 +38,17 @@ Sleep 300ms
 Enter
 Sleep 3000ms
 
+Type "# Take over interactively, then detach with Ctrl-\ Ctrl-\ — it keeps running"
+Sleep 600ms
+Enter
+Type "babysit attach -s top"
+Sleep 300ms
+Enter
+Sleep 2500ms
+Ctrl+\
+Ctrl+\
+Sleep 2000ms
+
 Type "babysit kill -s top"
 Sleep 300ms
 Enter
