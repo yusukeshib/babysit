@@ -2,19 +2,51 @@
 
 # Complete known session ids (directories under ~/.babysit/sessions). Read
 # straight from disk so completion stays fast and never has to spawn babysit.
+#
+# Each candidate carries a description (state + ⚑ flag + command) parsed from
+# the session's status.json/meta.json, mirroring `babysit ls`. This shows up as
+# a second column in plain zsh completion and in the fzf-tab list/preview.
 __babysit_sessions() {
     local -a sessions
     local __bs_dir="$HOME/.babysit/sessions"
     if [[ -d "$__bs_dir" ]]; then
+        local sess id state code cmd flag desc
         for sess in "$__bs_dir"/*(N/); do
-            sessions+=("${sess:t}")
+            id="${sess:t}"
+            # State (and exit code) from status.json. exited+code -> exit:N,
+            # mirroring the label `babysit ls` prints.
+            state=""
+            if [[ -r "$sess/status.json" ]]; then
+                state=$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$sess/status.json")
+                if [[ "$state" == exited ]]; then
+                    code=$(sed -n 's/.*"exit_code"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9][0-9]*\).*/\1/p' "$sess/status.json")
+                    [[ -n "$code" ]] && state="exit:$code"
+                fi
+            fi
+            # Command from meta.json: join the quoted entries of the "cmd" array.
+            cmd=""
+            if [[ -r "$sess/meta.json" ]]; then
+                cmd=$(sed -n '/"cmd"[[:space:]]*:[[:space:]]*\[/,/]/p' "$sess/meta.json" \
+                    | sed -n 's/^[[:space:]]*"\(.*\)",\{0,1\}[[:space:]]*$/\1/p' \
+                    | tr '\n' ' ')
+                cmd="${cmd%% }"
+            fi
+            # A flagged session (babysit flag) is prefixed with ⚑.
+            flag=""
+            [[ -e "$sess/note" ]] && flag="⚑ "
+            desc="${state:+$state  }$flag$cmd"
+            sessions+=("${id}:${desc}")
         done
     fi
-    _describe 'session' sessions
+    _describe -V 'session' sessions
 }
 
 _babysit() {
+    # state/line/opt_args are populated and read by zsh's _arguments machinery;
+    # the linter can't model that, so silence its unused-variable warnings.
+    # shellcheck disable=SC2034
     local curcontext="$curcontext" state line
+    # shellcheck disable=SC2034
     typeset -A opt_args
 
     _arguments -C \
@@ -23,24 +55,18 @@ _babysit() {
 
     case $state in
         subcmd)
+            # subcmds is consumed by `_describe` below.
             local -a subcmds
+            # shellcheck disable=SC2034
             subcmds=(
                 'run:Wrap a shell command in a PTY'
                 'list:List all babysit sessions'
-                'ls:List all babysit sessions'
                 'status:Show status of a session'
-                'st:Show status of a session'
-                'info:Show status of a session'
                 'log:Show recent output from the wrapped command'
-                'logs:Show recent output from the wrapped command'
                 'screenshot:Capture the current visible screen'
-                'shot:Capture the current visible screen'
                 'restart:Restart the wrapped command'
-                'r:Restart the wrapped command'
                 'kill:Terminate the wrapped command'
-                'stop:Terminate the wrapped command'
                 'send:Send text to the wrapped command stdin'
-                'type:Send text to the wrapped command stdin'
                 'key:Send named keys (Enter, Up, Esc, C-c, F1, …)'
                 'expect:Block until a regex appears in the output'
                 'wait-idle:Block until output has been quiet for a while'
@@ -49,7 +75,6 @@ _babysit() {
                 'flag:Flag a session for human attention'
                 'unflag:Clear a session attention flag'
                 'attach:Attach your terminal to a session (detach: Ctrl-\ Ctrl-\)'
-                'a:Attach your terminal to a session (detach: Ctrl-\ Ctrl-\)'
                 'detach:Detach any terminal attached to a session'
                 'prune:Delete finished or dead sessions'
                 'upgrade:Self-update to the latest version'
@@ -62,7 +87,7 @@ _babysit() {
                 run)
                     _arguments \
                         '--id=[Session id to assign]:id:' \
-                        '(-d --detach)'{-d,--detach}'[Run detached in the background]' \
+                        '--detach[Run detached in the background]' \
                         '--no-tty[Use pipes instead of a PTY (clean line output)]' \
                         '--timeout=[Auto-terminate after e.g. 30s, 10m, 2h]:duration:' \
                         '--idle-timeout=[Auto-terminate after this long with no output]:duration:' \
@@ -76,43 +101,43 @@ _babysit() {
                     ;;
                 status|st|info)
                     _arguments \
-                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--session[Session id]:session:__babysit_sessions' \
                         '--json[Output as JSON]'
                     ;;
                 log|logs)
                     _arguments \
-                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--session[Session id]:session:__babysit_sessions' \
                         '--tail=[Show only the last N lines]:lines:' \
                         '--grep=[Only show lines matching this regex]:regex:' \
                         '--raw[Include raw ANSI escapes]' \
                         '--since=[Only output bytes after this raw-log offset]:bytes:' \
-                        '(-f --follow)'{-f,--follow}'[Stream new output live until exit]' \
+                        '--follow[Stream new output live until exit]' \
                         '--json[Emit JSON {text, offset, done}]'
                     ;;
                 screenshot|shot)
                     _arguments \
-                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--session[Session id]:session:__babysit_sessions' \
                         '--format=[Output format]:format:(plain ansi json)' \
                         '--trim[Drop trailing blank lines and whitespace]'
                     ;;
                 send|type)
                     _arguments \
-                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
-                        '(-n --no-newline)'{-n,--no-newline}'[Do not append a trailing newline]' \
+                        '--session[Session id]:session:__babysit_sessions' \
+                        '--no-newline[Do not append a trailing newline]' \
                         '--json[Emit JSON {sent, offset}]'
                     ;;
                 restart|r|kill|stop|detach|key|resize|flag|unflag)
                     _arguments \
-                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--session[Session id]:session:__babysit_sessions' \
                         '--json[Emit a JSON result]'
                     ;;
                 attach|a)
                     _arguments \
-                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions'
+                        '--session[Session id]:session:__babysit_sessions'
                     ;;
                 expect)
                     _arguments \
-                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--session[Session id]:session:__babysit_sessions' \
                         '--timeout=[Give up after e.g. 30s, 2m; exits 124]:duration:' \
                         '--since=[Start scanning from this raw-log byte offset]:bytes:' \
                         '--from-now[Only match output produced from now on]' \
@@ -121,13 +146,13 @@ _babysit() {
                     ;;
                 wait-idle)
                     _arguments \
-                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--session[Session id]:session:__babysit_sessions' \
                         '--settle=[Required quiet period, e.g. 500ms, 2s]:duration:' \
                         '--timeout=[Give up after e.g. 30s; exits 124]:duration:'
                     ;;
                 wait)
                     _arguments \
-                        '(-s --session)'{-s,--session}'[Session id]:session:__babysit_sessions' \
+                        '--session[Session id]:session:__babysit_sessions' \
                         '--timeout=[Give up after e.g. 30s, 10m]:duration:'
                     ;;
                 prune)
