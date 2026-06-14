@@ -1,5 +1,9 @@
 # babysit
 
+[![crates.io](https://img.shields.io/crates/v/babysit.svg)](https://crates.io/crates/babysit)
+[![docs.rs](https://img.shields.io/docsrs/babysit)](https://docs.rs/babysit)
+[![license](https://img.shields.io/crates/l/babysit.svg)](https://github.com/yusukeshib/babysit/blob/main/LICENSE)
+
 Wrap a command in a PTY and control it from another terminal. The command runs
 in the background under a worker that owns the PTY and records its output. From
 anywhere you can read the output, screenshot the screen, send input, wait for
@@ -8,7 +12,11 @@ exit, or attach interactively.
 Useful for scripts and coding agents that need to drive a command they didn't
 start.
 
-![babysit demo](assets/demo.gif)
+![babysit general usage](assets/demo.gif)
+
+Read the live screen of a full-screen TUI from another terminal:
+
+![babysit screenshot](assets/screenshot.gif)
 
 ```console
 $ babysit run -d --json -- make local-ci   # {"id":"ab12"}
@@ -35,9 +43,20 @@ wrapped command the id is exported as `$BABYSIT_SESSION_ID`.
 
 ## Install
 
+Pick one:
+
 ```sh
-cargo install babysit                            # crates.io
-nix profile install github:yusukeshib/babysit    # Nix flakes
+# crates.io
+cargo install babysit
+```
+
+```sh
+# Nix flakes
+nix profile install github:yusukeshib/babysit
+```
+
+```sh
+# Prebuilt binary via install script
 curl -fsSL https://raw.githubusercontent.com/yusukeshib/babysit/main/install.sh | sh
 ```
 
