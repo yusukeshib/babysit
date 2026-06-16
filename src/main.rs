@@ -74,7 +74,11 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
-        cli::Command::List { json } => sub::list(json).await,
+        cli::Command::List {
+            json,
+            watch,
+            interval,
+        } => sub::list(json, watch, interval).await,
         cli::Command::Status { sel, json } => sub::status(sel.session, json).await,
         cli::Command::Log {
             sel,

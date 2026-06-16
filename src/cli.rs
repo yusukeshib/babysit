@@ -130,6 +130,13 @@ pub enum Command {
     List {
         #[arg(long)]
         json: bool,
+        /// Continuously refresh the list in place (like `watch`), until
+        /// interrupted with Ctrl-C. Ignored with --json.
+        #[arg(short = 'w', long)]
+        watch: bool,
+        /// Refresh interval for --watch (e.g. 500ms, 2s).
+        #[arg(long, value_name = "DUR", default_value = "1s")]
+        interval: String,
     },
     /// Show status of a session
     ///
