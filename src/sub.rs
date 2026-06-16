@@ -15,7 +15,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 pub async fn list(json: bool, watch: bool, interval: String) -> Result<()> {
-    if json || !watch {
+    use std::io::IsTerminal as _;
+    // Screen-clearing only makes sense on a terminal; when stdout is piped or
+    // redirected, fall through to a single plain render instead of emitting
+    // cursor/clear escapes in a loop forever.
+    let is_tty = std::io::stdout().is_terminal();
+    if json || !watch || !is_tty {
         let entries = gather_list_entries().await?;
         if json {
             let arr: Vec<serde_json::Value> = entries
@@ -35,17 +40,15 @@ pub async fn list(json: bool, watch: bool, interval: String) -> Result<()> {
                 .collect();
             println!("{}", serde_json::to_string_pretty(&arr)?);
         } else {
-            use std::io::IsTerminal as _;
-            let color = std::io::stdout().is_terminal();
-            print!("{}", render_list_text(&entries, color));
+            print!("{}", render_list_text(&entries, is_tty));
         }
         return Ok(());
     }
 
     // --watch: redraw the list in place until interrupted.
     let period = crate::run::parse_duration(&interval)?;
-    use std::io::{IsTerminal as _, Write as _};
-    let color = std::io::stdout().is_terminal();
+    use std::io::Write as _;
+    let color = is_tty;
     let mut ticker = tokio::time::interval(period);
     loop {
         tokio::select! {
