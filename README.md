@@ -1,7 +1,6 @@
 # babysit
 
 [![crates.io](https://img.shields.io/crates/v/babysit.svg)](https://crates.io/crates/babysit)
-[![docs.rs](https://img.shields.io/docsrs/babysit)](https://docs.rs/babysit)
 [![license](https://img.shields.io/crates/l/babysit.svg)](https://github.com/yusukeshib/babysit/blob/main/LICENSE)
 
 Wrap a command in a PTY and control it from another terminal. The command runs
