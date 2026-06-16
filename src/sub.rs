@@ -40,7 +40,7 @@ pub async fn list(json: bool, watch: bool, interval: String) -> Result<()> {
                 .collect();
             println!("{}", serde_json::to_string_pretty(&arr)?);
         } else {
-            print!("{}", render_list_text(&entries, is_tty));
+            print!("{}", render_list_text(&entries, is_tty, &[], 0));
         }
         return Ok(());
     }
@@ -61,8 +61,19 @@ pub async fn list(json: bool, watch: bool, interval: String) -> Result<()> {
             }
             _ = ticker.tick() => {
                 let entries = gather_list_entries().await?;
+                // Read each session's latest output line (cheap: tail of the
+                // log only, never the whole file) so the watch view shows what
+                // each command is currently doing.
+                let mut last_lines = Vec::with_capacity(entries.len());
+                for (m, _, _) in &entries {
+                    last_lines.push(read_last_output_line(&m.id).await);
+                }
+                let cols = match crossterm::terminal::size() {
+                    Ok((c, _)) if c > 0 => c as usize,
+                    _ => 80,
+                };
                 let now = Local::now().format("%H:%M:%S");
-                let body = render_list_text(&entries, color);
+                let body = render_list_text(&entries, color, &last_lines, cols);
                 // Clear screen + home cursor, hide cursor while drawing.
                 let mut out = std::io::stdout();
                 let header = if color {
@@ -75,6 +86,62 @@ pub async fn list(json: bool, watch: bool, interval: String) -> Result<()> {
             }
         }
     }
+}
+
+/// Read the most recent non-blank output line of a session, cheaply: only the
+/// tail of `output.log` is read (never the whole file, which can be many MB),
+/// then ANSI escapes are stripped and control chars dropped. Returns `None` if
+/// there's no log or no printable line. For full-screen TUIs that redraw in
+/// place the raw tail is a partial frame, so the result may look noisy — it's a
+/// best-effort "what's happening now" hint, not an exact screen render.
+async fn read_last_output_line(id: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+    const TAIL_BYTES: u64 = 8192;
+    let path = paths::output_log_path(id).ok()?;
+    let mut file = tokio::fs::File::open(&path).await.ok()?;
+    let len = file.metadata().await.ok()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
+    }
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await.ok()?;
+    let stripped = strip_ansi_escapes::strip(&buf);
+    let text = String::from_utf8_lossy(&stripped);
+    last_visible_line(&text)
+}
+
+/// Extract the latest visible line from ANSI-stripped output. Splits on CR *and*
+/// LF: full-screen TUIs overwrite the current line with a bare `\r` (no newline)
+/// between redraws, so `lines()` would glue an entire spinner history into one
+/// cell. Splitting on `\r` too isolates the latest frame — the meaningful
+/// "what's happening now". Residual control chars are dropped so the cell can't
+/// smear across the terminal.
+fn last_visible_line(text: &str) -> Option<String> {
+    let line = text
+        .split(['\n', '\r'])
+        .map(str::trim_end)
+        .rev()
+        .find(|l| !l.trim().is_empty())?;
+    let cleaned: String = line.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Truncate `s` to at most `max` display columns (char count), appending an
+/// ellipsis when clipped. `max == 0` means no limit.
+fn truncate_cols(s: &str, max: usize) -> String {
+    if max == 0 || s.chars().count() <= max {
+        return s.to_string();
+    }
+    let take = max.saturating_sub(1);
+    let mut out: String = s.chars().take(take).collect();
+    out.push('\u{2026}');
+    out
 }
 
 async fn gather_list_entries() -> Result<Vec<(Meta, Status, Option<String>)>> {
@@ -95,8 +162,15 @@ async fn gather_list_entries() -> Result<Vec<(Meta, Status, Option<String>)>> {
 }
 
 /// Render the session table to a string (no trailing print). `color` enables
-/// ANSI dim/state coloring.
-fn render_list_text(entries: &[(Meta, Status, Option<String>)], color: bool) -> String {
+/// ANSI dim/state coloring. When `last_lines` is non-empty it is indexed in
+/// step with `entries`; each present line is printed dimmed under its row,
+/// truncated to `width` columns (0 = no limit).
+fn render_list_text(
+    entries: &[(Meta, Status, Option<String>)],
+    color: bool,
+    last_lines: &[Option<String>],
+    width: usize,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     if entries.is_empty() {
@@ -153,7 +227,9 @@ fn render_list_text(entries: &[(Meta, Status, Option<String>)], color: bool) -> 
         "{dim}{:<id_w$} {:<state_w$} {:<age_w$} CMD{reset}",
         "ID", "STATE", "AGE"
     );
-    for (id, state, age, cmd) in &rows {
+    // The continuation line is indented to align under the CMD column.
+    let indent = id_w + 1 + state_w + 1 + age_w + 1;
+    for (i, (id, state, age, cmd)) in rows.iter().enumerate() {
         // Pad first, then wrap the trimmed label in color so the SGR codes
         // don't count toward the column width.
         let state_cell = if color {
@@ -168,6 +244,11 @@ fn render_list_text(entries: &[(Meta, Status, Option<String>)], color: bool) -> 
             format!("{state:<state_w$}")
         };
         let _ = writeln!(out, "{id:<id_w$} {state_cell} {age:<age_w$} {cmd}");
+        if let Some(Some(last)) = last_lines.get(i) {
+            let avail = width.saturating_sub(indent + 2);
+            let line = truncate_cols(last, avail);
+            let _ = writeln!(out, "{:indent$}{dim}↳ {line}{reset}", "");
+        }
     }
     out
 }
@@ -1045,8 +1126,42 @@ fn format_age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_complete, grep_filter, key_to_bytes, safe_prefix_len};
+    use super::{
+        escape_complete, grep_filter, key_to_bytes, last_visible_line, safe_prefix_len,
+        truncate_cols,
+    };
     use regex::Regex;
+
+    #[test]
+    fn last_visible_line_takes_final_nonblank() {
+        assert_eq!(
+            last_visible_line("build\ncompiling\ndone\n").as_deref(),
+            Some("done")
+        );
+        // Trailing blank lines are skipped.
+        assert_eq!(last_visible_line("a\nb\n\n  \n").as_deref(), Some("b"));
+        assert_eq!(last_visible_line("\n  \n").as_deref(), None);
+    }
+
+    #[test]
+    fn last_visible_line_splits_on_carriage_return() {
+        // TUI redraws separated by bare CR must not glue into one cell.
+        let frames = "frame1\rframe2\rWorking... (3s)";
+        assert_eq!(
+            last_visible_line(frames).as_deref(),
+            Some("Working... (3s)")
+        );
+    }
+
+    #[test]
+    fn truncate_cols_appends_ellipsis_when_clipped() {
+        assert_eq!(truncate_cols("hello", 0), "hello"); // 0 = no limit
+        assert_eq!(truncate_cols("hello", 10), "hello");
+        assert_eq!(truncate_cols("hello", 5), "hello");
+        assert_eq!(truncate_cols("hello", 4), "hel\u{2026}");
+        // Counts chars, not bytes (multibyte safe).
+        assert_eq!(truncate_cols("あいうえお", 3), "あい\u{2026}");
+    }
 
     #[test]
     fn key_named_sequences() {
