@@ -9,12 +9,72 @@ use crate::control::{Request, Response, last_n_lines};
 use crate::paths;
 use crate::session::{self, Meta, State, Status};
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use regex::Regex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-pub async fn list(json: bool) -> Result<()> {
+pub async fn list(json: bool, watch: bool, interval: String) -> Result<()> {
+    if json || !watch {
+        let entries = gather_list_entries().await?;
+        if json {
+            let arr: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|(m, s, note)| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "cmd": m.cmd,
+                        "state": s.state,
+                        "alive": is_owner_alive(m, s),
+                        "exit_code": s.exit_code,
+                        "started_at": m.started_at,
+                        "last_change": s.last_change,
+                        "note": note,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&arr)?);
+        } else {
+            use std::io::IsTerminal as _;
+            let color = std::io::stdout().is_terminal();
+            print!("{}", render_list_text(&entries, color));
+        }
+        return Ok(());
+    }
+
+    // --watch: redraw the list in place until interrupted.
+    let period = crate::run::parse_duration(&interval)?;
+    use std::io::{IsTerminal as _, Write as _};
+    let color = std::io::stdout().is_terminal();
+    let mut ticker = tokio::time::interval(period);
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                // Show the cursor again and move below the cleared region.
+                print!("\x1b[?25h");
+                let _ = std::io::stdout().flush();
+                println!();
+                return Ok(());
+            }
+            _ = ticker.tick() => {
+                let entries = gather_list_entries().await?;
+                let now = Local::now().format("%H:%M:%S");
+                let body = render_list_text(&entries, color);
+                // Clear screen + home cursor, hide cursor while drawing.
+                let mut out = std::io::stdout();
+                let header = if color {
+                    format!("\x1b[2mevery {interval}  {now}  (Ctrl-C to stop)\x1b[0m\n")
+                } else {
+                    format!("every {interval}  {now}  (Ctrl-C to stop)\n")
+                };
+                let _ = write!(out, "\x1b[?25l\x1b[2J\x1b[H{header}{body}");
+                let _ = out.flush();
+            }
+        }
+    }
+}
+
+async fn gather_list_entries() -> Result<Vec<(Meta, Status, Option<String>)>> {
     let ids = session::list_ids().await?;
     let mut entries = Vec::new();
     for id in &ids {
@@ -28,96 +88,85 @@ pub async fn list(json: bool) -> Result<()> {
     }
     // Most-recently-active first.
     entries.sort_by_key(|e| std::cmp::Reverse(e.1.last_change));
+    Ok(entries)
+}
 
-    if json {
-        let arr: Vec<serde_json::Value> = entries
-            .iter()
-            .map(|(m, s, note)| {
-                serde_json::json!({
-                    "id": m.id,
-                    "cmd": m.cmd,
-                    "state": s.state,
-                    "alive": is_owner_alive(m, s),
-                    "exit_code": s.exit_code,
-                    "started_at": m.started_at,
-                    "last_change": s.last_change,
-                    "note": note,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if entries.is_empty() {
-        println!("(no sessions)");
-    } else {
-        // Precompute each row's display columns so we can size each column to
-        // its widest value; fixed widths break alignment when an id is long.
-        let rows: Vec<(String, String, String, String)> = entries
-            .iter()
-            .map(|(m, s, note)| {
-                let age = format_age(m.started_at, Utc::now());
-                let cmd = m.cmd.join(" ");
-                // A flagged session is prefixed with ⚑ and its note appended, so
-                // a human scanning `babysit ls` sees what needs attention.
-                let suffix = match note {
-                    Some(n) if !n.is_empty() => format!("  ⚑ {n}"),
-                    Some(_) => "  ⚑".to_string(),
-                    None => String::new(),
-                };
-                (
-                    m.id.clone(),
-                    state_label_for(Some(m), s),
-                    age,
-                    format!("{cmd}{suffix}"),
-                )
-            })
-            .collect();
-
-        let id_w = rows
-            .iter()
-            .map(|r| r.0.chars().count())
-            .chain(std::iter::once("ID".len()))
-            .max()
-            .unwrap_or(2);
-        let state_w = rows
-            .iter()
-            .map(|r| r.1.chars().count())
-            .chain(std::iter::once("STATE".len()))
-            .max()
-            .unwrap_or(5);
-        let age_w = rows
-            .iter()
-            .map(|r| r.2.chars().count())
-            .chain(std::iter::once("AGE".len()))
-            .max()
-            .unwrap_or(3);
-
-        use std::io::IsTerminal as _;
-        let color = std::io::stdout().is_terminal();
-        let dim = if color { "\x1b[2m" } else { "" };
-        let reset = if color { "\x1b[0m" } else { "" };
-
-        println!(
-            "{dim}{:<id_w$} {:<state_w$} {:<age_w$} CMD{reset}",
-            "ID", "STATE", "AGE"
-        );
-        for (id, state, age, cmd) in &rows {
-            // Pad first, then wrap the trimmed label in color so the SGR codes
-            // don't count toward the column width.
-            let state_cell = if color {
-                let padded = format!("{state:<state_w$}");
-                format!(
-                    "{}{state}{}{}",
-                    state_color(state),
-                    reset,
-                    &padded[state.len()..]
-                )
-            } else {
-                format!("{state:<state_w$}")
-            };
-            println!("{id:<id_w$} {state_cell} {age:<age_w$} {cmd}");
-        }
+/// Render the session table to a string (no trailing print). `color` enables
+/// ANSI dim/state coloring.
+fn render_list_text(entries: &[(Meta, Status, Option<String>)], color: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if entries.is_empty() {
+        out.push_str("(no sessions)\n");
+        return out;
     }
-    Ok(())
+    // Precompute each row's display columns so we can size each column to
+    // its widest value; fixed widths break alignment when an id is long.
+    let rows: Vec<(String, String, String, String)> = entries
+        .iter()
+        .map(|(m, s, note)| {
+            let age = format_age(m.started_at, Utc::now());
+            let cmd = m.cmd.join(" ");
+            // A flagged session is prefixed with ⚑ and its note appended, so
+            // a human scanning `babysit ls` sees what needs attention.
+            let suffix = match note {
+                Some(n) if !n.is_empty() => format!("  ⚑ {n}"),
+                Some(_) => "  ⚑".to_string(),
+                None => String::new(),
+            };
+            (
+                m.id.clone(),
+                state_label_for(Some(m), s),
+                age,
+                format!("{cmd}{suffix}"),
+            )
+        })
+        .collect();
+
+    let id_w = rows
+        .iter()
+        .map(|r| r.0.chars().count())
+        .chain(std::iter::once("ID".len()))
+        .max()
+        .unwrap_or(2);
+    let state_w = rows
+        .iter()
+        .map(|r| r.1.chars().count())
+        .chain(std::iter::once("STATE".len()))
+        .max()
+        .unwrap_or(5);
+    let age_w = rows
+        .iter()
+        .map(|r| r.2.chars().count())
+        .chain(std::iter::once("AGE".len()))
+        .max()
+        .unwrap_or(3);
+
+    let dim = if color { "\x1b[2m" } else { "" };
+    let reset = if color { "\x1b[0m" } else { "" };
+
+    let _ = writeln!(
+        out,
+        "{dim}{:<id_w$} {:<state_w$} {:<age_w$} CMD{reset}",
+        "ID", "STATE", "AGE"
+    );
+    for (id, state, age, cmd) in &rows {
+        // Pad first, then wrap the trimmed label in color so the SGR codes
+        // don't count toward the column width.
+        let state_cell = if color {
+            let padded = format!("{state:<state_w$}");
+            format!(
+                "{}{state}{}{}",
+                state_color(state),
+                reset,
+                &padded[state.len()..]
+            )
+        } else {
+            format!("{state:<state_w$}")
+        };
+        let _ = writeln!(out, "{id:<id_w$} {state_cell} {age:<age_w$} {cmd}");
+    }
+    out
 }
 
 pub async fn status(session: Option<String>, json: bool) -> Result<()> {
