@@ -1,15 +1,8 @@
-mod attach;
-mod cli;
-mod control;
-mod pane;
-mod paths;
-mod render;
-mod run;
-mod session;
-mod sub;
-mod upgrade;
+//! The babysit CLI — a thin dispatcher over the `babysit` library (see lib.rs).
+//! All logic lives in the library; this binary only parses args and routes.
 
 use anyhow::Result;
+use babysit::{attach, cli, run, sub, upgrade};
 use clap::Parser;
 
 #[tokio::main]

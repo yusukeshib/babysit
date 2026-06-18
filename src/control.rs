@@ -5,8 +5,10 @@
 //! Wire protocol: one request per connection, newline-delimited JSON for
 //! both directions:
 //!
-//!     →  {"op":"status"}
-//!     ←  {"ok":true,"data":{...}}
+//! ```text
+//! →  {"op":"status"}
+//! ←  {"ok":true,"data":{...}}
+//! ```
 //!
 //! The connection closes after the response.
 
