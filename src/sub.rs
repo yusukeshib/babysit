@@ -1105,10 +1105,7 @@ fn is_owner_alive_meta(meta: Option<&Meta>) -> bool {
 }
 
 fn is_owner_alive(meta: &Meta, s: &Status) -> bool {
-    if !matches!(s.state, State::Starting | State::Running) {
-        return false;
-    }
-    session::is_pid_alive(meta.babysit_pid)
+    session::is_owner_alive(meta, s)
 }
 
 fn format_age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {

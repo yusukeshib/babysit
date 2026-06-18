@@ -65,6 +65,14 @@ pub fn is_pid_alive(pid: u32) -> bool {
     )
 }
 
+/// True while the wrapped command's babysit owner is still running: a terminal
+/// state is never alive; otherwise the owner pid must exist. Canonical check
+/// shared by the CLI (`sub::list`) and the library API (`api::list_sessions`)
+/// so the two can never drift.
+pub fn is_owner_alive(meta: &Meta, status: &Status) -> bool {
+    matches!(status.state, State::Starting | State::Running) && is_pid_alive(meta.babysit_pid)
+}
+
 /// Resolve the session id for a new run: validate a user-supplied `--id`,
 /// or auto-generate a unique one when none was given.
 pub async fn make_id(requested: Option<String>) -> Result<String> {

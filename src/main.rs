@@ -1,15 +1,8 @@
-mod attach;
-mod cli;
-mod control;
-mod pane;
-mod paths;
-mod render;
-mod run;
-mod session;
-mod sub;
-mod upgrade;
+//! The babysit CLI — a thin dispatcher over the `babysit` library (see lib.rs).
+//! All logic lives in the library; this binary only parses args and routes.
 
 use anyhow::Result;
+use babysit::{attach, cli, run, sub};
 use clap::Parser;
 
 #[tokio::main]
@@ -146,8 +139,16 @@ async fn main() -> Result<()> {
         cli::Command::Detach { sel, json } => attach::detach(sel.session, json).await,
         cli::Command::Prune { dry_run, json } => sub::prune(dry_run, json).await,
         cli::Command::Upgrade => {
-            let code = upgrade::run()?;
-            std::process::exit(code);
+            #[cfg(feature = "upgrade")]
+            {
+                let code = babysit::upgrade::run()?;
+                std::process::exit(code);
+            }
+            #[cfg(not(feature = "upgrade"))]
+            {
+                eprintln!("babysit: built without upgrade support");
+                std::process::exit(1);
+            }
         }
         cli::Command::Config { shell } => {
             match shell {

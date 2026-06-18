@@ -35,4 +35,11 @@ vt100 = "0.16"
 regex = "1"
 self_update = { version = "0.42", default-features = false, features = [
   "rustls",
-] }
+], optional = true }
+
+[features]
+# `upgrade` pulls the network stack (self_update -> reqwest/rustls). It is on by
+# default for the CLI, but embedders (e.g. looop) depend with
+# default-features=false to avoid linking reqwest/hyper/rustls.
+default = ["upgrade"]
+upgrade = ["dep:self_update"]
