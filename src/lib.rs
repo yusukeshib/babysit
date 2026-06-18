@@ -18,6 +18,7 @@ pub mod render;
 pub mod run;
 pub mod session;
 pub mod sub;
+#[cfg(feature = "upgrade")]
 pub mod upgrade;
 
 /// Curated, data-first public API for embedding babysit in another program.
