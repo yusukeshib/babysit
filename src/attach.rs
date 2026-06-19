@@ -15,7 +15,7 @@
 //! TUIs/shells, e.g. history) so it doesn't collide with the wrapped app.
 
 use crate::pane::ExitInfo;
-use crate::paths;
+use crate::paths::Babysit;
 use crate::session::{self, State, Status};
 use anyhow::{Context, Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -105,9 +105,9 @@ fn resize_payload(cols: u16, rows: u16) -> Vec<u8> {
 
 /// Detach an attached terminal from session `id` (the `babysit detach`
 /// subcommand). Tells the worker to drop its currently-attached clients.
-pub async fn detach(session: Option<String>, json: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let path = paths::control_socket_path(&id)?;
+pub async fn detach(bs: &Babysit, session: Option<String>, json: bool) -> Result<()> {
+    let id = session::resolve(bs, session).await?;
+    let path = bs.control_socket_path(&id);
     let mut stream = UnixStream::connect(&path)
         .await
         .with_context(|| format!("connecting to session {id}"))?;
@@ -126,9 +126,9 @@ pub async fn detach(session: Option<String>, json: bool) -> Result<()> {
 
 /// Resolve a user-supplied selector (id or $BABYSIT_SESSION_ID) and attach to
 /// it. Errors if no such session exists — used by `babysit attach`.
-pub async fn attach(session: Option<String>) -> Result<i32> {
-    let id = session::resolve(session).await?;
-    attach_to(id).await
+pub async fn attach(bs: &Babysit, session: Option<String>) -> Result<i32> {
+    let id = session::resolve(bs, session).await?;
+    attach_to(bs, id).await
 }
 
 /// Attach the current terminal to the session with the exact id `id` and
@@ -139,14 +139,14 @@ pub async fn attach(session: Option<String>) -> Result<i32> {
 /// Does not pre-check that the session exists: `connect_retry` waits for the
 /// worker to bind its socket, so this is safe to call right after spawning a
 /// worker (the `babysit run` path) before the session dir is written.
-pub async fn attach_to(id: String) -> Result<i32> {
-    let path = paths::control_socket_path(&id)?;
+pub async fn attach_to(bs: &Babysit, id: String) -> Result<i32> {
+    let path = bs.control_socket_path(&id);
 
-    let stream = match connect_retry(&path, &id).await? {
+    let stream = match connect_retry(bs, &path, &id).await? {
         Some(s) => s,
         // Session already finished before we could attach: print whatever the
         // log captured and report the recorded exit code.
-        None => return fallback_finished(&id).await,
+        None => return fallback_finished(bs, &id).await,
     };
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -209,7 +209,7 @@ pub async fn attach_to(id: String) -> Result<i32> {
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => {
                     // Worker closed unexpectedly; fall back to the recorded code.
-                    exit_code = recorded_exit_code(&id).await;
+                    exit_code = recorded_exit_code(bs, &id).await;
                     restore_terminal = true;
                     break;
                 }
@@ -257,34 +257,38 @@ fn restore_terminal_modes() {
 /// Connect to the worker's socket, retrying briefly while it binds. Returns
 /// `Ok(None)` if the session has already reached a terminal state (so the
 /// caller should fall back to the on-disk log + status).
-async fn connect_retry(path: &std::path::Path, id: &str) -> Result<Option<UnixStream>> {
+async fn connect_retry(
+    bs: &Babysit,
+    path: &std::path::Path,
+    id: &str,
+) -> Result<Option<UnixStream>> {
     for _ in 0..75 {
         match UnixStream::connect(path).await {
             Ok(s) => return Ok(Some(s)),
             Err(_) => {
-                if session_finished(id).await {
+                if session_finished(bs, id).await {
                     return Ok(None);
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
         }
     }
-    if session_finished(id).await {
+    if session_finished(bs, id).await {
         Ok(None)
     } else {
         Err(anyhow!("could not connect to session {id}"))
     }
 }
 
-async fn session_finished(id: &str) -> bool {
-    session::read_status(id)
+async fn session_finished(bs: &Babysit, id: &str) -> bool {
+    session::read_status(bs, id)
         .await
         .map(|s| s.state.is_terminal())
         .unwrap_or(false)
 }
 
-async fn recorded_exit_code(id: &str) -> i32 {
-    exit_code_from_status(session::read_status(id).await.ok())
+async fn recorded_exit_code(bs: &Babysit, id: &str) -> i32 {
+    exit_code_from_status(session::read_status(bs, id).await.ok())
 }
 
 fn exit_code_from_status(status: Option<Status>) -> i32 {
@@ -298,16 +302,14 @@ fn exit_code_from_status(status: Option<Status>) -> i32 {
 
 /// The session finished before we attached: dump the captured log and return
 /// the recorded exit code, so `babysit run -- <quick cmd>` still behaves.
-async fn fallback_finished(id: &str) -> Result<i32> {
-    if let Ok(path) = paths::output_log_path(id)
-        && let Ok(bytes) = tokio::fs::read(&path).await
-    {
+async fn fallback_finished(bs: &Babysit, id: &str) -> Result<i32> {
+    if let Ok(bytes) = tokio::fs::read(bs.output_log_path(id)).await {
         use std::io::Write;
         let mut out = std::io::stdout();
         let _ = out.write_all(&bytes);
         let _ = out.flush();
     }
-    Ok(recorded_exit_code(id).await)
+    Ok(recorded_exit_code(bs, id).await)
 }
 
 /// Strip the `Ctrl-\ Ctrl-\` detach sequence from a stdin chunk. Returns the

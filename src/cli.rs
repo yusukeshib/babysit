@@ -100,6 +100,11 @@ pub enum Command {
         /// itself to run detached. Not for direct use.
         #[arg(long = "detached-id", value_name = "ID", hide = true)]
         detached_id: Option<String>,
+        /// Internal: state root handed down by the parent when it re-execs
+        /// itself to run detached, so the worker reconstructs the same context
+        /// without reading the environment. Not for direct use.
+        #[arg(long = "root", value_name = "DIR", hide = true)]
+        root: Option<String>,
         /// Run with plain pipes instead of a PTY. Programs that detect a
         /// non-tty then emit clean, line-oriented output — nicer for log
         /// scraping (e.g. by an agent). Disables interactive/TUI rendering.
