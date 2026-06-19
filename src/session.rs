@@ -1,4 +1,4 @@
-use crate::paths;
+use crate::paths::Babysit;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,65 @@ impl Status {
     }
 }
 
+/// A single session, flattened to plain data (no printing, no exit codes). The
+/// in-process equivalent of one row of `babysit ls --json`, returned by
+/// [`Babysit::list_sessions`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub cmd: Vec<String>,
+    pub state: String,
+    pub alive: bool,
+    pub exit_code: Option<i32>,
+    pub note: Option<String>,
+    pub started_at: String,
+    pub last_change: String,
+}
+
+fn state_str(s: State) -> &'static str {
+    match s {
+        State::Starting => "starting",
+        State::Running => "running",
+        State::Exited => "exited",
+        State::Killed => "killed",
+    }
+}
+
+impl Babysit {
+    /// List all sessions in this root, most-recently-active first — the curated,
+    /// data-first surface for embedding. Sessions whose metadata can't be read
+    /// (mid-write, corrupt) are skipped, exactly like the CLI.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let ids = list_ids(self).await?;
+        let mut entries: Vec<(Meta, Status, Option<String>)> = Vec::new();
+        for id in &ids {
+            let Ok(meta) = read_meta(self, id).await else {
+                continue;
+            };
+            let status = read_status(self, id)
+                .await
+                .unwrap_or_else(|_| Status::starting());
+            let note = read_note(self, id).await;
+            entries.push((meta, status, note));
+        }
+        entries.sort_by_key(|e| std::cmp::Reverse(e.1.last_change));
+
+        Ok(entries
+            .into_iter()
+            .map(|(m, s, note)| SessionInfo {
+                alive: is_owner_alive(&m, &s),
+                state: state_str(s.state).to_string(),
+                id: m.id,
+                cmd: m.cmd,
+                exit_code: s.exit_code,
+                note,
+                started_at: m.started_at.to_rfc3339(),
+                last_change: s.last_change.to_rfc3339(),
+            })
+            .collect())
+    }
+}
+
 /// True if `pid` corresponds to a process this user can see.
 ///
 /// Used to distinguish a session whose babysit owner is still running from
@@ -67,19 +126,19 @@ pub fn is_pid_alive(pid: u32) -> bool {
 
 /// True while the wrapped command's babysit owner is still running: a terminal
 /// state is never alive; otherwise the owner pid must exist. Canonical check
-/// shared by the CLI (`sub::list`) and the library API (`api::list_sessions`)
-/// so the two can never drift.
+/// shared by the CLI (`sub::list`) and the library API (`list_sessions`) so the
+/// two can never drift.
 pub fn is_owner_alive(meta: &Meta, status: &Status) -> bool {
     matches!(status.state, State::Starting | State::Running) && is_pid_alive(meta.babysit_pid)
 }
 
 /// Resolve the session id for a new run: validate a user-supplied `--id`,
 /// or auto-generate a unique one when none was given.
-pub async fn make_id(requested: Option<String>) -> Result<String> {
+pub async fn make_id(bs: &Babysit, requested: Option<String>) -> Result<String> {
     match requested {
         Some(id) => {
             validate_id(&id)?;
-            let dir = paths::session_dir(&id)?;
+            let dir = bs.session_dir(&id);
             if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
                 return Err(anyhow!(
                     "session `{id}` already exists; pick another --id or run `babysit prune`"
@@ -87,7 +146,7 @@ pub async fn make_id(requested: Option<String>) -> Result<String> {
             }
             Ok(id)
         }
-        None => Ok(new_unique_id().await),
+        None => Ok(new_unique_id(bs).await),
     }
 }
 
@@ -132,28 +191,29 @@ pub fn new_id() -> String {
 /// concurrent sessions could hash to the same id and clobber each other's
 /// directory (meta/status/socket). Retry until we find a free one; fall
 /// back to a raw id if the space is somehow exhausted.
-pub async fn new_unique_id() -> String {
+pub async fn new_unique_id(bs: &Babysit) -> String {
     for _ in 0..10_000 {
         let id = new_id();
-        match paths::session_dir(&id) {
-            Ok(dir) if tokio::fs::try_exists(&dir).await.unwrap_or(false) => continue,
-            _ => return id,
+        if !tokio::fs::try_exists(bs.session_dir(&id))
+            .await
+            .unwrap_or(false)
+        {
+            return id;
         }
     }
     new_id()
 }
 
-pub async fn write_meta(meta: &Meta) -> Result<()> {
-    let dir = paths::session_dir(&meta.id)?;
+pub async fn write_meta(bs: &Babysit, meta: &Meta) -> Result<()> {
+    let dir = bs.session_dir(&meta.id);
     tokio::fs::create_dir_all(&dir).await?;
-    let path = paths::meta_path(&meta.id)?;
     let json = serde_json::to_vec_pretty(meta)?;
-    tokio::fs::write(&path, json).await?;
+    tokio::fs::write(bs.meta_path(&meta.id), json).await?;
     Ok(())
 }
 
-pub async fn write_status(id: &str, status: &Status) -> Result<()> {
-    let path = paths::status_path(id)?;
+pub async fn write_status(bs: &Babysit, id: &str, status: &Status) -> Result<()> {
+    let path = bs.status_path(id);
     let json = serde_json::to_vec_pretty(status)?;
     // Write atomically via rename to avoid torn reads.
     let tmp = path.with_extension("json.tmp");
@@ -162,17 +222,15 @@ pub async fn write_status(id: &str, status: &Status) -> Result<()> {
     Ok(())
 }
 
-pub async fn read_meta(id: &str) -> Result<Meta> {
-    let path = paths::meta_path(id)?;
-    let bytes = tokio::fs::read(&path)
+pub async fn read_meta(bs: &Babysit, id: &str) -> Result<Meta> {
+    let bytes = tokio::fs::read(bs.meta_path(id))
         .await
         .with_context(|| format!("reading meta for {id}"))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-pub async fn read_status(id: &str) -> Result<Status> {
-    let path = paths::status_path(id)?;
-    let bytes = tokio::fs::read(&path)
+pub async fn read_status(bs: &Babysit, id: &str) -> Result<Status> {
+    let bytes = tokio::fs::read(bs.status_path(id))
         .await
         .with_context(|| format!("reading status for {id}"))?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -180,16 +238,15 @@ pub async fn read_status(id: &str) -> Result<Status> {
 
 /// Write an attention note for a session (`babysit flag`). Creates the
 /// session dir if needed so it works regardless of the worker's state.
-pub async fn write_note(id: &str, message: &str) -> Result<()> {
-    let dir = paths::session_dir(id)?;
-    tokio::fs::create_dir_all(&dir).await?;
-    tokio::fs::write(paths::note_path(id)?, message.as_bytes()).await?;
+pub async fn write_note(bs: &Babysit, id: &str, message: &str) -> Result<()> {
+    tokio::fs::create_dir_all(bs.session_dir(id)).await?;
+    tokio::fs::write(bs.note_path(id), message.as_bytes()).await?;
     Ok(())
 }
 
 /// Clear a session's attention note (`babysit unflag`). Missing note is fine.
-pub async fn clear_note(id: &str) -> Result<()> {
-    match tokio::fs::remove_file(paths::note_path(id)?).await {
+pub async fn clear_note(bs: &Babysit, id: &str) -> Result<()> {
+    match tokio::fs::remove_file(bs.note_path(id)).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
@@ -198,15 +255,14 @@ pub async fn clear_note(id: &str) -> Result<()> {
 
 /// Read a session's attention note, if flagged. A present-but-empty file
 /// still counts as flagged and yields an empty string.
-pub async fn read_note(id: &str) -> Option<String> {
-    let path = paths::note_path(id).ok()?;
-    let bytes = tokio::fs::read(&path).await.ok()?;
+pub async fn read_note(bs: &Babysit, id: &str) -> Option<String> {
+    let bytes = tokio::fs::read(bs.note_path(id)).await.ok()?;
     Some(String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
-/// Enumerate all session ids by listing ~/.babysit/sessions/.
-pub async fn list_ids() -> Result<Vec<String>> {
-    let dir = paths::sessions_dir()?;
+/// Enumerate all session ids by listing `<root>/sessions/`.
+pub async fn list_ids(bs: &Babysit) -> Result<Vec<String>> {
+    let dir = bs.sessions_dir();
     if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
         return Ok(Vec::new());
     }
@@ -226,27 +282,30 @@ pub async fn list_ids() -> Result<Vec<String>> {
 ///
 /// Resolution order:
 /// 1. The explicit argument, if Some.
-/// 2. `$BABYSIT_SESSION_ID`, if set.
+/// 2. `$BABYSIT_SESSION_ID`, if set (the session-selector env babysit exports
+///    INTO the wrapped command, so nested `babysit` calls can omit `-s`). This
+///    is a runtime *selector*, not the state-root config — the root always
+///    comes from the `Babysit` context.
 ///
 /// There is intentionally no "most recently active" fallback: an agent that
 /// drives several sessions must name the one it means, so a forgotten `-s`
 /// fails loudly instead of silently operating on the wrong session.
-pub async fn resolve(session: Option<String>) -> Result<String> {
+pub async fn resolve(bs: &Babysit, session: Option<String>) -> Result<String> {
     if let Some(s) = session {
-        return resolve_one(&s).await;
+        return resolve_one(bs, &s).await;
     }
     if let Ok(env_id) = std::env::var("BABYSIT_SESSION_ID")
         && !env_id.is_empty()
     {
-        return resolve_one(&env_id).await;
+        return resolve_one(bs, &env_id).await;
     }
     Err(anyhow!(
         "no session selected: pass -s <id> or set $BABYSIT_SESSION_ID (list ids with `babysit ls`)"
     ))
 }
 
-async fn resolve_one(s: &str) -> Result<String> {
-    let ids = list_ids().await?;
+async fn resolve_one(bs: &Babysit, s: &str) -> Result<String> {
+    let ids = list_ids(bs).await?;
     if ids.iter().any(|i| i == s) {
         return Ok(s.to_string());
     }

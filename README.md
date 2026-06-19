@@ -36,6 +36,30 @@ change the root. `status`, `log`, and `screenshot` work after the worker exits;
 `-s <id>` selects a session; there is no "most recent" fallback. Inside the
 wrapped command the id is exported as `$BABYSIT_SESSION_ID`.
 
+## Library use (embedding)
+
+babysit is also a library. Everything is reached through a `Babysit` context — an
+explicit handle to a state root. The library never reads the environment to find
+its root; you pass it in. (`$BABYSIT_DIR` is consulted only by the `babysit`
+binary, via `Babysit::from_env`.)
+
+```rust
+use babysit::Babysit;
+
+# async fn demo() -> anyhow::Result<()> {
+let bs = Babysit::new("/path/to/state"); // explicit root, no env
+let id = /* spawn */ "job".to_string();
+for s in bs.list_sessions().await? {
+    println!("{} {}", s.id, s.state);
+}
+bs.kill(Some(id), false).await?;
+# Ok(()) }
+```
+
+Embedders (e.g. [`looop`](https://github.com/yusukeshib/looop)) compute their own
+root and call `Babysit::new`, so a babysit-backed tool never has to touch
+`$BABYSIT_DIR` or share the global `~/.babysit`.
+
 ## Install
 
 Pick one.

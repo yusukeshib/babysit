@@ -1,7 +1,7 @@
 use crate::attach;
 use crate::control::{self, Handle, LoopMessage};
 use crate::pane::{ExitInfo, OutputHub, Pane};
-use crate::paths;
+use crate::paths::Babysit;
 use crate::session::{self, Meta, State, Status};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -11,226 +11,305 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-/// Entry point for `babysit run` / `babysit -- …` / `babysit -d -- …`.
-///
-/// Architecture (tmux-style): the wrapped command always runs under a
-/// headless *worker* process that owns the PTY, the control socket, and the
-/// output fan-out. Foreground terminals are just *clients* attached over the
-/// socket. `run` spawns the worker and (unless `-d`) attaches to it; `-d`
-/// spawns the worker and returns immediately.
-#[allow(clippy::too_many_arguments)] // top-level CLI entry; each arg is a distinct flag
-pub async fn run(
-    cmd: Vec<String>,
-    id: Option<String>,
-    detach: bool,
-    detached_id: Option<String>,
-    no_tty: bool,
-    timeout: Option<String>,
-    idle_timeout: Option<String>,
-    size: Option<String>,
-    json: bool,
-) -> Result<i32> {
-    // Parse the inputs up front so a bad value errors before we spawn.
-    // Use parse_timeout (not parse_duration) so `0`/`none`/`off`/`never` mean
-    // "no timeout" here too, consistent with wait/expect/wait-idle — otherwise
-    // `--timeout 0s` would auto-kill the command immediately.
-    let timeout = timeout.as_deref().map(parse_timeout).transpose()?.flatten();
-    let idle_timeout = idle_timeout
-        .as_deref()
-        .map(parse_timeout)
-        .transpose()?
-        .flatten();
-    let size = size.as_deref().map(parse_size).transpose()?;
+impl Babysit {
+    /// Entry point for `babysit run` / `babysit -- …` / `babysit -d -- …`.
+    ///
+    /// Architecture (tmux-style): the wrapped command always runs under a
+    /// headless *worker* process that owns the PTY, the control socket, and the
+    /// output fan-out. Foreground terminals are just *clients* attached over the
+    /// socket. `run` spawns the worker and (unless `-d`) attaches to it; `-d`
+    /// spawns the worker and returns immediately.
+    #[allow(clippy::too_many_arguments)] // top-level entry; each arg is a distinct flag
+    pub async fn run(
+        &self,
+        cmd: Vec<String>,
+        id: Option<String>,
+        detach: bool,
+        detached_id: Option<String>,
+        no_tty: bool,
+        timeout: Option<String>,
+        idle_timeout: Option<String>,
+        size: Option<String>,
+        json: bool,
+    ) -> Result<i32> {
+        // Parse the inputs up front so a bad value errors before we spawn.
+        // Use parse_timeout (not parse_duration) so `0`/`none`/`off`/`never`
+        // mean "no timeout" here too, consistent with wait/expect/wait-idle —
+        // otherwise `--timeout 0s` would auto-kill the command immediately.
+        let timeout = timeout.as_deref().map(parse_timeout).transpose()?.flatten();
+        let idle_timeout = idle_timeout
+            .as_deref()
+            .map(parse_timeout)
+            .transpose()?
+            .flatten();
+        let size = size.as_deref().map(parse_size).transpose()?;
 
-    // We are the detached worker (re-exec'd with --detached-id): run the
-    // headless server loop and never come back until the command exits.
-    if let Some(worker_id) = detached_id {
-        serve_worker(cmd, worker_id, !no_tty, timeout, idle_timeout, size).await?;
-        return Ok(0);
-    }
-
-    // Parent: choose the id, announce it, spawn the worker.
-    let session_id = session::make_id(id).await?;
-    if json {
-        // Machine-readable: an agent captures `.id` without scraping prose.
-        println!("{}", serde_json::json!({ "id": session_id }));
-        let _ = std::io::stdout().flush();
-    } else {
-        print_banner(&session_id, &cmd.join(" "));
-    }
-    spawn_worker_process(&cmd, &session_id, no_tty, timeout, idle_timeout, size)?;
-
-    if detach {
-        return Ok(0);
-    }
-    // Attached run: stream the session until it exits or we detach. Use the
-    // id directly (skip resolution) since the worker may not have written the
-    // session dir yet — connect_retry waits for its socket.
-    attach::attach_to(session_id).await
-}
-
-/// The headless worker: owns the PTY + control socket, fans output out to
-/// attached clients, and supervises restarts until the command exits.
-async fn serve_worker(
-    cmd: Vec<String>,
-    id: String,
-    tty: bool,
-    timeout: Option<Duration>,
-    idle_timeout: Option<Duration>,
-    size: Option<(u16, u16)>,
-) -> Result<()> {
-    let meta = Meta {
-        id: id.clone(),
-        cmd: cmd.clone(),
-        babysit_pid: std::process::id(),
-        started_at: Utc::now(),
-    };
-    session::write_meta(&meta).await?;
-    session::write_status(&id, &Status::starting()).await?;
-
-    // No terminal here (stdio is /dev/null); start at the requested size or a
-    // sane default. Attached clients send their real size via a resize frame.
-    let (cols, rows) = size.unwrap_or((80, 24));
-
-    let log_path = paths::output_log_path(&id)?;
-    let env = vec![("BABYSIT_SESSION_ID".into(), id.clone())];
-    let hub = OutputHub::new();
-    let pane = match Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone(), tty) {
-        Ok(p) => Arc::new(p),
-        Err(e) => {
-            // Don't leave the session stuck in `starting` forever.
-            let _ = session::write_status(
-                &id,
-                &Status {
-                    state: State::Exited,
-                    child_pid: None,
-                    exit_code: None,
-                    last_change: Utc::now(),
-                },
-            )
-            .await;
-            return Err(e);
+        // We are the detached worker (re-exec'd with --detached-id): run the
+        // headless server loop and never come back until the command exits.
+        if let Some(worker_id) = detached_id {
+            self.serve_worker(cmd, worker_id, !no_tty, timeout, idle_timeout, size)
+                .await?;
+            return Ok(0);
         }
-    };
 
-    session::write_status(
-        &id,
-        &Status {
-            state: State::Running,
-            child_pid: pane.pid,
-            exit_code: None,
-            last_change: Utc::now(),
-        },
-    )
-    .await?;
+        // Parent: choose the id, announce it, spawn the worker.
+        let session_id = session::make_id(self, id).await?;
+        if json {
+            // Machine-readable: an agent captures `.id` without scraping prose.
+            println!("{}", serde_json::json!({ "id": session_id }));
+            let _ = std::io::stdout().flush();
+        } else {
+            print_banner(&session_id, &cmd.join(" "));
+        }
+        self.spawn_worker_process(&cmd, &session_id, no_tty, timeout, idle_timeout, size)?;
 
-    let (action_tx, mut action_rx) = mpsc::unbounded_channel::<LoopMessage>();
-    let (exit_tx, exit_rx) = watch::channel::<Option<ExitInfo>>(None);
-    let (detach_tx, _detach_rx0) = watch::channel::<u64>(0);
-    let detach_tx = Arc::new(detach_tx);
-    let attached = Arc::new(AtomicUsize::new(0));
-    let handle = Handle::new(
-        id.clone(),
-        pane.clone(),
-        action_tx,
-        hub.clone(),
-        exit_rx,
-        detach_tx,
-        attached.clone(),
-    );
-    control::serve(handle.clone()).await?;
+        if detach {
+            return Ok(0);
+        }
+        // Attached run: stream the session until it exits or we detach. Use the
+        // id directly (skip resolution) since the worker may not have written
+        // the session dir yet — connect_retry waits for its socket.
+        attach::attach_to(self, session_id).await
+    }
 
-    let mut current_pane = pane;
-    let info: Option<ExitInfo>;
-    // Optional auto-kill deadline. Fires once; after that the branch is
-    // disabled so we don't busy-loop re-killing.
-    let timeout_at = timeout.map(|d| tokio::time::Instant::now() + d);
-    let mut timed_out = false;
+    /// The headless worker: owns the PTY + control socket, fans output out to
+    /// attached clients, and supervises restarts until the command exits.
+    async fn serve_worker(
+        &self,
+        cmd: Vec<String>,
+        id: String,
+        tty: bool,
+        timeout: Option<Duration>,
+        idle_timeout: Option<Duration>,
+        size: Option<(u16, u16)>,
+    ) -> Result<()> {
+        let meta = Meta {
+            id: id.clone(),
+            cmd: cmd.clone(),
+            babysit_pid: std::process::id(),
+            started_at: Utc::now(),
+        };
+        session::write_meta(self, &meta).await?;
+        session::write_status(self, &id, &Status::starting()).await?;
 
-    // Optional inactivity watchdog: poll the pane's idle time and kill once it
-    // exceeds the limit. Polled (rather than event-driven) since output
-    // arrives on a blocking reader thread.
-    let idle_limit_ms = idle_timeout.map(|d| d.as_millis() as u64);
-    let mut idle_tick = idle_limit_ms.map(|_| tokio::time::interval(Duration::from_millis(500)));
-    let mut idle_killed = false;
+        // No terminal here (stdio is /dev/null); start at the requested size or
+        // a sane default. Attached clients send their real size via a resize
+        // frame.
+        let (cols, rows) = size.unwrap_or((80, 24));
 
-    loop {
-        let exit_notify = current_pane.exit_notify.clone();
-        tokio::select! {
-            _ = async {
-                match timeout_at {
-                    Some(t) => tokio::time::sleep_until(t).await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if !timed_out => {
-                timed_out = true;
-                current_pane.kill();
-            }
-            _ = async {
-                match idle_tick.as_mut() {
-                    Some(t) => { t.tick().await; }
-                    None => std::future::pending::<()>().await,
-                }
-            }, if !idle_killed => {
-                if let Some(limit) = idle_limit_ms
-                    && current_pane.idle_ms() >= limit
-                {
-                    idle_killed = true;
-                    current_pane.kill();
-                }
-            }
-            Some(msg) = action_rx.recv() => match msg {
-                LoopMessage::Restart => {
-                    current_pane.kill();
-                    current_pane.exit_notify.notified().await;
-                    let new_pane = Arc::new(Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone(), tty)?);
-                    handle.replace_cmd_pane(new_pane.clone()).await;
-                    session::write_status(&id, &Status {
-                        state: State::Running,
-                        child_pid: new_pane.pid,
+        let log_path = self.output_log_path(&id);
+        let env = vec![("BABYSIT_SESSION_ID".into(), id.clone())];
+        let hub = OutputHub::new();
+        let pane = match Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone(), tty) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                // Don't leave the session stuck in `starting` forever.
+                let _ = session::write_status(
+                    self,
+                    &id,
+                    &Status {
+                        state: State::Exited,
+                        child_pid: None,
                         exit_code: None,
                         last_change: Utc::now(),
-                    }).await?;
-                    current_pane = new_pane;
-                }
+                    },
+                )
+                .await;
+                return Err(e);
+            }
+        };
+
+        session::write_status(
+            self,
+            &id,
+            &Status {
+                state: State::Running,
+                child_pid: pane.pid,
+                exit_code: None,
+                last_change: Utc::now(),
             },
-            _ = exit_notify.notified() => {
-                info = current_pane.exit_info();
-                let signaled = info.map(|i| i.signaled).unwrap_or(true);
-                let state = if signaled { State::Killed } else { State::Exited };
-                session::write_status(&id, &Status {
-                    state,
-                    child_pid: None,
-                    exit_code: info.and_then(|i| i.code),
-                    last_change: Utc::now(),
-                }).await?;
-                break;
+        )
+        .await?;
+
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel::<LoopMessage>();
+        let (exit_tx, exit_rx) = watch::channel::<Option<ExitInfo>>(None);
+        let (detach_tx, _detach_rx0) = watch::channel::<u64>(0);
+        let detach_tx = Arc::new(detach_tx);
+        let attached = Arc::new(AtomicUsize::new(0));
+        let handle = Handle::new(
+            self.clone(),
+            id.clone(),
+            pane.clone(),
+            action_tx,
+            hub.clone(),
+            exit_rx,
+            detach_tx,
+            attached.clone(),
+        );
+        control::serve(handle.clone()).await?;
+
+        let mut current_pane = pane;
+        let info: Option<ExitInfo>;
+        // Optional auto-kill deadline. Fires once; after that the branch is
+        // disabled so we don't busy-loop re-killing.
+        let timeout_at = timeout.map(|d| tokio::time::Instant::now() + d);
+        let mut timed_out = false;
+
+        // Optional inactivity watchdog: poll the pane's idle time and kill once
+        // it exceeds the limit. Polled (rather than event-driven) since output
+        // arrives on a blocking reader thread.
+        let idle_limit_ms = idle_timeout.map(|d| d.as_millis() as u64);
+        let mut idle_tick =
+            idle_limit_ms.map(|_| tokio::time::interval(Duration::from_millis(500)));
+        let mut idle_killed = false;
+
+        loop {
+            let exit_notify = current_pane.exit_notify.clone();
+            tokio::select! {
+                _ = async {
+                    match timeout_at {
+                        Some(t) => tokio::time::sleep_until(t).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if !timed_out => {
+                    timed_out = true;
+                    current_pane.kill();
+                }
+                _ = async {
+                    match idle_tick.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if !idle_killed => {
+                    if let Some(limit) = idle_limit_ms
+                        && current_pane.idle_ms() >= limit
+                    {
+                        idle_killed = true;
+                        current_pane.kill();
+                    }
+                }
+                Some(msg) = action_rx.recv() => match msg {
+                    LoopMessage::Restart => {
+                        current_pane.kill();
+                        current_pane.exit_notify.notified().await;
+                        let new_pane = Arc::new(Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone(), tty)?);
+                        handle.replace_cmd_pane(new_pane.clone()).await;
+                        session::write_status(self, &id, &Status {
+                            state: State::Running,
+                            child_pid: new_pane.pid,
+                            exit_code: None,
+                            last_change: Utc::now(),
+                        }).await?;
+                        current_pane = new_pane;
+                    }
+                },
+                _ = exit_notify.notified() => {
+                    info = current_pane.exit_info();
+                    let signaled = info.map(|i| i.signaled).unwrap_or(true);
+                    let state = if signaled { State::Killed } else { State::Exited };
+                    session::write_status(self, &id, &Status {
+                        state,
+                        child_pid: None,
+                        exit_code: info.and_then(|i| i.code),
+                        last_change: Utc::now(),
+                    }).await?;
+                    break;
+                }
             }
         }
+
+        // Let the reader thread drain the final PTY output to the log and to any
+        // attached clients' queues (bounded so lingering PTY holders can't wedge
+        // shutdown), then tell attached clients the exit code.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            current_pane.reader_done.notified(),
+        )
+        .await;
+        let _ = exit_tx.send(Some(info.unwrap_or(ExitInfo {
+            code: None,
+            signaled: true,
+        })));
+
+        // Wait (bounded) for attached clients to flush the remaining output and
+        // the exit frame and disconnect, so the live view isn't truncated. The
+        // on-disk log already has everything regardless.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while attached.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        control::cleanup(self, &id);
+        Ok(())
     }
 
-    // Let the reader thread drain the final PTY output to the log and to any
-    // attached clients' queues (bounded so lingering PTY holders can't wedge
-    // shutdown), then tell attached clients the exit code.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        current_pane.reader_done.notified(),
-    )
-    .await;
-    let _ = exit_tx.send(Some(info.unwrap_or(ExitInfo {
-        code: None,
-        signaled: true,
-    })));
+    /// Re-exec babysit as a detached worker that supervises `cmd` in the
+    /// background. The worker gets its own session (setsid) so it survives the
+    /// parent and the user's shell exiting, and its stdio is detached to
+    /// /dev/null (output is captured to the log and fanned out to attached
+    /// clients). The chosen `id` is handed down via `--detached-id`, and the
+    /// state root via `--root`, so the worker reconstructs THIS context without
+    /// reading the environment.
+    fn spawn_worker_process(
+        &self,
+        cmd: &[String],
+        id: &str,
+        no_tty: bool,
+        timeout: Option<Duration>,
+        idle_timeout: Option<Duration>,
+        size: Option<(u16, u16)>,
+    ) -> Result<()> {
+        use std::process::{Command, Stdio};
 
-    // Wait (bounded) for attached clients to flush the remaining output and
-    // the exit frame and disconnect, so the live view isn't truncated. The
-    // on-disk log already has everything regardless.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while attached.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let exe = std::env::current_exe().context("locating the babysit executable")?;
+        let mut command = Command::new(exe);
+        command
+            .arg("run")
+            .arg("--detached-id")
+            .arg(id)
+            .arg("--root")
+            .arg(self.root());
+        if no_tty {
+            command.arg("--no-tty");
+        }
+        if let Some(d) = timeout {
+            // Pass milliseconds so a sub-second timeout isn't truncated to 0s
+            // when re-exec'd into the worker.
+            command.arg("--timeout").arg(format!("{}ms", d.as_millis()));
+        }
+        if let Some(d) = idle_timeout {
+            command
+                .arg("--idle-timeout")
+                .arg(format!("{}ms", d.as_millis()));
+        }
+        if let Some((c, r)) = size {
+            command.arg("--size").arg(format!("{c}x{r}"));
+        }
+        command.arg("--").args(cmd);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // New session: detach from the controlling terminal and the
+            // parent's process group so the worker isn't killed when the shell
+            // exits or sends Ctrl-C to the foreground group.
+            unsafe {
+                command.pre_exec(|| {
+                    nix::unistd::setsid()
+                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                    Ok(())
+                });
+            }
+        }
+
+        command
+            .spawn()
+            .context("spawning detached babysit worker")?;
+        Ok(())
     }
-    control::cleanup(&id);
-    Ok(())
 }
 
 /// Print the session-id banner to the user's terminal.
@@ -244,66 +323,6 @@ fn print_banner(id: &str, cmd_title: &str) {
     println!("  babysit log -s {on}{id}{off} --tail 200");
     println!("  babysit attach -s {on}{id}{off}");
     let _ = std::io::stdout().flush();
-}
-
-/// Re-exec babysit as a detached worker that supervises `cmd` in the
-/// background. The worker gets its own session (setsid) so it survives the
-/// parent and the user's shell exiting, and its stdio is detached to
-/// /dev/null (output is captured to the log and fanned out to attached
-/// clients). The chosen `id` is handed down via --detached-id.
-fn spawn_worker_process(
-    cmd: &[String],
-    id: &str,
-    no_tty: bool,
-    timeout: Option<Duration>,
-    idle_timeout: Option<Duration>,
-    size: Option<(u16, u16)>,
-) -> Result<()> {
-    use std::process::{Command, Stdio};
-
-    let exe = std::env::current_exe().context("locating the babysit executable")?;
-    let mut command = Command::new(exe);
-    command.arg("run").arg("--detached-id").arg(id);
-    if no_tty {
-        command.arg("--no-tty");
-    }
-    if let Some(d) = timeout {
-        // Pass milliseconds so a sub-second timeout isn't truncated to 0s when
-        // re-exec'd into the worker.
-        command.arg("--timeout").arg(format!("{}ms", d.as_millis()));
-    }
-    if let Some(d) = idle_timeout {
-        command
-            .arg("--idle-timeout")
-            .arg(format!("{}ms", d.as_millis()));
-    }
-    if let Some((c, r)) = size {
-        command.arg("--size").arg(format!("{c}x{r}"));
-    }
-    command.arg("--").args(cmd);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // New session: detach from the controlling terminal and the parent's
-        // process group so the worker isn't killed when the shell exits or
-        // sends Ctrl-C to the foreground group.
-        unsafe {
-            command.pre_exec(|| {
-                nix::unistd::setsid().map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                Ok(())
-            });
-        }
-    }
-
-    command
-        .spawn()
-        .context("spawning detached babysit worker")?;
-    Ok(())
 }
 
 /// Parse a `--timeout` value into an optional deadline. The sentinels `0`,

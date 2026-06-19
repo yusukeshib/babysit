@@ -14,7 +14,7 @@
 
 use crate::attach::{self, C_INPUT, C_RESIZE, S_DETACHED, S_EXIT, S_OUTPUT};
 use crate::pane::{ExitInfo, OutputHub, Pane};
-use crate::paths;
+use crate::paths::Babysit;
 use crate::session;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -112,6 +112,9 @@ pub enum LoopMessage {
 /// even after a restart swaps it.
 #[derive(Clone)]
 pub struct Handle {
+    /// The context this session lives in (its state root), so the control loop
+    /// resolves paths without consulting the environment.
+    pub bs: Babysit,
     pub session_id: String,
     pub cmd_pane: Arc<Mutex<Arc<Pane>>>,
     pub action_tx: mpsc::UnboundedSender<LoopMessage>,
@@ -128,7 +131,9 @@ pub struct Handle {
 }
 
 impl Handle {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        bs: Babysit,
         session_id: String,
         cmd_pane: Arc<Pane>,
         action_tx: mpsc::UnboundedSender<LoopMessage>,
@@ -138,6 +143,7 @@ impl Handle {
         attached: Arc<AtomicUsize>,
     ) -> Self {
         Self {
+            bs,
             session_id,
             cmd_pane: Arc::new(Mutex::new(cmd_pane)),
             action_tx,
@@ -157,7 +163,7 @@ impl Handle {
 /// Bind a control socket and spawn a task that serves requests forever.
 /// The task is detached; on shutdown the caller should call `cleanup()`.
 pub async fn serve(handle: Handle) -> Result<()> {
-    let path = paths::control_socket_path(&handle.session_id)?;
+    let path = handle.bs.control_socket_path(&handle.session_id);
     // If a stale socket exists from a prior run with the same id, remove it.
     let _ = tokio::fs::remove_file(&path).await;
     let listener = UnixListener::bind(&path)
@@ -220,12 +226,12 @@ async fn handle_conn(stream: UnixStream, handle: Handle) -> Result<()> {
 async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
     match req {
         Request::Status => {
-            let status = session::read_status(&handle.session_id).await?;
+            let status = session::read_status(&handle.bs, &handle.session_id).await?;
             let mut obj = serde_json::to_value(status)?;
             // Augment with cheap-to-poll liveness metrics so an agent can tell
             // whether output advanced without re-fetching a screenshot/log.
             if let serde_json::Value::Object(map) = &mut obj {
-                let path = paths::output_log_path(&handle.session_id)?;
+                let path = handle.bs.output_log_path(&handle.session_id);
                 let output_bytes = tokio::fs::metadata(&path)
                     .await
                     .map(|m| m.len())
@@ -237,7 +243,7 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
             Ok(obj)
         }
         Request::Log { tail, raw } => {
-            let path = paths::output_log_path(&handle.session_id)?;
+            let path = handle.bs.output_log_path(&handle.session_id);
             read_log(&path, tail, raw).await
         }
         Request::Screenshot { format, trim } => {
@@ -254,7 +260,7 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
             // Capture the log size BEFORE injecting input: this is the
             // race-free offset to hand to `expect --since` so it scans only
             // the output the command produces in response.
-            let path = paths::output_log_path(&handle.session_id)?;
+            let path = handle.bs.output_log_path(&handle.session_id);
             let offset = tokio::fs::metadata(&path)
                 .await
                 .map(|m| m.len())
@@ -434,10 +440,8 @@ impl Drop for AttachedGuard {
 }
 
 /// Best-effort cleanup: remove the socket file. Called on graceful shutdown.
-pub fn cleanup(session_id: &str) {
-    if let Ok(path) = paths::control_socket_path(session_id) {
-        let _ = std::fs::remove_file(path);
-    }
+pub fn cleanup(bs: &Babysit, session_id: &str) {
+    let _ = std::fs::remove_file(bs.control_socket_path(session_id));
 }
 
 #[cfg(test)]

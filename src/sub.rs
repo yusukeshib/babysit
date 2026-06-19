@@ -1,12 +1,13 @@
 //! `babysit` subcommand handlers (the "API" surface that agents use).
 //!
-//! `list` is answered directly from disk. The other subcommands open a
-//! short-lived connection to the session's control socket and forward the
-//! request as a JSON line.
+//! Every handler is a method on [`Babysit`], so it operates on an explicit
+//! state root rather than a process-global one. `list` is answered directly from
+//! disk; the others open a short-lived connection to the session's control
+//! socket and forward the request as a JSON line.
 
 use crate::cli::ShotFormat;
 use crate::control::{Request, Response, last_n_lines};
-use crate::paths;
+use crate::paths::Babysit;
 use crate::session::{self, Meta, State, Status};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
@@ -14,91 +15,571 @@ use regex::Regex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-pub async fn list(json: bool, watch: bool, interval: String) -> Result<()> {
-    use std::io::IsTerminal as _;
-    // Screen-clearing only makes sense on a terminal; when stdout is piped or
-    // redirected, fall through to a single plain render instead of emitting
-    // cursor/clear escapes in a loop forever.
-    let is_tty = std::io::stdout().is_terminal();
-    if json || !watch || !is_tty {
-        let entries = gather_list_entries().await?;
-        if json {
-            let arr: Vec<serde_json::Value> = entries
-                .iter()
-                .map(|(m, s, note)| {
-                    serde_json::json!({
-                        "id": m.id,
-                        "cmd": m.cmd,
-                        "state": s.state,
-                        "alive": is_owner_alive(m, s),
-                        "exit_code": s.exit_code,
-                        "started_at": m.started_at,
-                        "last_change": s.last_change,
-                        "note": note,
+impl Babysit {
+    pub async fn list(&self, json: bool, watch: bool, interval: String) -> Result<()> {
+        use std::io::IsTerminal as _;
+        // Screen-clearing only makes sense on a terminal; when stdout is piped
+        // or redirected, fall through to a single plain render instead of
+        // emitting cursor/clear escapes in a loop forever.
+        let is_tty = std::io::stdout().is_terminal();
+        if json || !watch || !is_tty {
+            let entries = gather_list_entries(self).await?;
+            if json {
+                let arr: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|(m, s, note)| {
+                        serde_json::json!({
+                            "id": m.id,
+                            "cmd": m.cmd,
+                            "state": s.state,
+                            "alive": is_owner_alive(m, s),
+                            "exit_code": s.exit_code,
+                            "started_at": m.started_at,
+                            "last_change": s.last_change,
+                            "note": note,
+                        })
                     })
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&arr)?);
-        } else {
-            print!("{}", render_list_text(&entries, is_tty, &[], 0));
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                print!("{}", render_list_text(&entries, is_tty, &[], 0));
+            }
+            return Ok(());
         }
-        return Ok(());
+
+        // --watch: redraw the list in place until interrupted.
+        let period = crate::run::parse_duration(&interval)?;
+        use std::io::Write as _;
+        let color = is_tty;
+        let mut ticker = tokio::time::interval(period);
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    // Show the cursor again and move below the cleared region.
+                    print!("\x1b[?25h");
+                    let _ = std::io::stdout().flush();
+                    println!();
+                    return Ok(());
+                }
+                _ = ticker.tick() => {
+                    let entries = gather_list_entries(self).await?;
+                    // Read each session's latest output line (cheap: tail of
+                    // the log only) so the watch view shows current activity.
+                    let mut last_lines = Vec::with_capacity(entries.len());
+                    for (m, _, _) in &entries {
+                        last_lines.push(read_last_output_line(self, &m.id).await);
+                    }
+                    let cols = match crossterm::terminal::size() {
+                        Ok((c, _)) if c > 0 => c as usize,
+                        _ => 80,
+                    };
+                    let now = Local::now().format("%H:%M:%S");
+                    let body = render_list_text(&entries, color, &last_lines, cols);
+                    // Clear screen + home cursor, hide cursor while drawing.
+                    let mut out = std::io::stdout();
+                    let header = if color {
+                        format!("\x1b[2mevery {interval}  {now}  (Ctrl-C to stop)\x1b[0m\n")
+                    } else {
+                        format!("every {interval}  {now}  (Ctrl-C to stop)\n")
+                    };
+                    let _ = write!(out, "\x1b[?25l\x1b[2J\x1b[H{header}{body}");
+                    let _ = out.flush();
+                }
+            }
+        }
     }
 
-    // --watch: redraw the list in place until interrupted.
-    let period = crate::run::parse_duration(&interval)?;
-    use std::io::Write as _;
-    let color = is_tty;
-    let mut ticker = tokio::time::interval(period);
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                // Show the cursor again and move below the cleared region.
-                print!("\x1b[?25h");
-                let _ = std::io::stdout().flush();
-                println!();
-                return Ok(());
-            }
-            _ = ticker.tick() => {
-                let entries = gather_list_entries().await?;
-                // Read each session's latest output line (cheap: tail of the
-                // log only, never the whole file) so the watch view shows what
-                // each command is currently doing.
-                let mut last_lines = Vec::with_capacity(entries.len());
-                for (m, _, _) in &entries {
-                    last_lines.push(read_last_output_line(&m.id).await);
+    pub async fn status(&self, session: Option<String>, json: bool) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        // Prefer the live state via the control socket; fall back to disk if
+        // the babysit process isn't running.
+        let resp = request(self, &id, &Request::Status).await;
+        let data = match resp {
+            Ok(r) if r.ok => r.data,
+            _ => {
+                // Disk fallback (worker dead). Keep the same shape an agent
+                // polls for: `output_bytes` from the log size; `screen_seq` is
+                // live-only, so report it as null.
+                let mut obj = serde_json::to_value(session::read_status(self, &id).await?)?;
+                if let serde_json::Value::Object(map) = &mut obj {
+                    let output_bytes = tokio::fs::metadata(self.output_log_path(&id))
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    map.insert("output_bytes".into(), output_bytes.into());
+                    map.insert("screen_seq".into(), serde_json::Value::Null);
                 }
-                let cols = match crossterm::terminal::size() {
-                    Ok((c, _)) if c > 0 => c as usize,
-                    _ => 80,
-                };
-                let now = Local::now().format("%H:%M:%S");
-                let body = render_list_text(&entries, color, &last_lines, cols);
-                // Clear screen + home cursor, hide cursor while drawing.
-                let mut out = std::io::stdout();
-                let header = if color {
-                    format!("\x1b[2mevery {interval}  {now}  (Ctrl-C to stop)\x1b[0m\n")
-                } else {
-                    format!("every {interval}  {now}  (Ctrl-C to stop)\n")
-                };
-                let _ = write!(out, "\x1b[?25l\x1b[2J\x1b[H{header}{body}");
-                let _ = out.flush();
+                obj
+            }
+        };
+        if json {
+            let mut out = serde_json::Map::new();
+            out.insert("session".into(), serde_json::Value::String(id));
+            out.insert("status".into(), data);
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            let s: Status = serde_json::from_value(data)?;
+            let meta = session::read_meta(self, &id).await.ok();
+            println!("session: {id}");
+            if let Some(m) = meta.as_ref() {
+                println!("cmd:     {}", m.cmd.join(" "));
+            }
+            println!("state:   {}", state_label_for(meta.as_ref(), &s));
+            if let Some(c) = s.exit_code {
+                println!("exit:    {c}");
+            }
+            if let Some(note) = session::read_note(self, &id).await {
+                println!("flag:    ⚑ {note}");
             }
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn log(
+        &self,
+        session: Option<String>,
+        tail: Option<usize>,
+        grep: Option<String>,
+        raw: bool,
+        since: Option<u64>,
+        follow: bool,
+        json: bool,
+    ) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        let path = self.output_log_path(&id);
+        let re = grep
+            .as_deref()
+            .map(Regex::new)
+            .transpose()
+            .context("invalid --grep regex")?;
+
+        if follow {
+            return follow_log(self, &id, &path, raw, since.unwrap_or(0), re.as_ref()).await;
+        }
+
+        if let Some(off) = since {
+            // Incremental read straight from the (append-only) log file.
+            let (text, offset) = read_slice(&path, off, raw).await?;
+            emit_log(self, &id, grep_filter(text, re.as_ref()), offset, json).await
+        } else {
+            // Whole log (or --tail). Prefer the live socket; fall back to disk.
+            // With --grep we fetch the full log and filter+tail client-side, so
+            // the server-side tail is skipped.
+            let server_tail = if re.is_some() { None } else { tail };
+            let resp = request(
+                self,
+                &id,
+                &Request::Log {
+                    tail: server_tail,
+                    raw,
+                },
+            )
+            .await;
+            let text = match resp {
+                Ok(r) if r.ok => r
+                    .data
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                _ => {
+                    let bytes = tokio::fs::read(&path).await.unwrap_or_default();
+                    let processed = if raw {
+                        bytes
+                    } else {
+                        strip_ansi_escapes::strip(&bytes)
+                    };
+                    let text = String::from_utf8_lossy(&processed).into_owned();
+                    match server_tail {
+                        Some(n) => last_n_lines(&text, n),
+                        None => text,
+                    }
+                }
+            };
+            // Apply --grep, then --tail to the matching lines.
+            let text = match re.as_ref() {
+                Some(re) => {
+                    let filtered = grep_filter(text, Some(re));
+                    match tail {
+                        Some(n) => last_n_lines(&filtered, n),
+                        None => filtered,
+                    }
+                }
+                None => text,
+            };
+            let offset = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            emit_log(self, &id, text, offset, json).await
+        }
+    }
+
+    /// Capture the current visible screen of a session. Prefers the live worker
+    /// (via the control socket); if the worker is gone, falls back to replaying
+    /// the on-disk output log through a fresh virtual terminal.
+    pub async fn screenshot(
+        &self,
+        session: Option<String>,
+        format: ShotFormat,
+        trim: bool,
+    ) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        let req = Request::Screenshot { format, trim };
+        let data = match request(self, &id, &req).await {
+            Ok(r) if r.ok => r.data,
+            _ => {
+                // Worker not running: render from the log on disk.
+                let bytes = tokio::fs::read(self.output_log_path(&id))
+                    .await
+                    .unwrap_or_default();
+                crate::render::render_log(&bytes, format, trim)
+            }
+        };
+
+        match format {
+            // For text formats the rendered screen is the payload; print it raw.
+            // JSON returns the full metadata object (size, cursor, cells).
+            ShotFormat::Plain | ShotFormat::Ansi => {
+                if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
+                    println!("{text}");
+                }
+            }
+            ShotFormat::Json => println!("{}", serde_json::to_string_pretty(&data)?),
+        }
+        Ok(())
+    }
+
+    pub async fn restart(&self, session: Option<String>, json: bool) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        let data = operate(self, &id, &Request::Restart, "restart").await?;
+        emit_result(json, data, || format!("restart queued for session {id}"))
+    }
+
+    pub async fn kill(&self, session: Option<String>, json: bool) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        let data = operate(self, &id, &Request::Kill, "kill").await?;
+        emit_result(json, data, || format!("killed session {id}"))
+    }
+
+    pub async fn send(
+        &self,
+        session: Option<String>,
+        text: String,
+        newline: bool,
+        json: bool,
+    ) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        let data = operate(self, &id, &Request::Send { text, newline }, "send").await?;
+        // Non-JSON success stays silent (as before); JSON returns {sent, offset}.
+        if json {
+            println!("{}", serde_json::to_string(&data)?);
+        }
+        Ok(())
+    }
+
+    /// Send one or more named keys (e.g. `Down Down Enter`, `C-c`) to the
+    /// wrapped command by encoding them to their terminal byte sequences and
+    /// writing them raw (no trailing newline).
+    pub async fn key(&self, session: Option<String>, keys: Vec<String>, json: bool) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        let mut bytes = Vec::new();
+        for name in &keys {
+            let seq = key_to_bytes(name).ok_or_else(|| {
+                anyhow!("unknown key `{name}` (try Enter, Tab, Esc, Up, C-c, F1, …)")
+            })?;
+            bytes.extend_from_slice(&seq);
+        }
+        // Key escape sequences are ASCII, so a lossless String round-trips them
+        // over the JSON `send` op without a newline.
+        let text = String::from_utf8(bytes).expect("key sequences are ASCII");
+        let data = operate(
+            self,
+            &id,
+            &Request::Send {
+                text,
+                newline: false,
+            },
+            "send keys",
+        )
+        .await?;
+        if json {
+            println!("{}", serde_json::to_string(&data)?);
+        }
+        Ok(())
+    }
+
+    /// Resize a session's terminal from a `COLSxROWS` string.
+    pub async fn resize(&self, session: Option<String>, size: String, json: bool) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        let (cols, rows) = crate::run::parse_size(&size)?;
+        let data = operate(self, &id, &Request::Resize { cols, rows }, "resize").await?;
+        emit_result(json, data, || {
+            format!("resized session {id} to {cols}x{rows}")
+        })
+    }
+
+    /// Flag a session for human attention, with an optional note.
+    pub async fn flag(
+        &self,
+        session: Option<String>,
+        message: Option<String>,
+        json: bool,
+    ) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        let msg = message.unwrap_or_else(|| "needs attention".to_string());
+        session::write_note(self, &id, &msg).await?;
+        emit_result(
+            json,
+            serde_json::json!({ "flagged": true, "note": msg }),
+            || format!("flagged session {id}: {msg}"),
+        )
+    }
+
+    /// Clear a session's attention flag.
+    pub async fn unflag(&self, session: Option<String>, json: bool) -> Result<()> {
+        let id = session::resolve(self, session).await?;
+        session::clear_note(self, &id).await?;
+        emit_result(json, serde_json::json!({ "unflagged": true }), || {
+            format!("unflagged session {id}")
+        })
+    }
+
+    /// Block until `pattern` (a regex) appears in the output, or `timeout`
+    /// elapses. Scans incrementally from `since` if given, else from the
+    /// current end when `from_now`, else from the start of the log. With
+    /// `screen`, matches against the rendered virtual-terminal grid instead of
+    /// the raw stream (for full-screen TUIs). Returns 0 on match, 124 on
+    /// timeout, 1 if the session ends before the pattern appears.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn expect(
+        &self,
+        session: Option<String>,
+        pattern: String,
+        timeout: String,
+        since: Option<u64>,
+        from_now: bool,
+        raw: bool,
+        screen: bool,
+        json: bool,
+    ) -> Result<i32> {
+        let id = session::resolve(self, session).await?;
+        let path = self.output_log_path(&id);
+        let re = Regex::new(&pattern).context("invalid expect regex")?;
+        let timeout = crate::run::parse_timeout(&timeout)?;
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
+
+        if screen {
+            return expect_screen(self, &id, &re, &pattern, deadline, json).await;
+        }
+
+        // Where to start scanning. Default: the whole log, so an already-printed
+        // marker still matches. `--from-now` opts into stream semantics;
+        // `--since` is the race-free way to wait for output after a point.
+        let mut off = match since {
+            Some(o) => o,
+            None if from_now => tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0),
+            None => 0,
+        };
+        let mut buf = String::new();
+
+        loop {
+            let (text, new_off) = read_slice(&path, off, raw).await?;
+            off = new_off;
+            if !text.is_empty() {
+                buf.push_str(&text);
+                if let Some(m) = re.find(&buf) {
+                    if json {
+                        let obj = serde_json::json!({
+                            "matched": m.as_str(),
+                            "offset": off,
+                        });
+                        println!("{}", serde_json::to_string(&obj)?);
+                    } else {
+                        println!("{}", m.as_str());
+                    }
+                    return Ok(0);
+                }
+            }
+            if is_finished(self, &id).await {
+                // Drain any final bytes once more before giving up.
+                let (tail, _) = read_slice(&path, off, raw).await?;
+                buf.push_str(&tail);
+                if re.is_match(&buf) {
+                    return Ok(0);
+                }
+                eprintln!("babysit: session {id} ended before matching /{pattern}/");
+                return Ok(1);
+            }
+            if let Some(dl) = deadline
+                && std::time::Instant::now() >= dl
+            {
+                eprintln!("babysit: timed out waiting for /{pattern}/ in session {id}");
+                return Ok(124);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Block until the session's output has been quiet for `settle`. Returns
+    /// immediately (idle) if the session already finished; exits 124 on timeout.
+    pub async fn wait_idle(
+        &self,
+        session: Option<String>,
+        settle: String,
+        timeout: String,
+    ) -> Result<i32> {
+        let id = session::resolve(self, session).await?;
+        let path = self.output_log_path(&id);
+        let settle = crate::run::parse_duration(&settle)?;
+        let timeout = crate::run::parse_timeout(&timeout)?;
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
+
+        let mut last_size = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let mut quiet_since = std::time::Instant::now();
+
+        loop {
+            let size = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if size != last_size {
+                last_size = size;
+                quiet_since = std::time::Instant::now();
+            } else if quiet_since.elapsed() >= settle {
+                return Ok(0);
+            }
+            // A finished session is, by definition, idle.
+            if is_finished(self, &id).await {
+                return Ok(0);
+            }
+            if let Some(dl) = deadline
+                && std::time::Instant::now() >= dl
+            {
+                eprintln!("babysit: timed out waiting for session {id} to settle");
+                return Ok(124);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Block until the session's wrapped command exits, then return its exit
+    /// code. Polls the on-disk status, gives up with exit 124 after `timeout`,
+    /// and returns 137 if the owning babysit process dies without recording a
+    /// terminal state.
+    pub async fn wait(&self, session: Option<String>, timeout: Option<String>) -> Result<i32> {
+        let id = session::resolve(self, session).await?;
+        let timeout = match timeout {
+            Some(s) => crate::run::parse_timeout(&s)?,
+            None => None,
+        };
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
+
+        loop {
+            if let Ok(status) = session::read_status(self, &id).await {
+                match status.state {
+                    State::Exited => return Ok(status.exit_code.unwrap_or(0)),
+                    State::Killed => return Ok(status.exit_code.unwrap_or(130)),
+                    State::Starting | State::Running => {
+                        // Owner gone without a terminal state ⇒ it crashed.
+                        if let Ok(meta) = session::read_meta(self, &id).await
+                            && !session::is_pid_alive(meta.babysit_pid)
+                        {
+                            eprintln!("babysit: session {id} owner died before exiting");
+                            return Ok(137);
+                        }
+                    }
+                }
+            }
+            if let Some(dl) = deadline
+                && std::time::Instant::now() >= dl
+            {
+                eprintln!("babysit: timed out waiting for session {id}");
+                return Ok(124);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Delete session directories for sessions that are in a terminal state
+    /// (exited / killed) or whose owning babysit process has died. Live
+    /// sessions (running, with a live owner) are never touched.
+    pub async fn prune(&self, dry_run: bool, json: bool) -> Result<()> {
+        let ids = session::list_ids(self).await?;
+        let mut targets: Vec<(String, Meta)> = Vec::new();
+        for id in &ids {
+            let meta = match session::read_meta(self, id).await {
+                Ok(m) => m,
+                // Unparseable meta — leave it alone rather than silently nuke it.
+                Err(_) => continue,
+            };
+            let status = session::read_status(self, id).await.ok();
+            let alive = session::is_pid_alive(meta.babysit_pid);
+            let should_delete = match status.as_ref().map(|s| s.state) {
+                Some(State::Exited | State::Killed) => true,
+                // Starting/Running with a dead owner ⇒ "dead" in `babysit list`.
+                Some(State::Starting | State::Running) if !alive => true,
+                // No status file at all and no live owner ⇒ orphan.
+                None if !alive => true,
+                _ => false,
+            };
+            if should_delete {
+                targets.push((id.clone(), meta));
+            }
+        }
+
+        if targets.is_empty() {
+            if json {
+                println!("[]");
+            } else {
+                println!("(nothing to prune)");
+            }
+            return Ok(());
+        }
+
+        let mut results = Vec::new();
+        for (id, meta) in &targets {
+            let cmd = meta.cmd.join(" ");
+            if dry_run {
+                if !json {
+                    println!("would delete {id}  {cmd}");
+                }
+                results.push(serde_json::json!({ "id": id, "cmd": cmd, "deleted": false }));
+            } else {
+                let dir = self.session_dir(id);
+                if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                    eprintln!("babysit: failed to remove {}: {e}", dir.display());
+                    continue;
+                }
+                if !json {
+                    println!("deleted {id}  {cmd}");
+                }
+                results.push(serde_json::json!({ "id": id, "cmd": cmd, "deleted": true }));
+            }
+        }
+        if json {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+        Ok(())
     }
 }
 
 /// Read the most recent non-blank output line of a session, cheaply: only the
-/// tail of `output.log` is read (never the whole file, which can be many MB),
-/// then ANSI escapes are stripped and control chars dropped. Returns `None` if
-/// there's no log or no printable line. For full-screen TUIs that redraw in
-/// place the raw tail is a partial frame, so the result may look noisy — it's a
-/// best-effort "what's happening now" hint, not an exact screen render.
-async fn read_last_output_line(id: &str) -> Option<String> {
+/// tail of `output.log` is read, then ANSI escapes are stripped and control
+/// chars dropped. Returns `None` if there's no log or no printable line. For
+/// full-screen TUIs that redraw in place the raw tail is a partial frame, so
+/// the result may look noisy — a best-effort "what's happening now" hint.
+async fn read_last_output_line(bs: &Babysit, id: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
     const TAIL_BYTES: u64 = 8192;
-    let path = paths::output_log_path(id).ok()?;
-    let mut file = tokio::fs::File::open(&path).await.ok()?;
+    let mut file = tokio::fs::File::open(bs.output_log_path(id)).await.ok()?;
     let len = file.metadata().await.ok()?.len();
     let start = len.saturating_sub(TAIL_BYTES);
     if start > 0 {
@@ -114,9 +595,8 @@ async fn read_last_output_line(id: &str) -> Option<String> {
 /// Extract the latest visible line from ANSI-stripped output. Splits on CR *and*
 /// LF: full-screen TUIs overwrite the current line with a bare `\r` (no newline)
 /// between redraws, so `lines()` would glue an entire spinner history into one
-/// cell. Splitting on `\r` too isolates the latest frame — the meaningful
-/// "what's happening now". Residual control chars are dropped so the cell can't
-/// smear across the terminal.
+/// cell. Splitting on `\r` too isolates the latest frame. Residual control
+/// chars are dropped so the cell can't smear across the terminal.
 fn last_visible_line(text: &str) -> Option<String> {
     let line = text
         .split(['\n', '\r'])
@@ -144,16 +624,18 @@ fn truncate_cols(s: &str, max: usize) -> String {
     out
 }
 
-async fn gather_list_entries() -> Result<Vec<(Meta, Status, Option<String>)>> {
-    let ids = session::list_ids().await?;
+async fn gather_list_entries(bs: &Babysit) -> Result<Vec<(Meta, Status, Option<String>)>> {
+    let ids = session::list_ids(bs).await?;
     let mut entries = Vec::new();
     for id in &ids {
-        let meta = match session::read_meta(id).await {
+        let meta = match session::read_meta(bs, id).await {
             Ok(m) => m,
             Err(_) => continue,
         };
-        let status = session::read_status(id).await.unwrap_or(Status::starting());
-        let note = session::read_note(id).await;
+        let status = session::read_status(bs, id)
+            .await
+            .unwrap_or(Status::starting());
+        let note = session::read_note(bs, id).await;
         entries.push((meta, status, note));
     }
     // Most-recently-active first.
@@ -253,128 +735,17 @@ fn render_list_text(
     out
 }
 
-pub async fn status(session: Option<String>, json: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    // Prefer the live state via the control socket; fall back to disk if
-    // the babysit process isn't running.
-    let resp = request(&id, &Request::Status).await;
-    let data = match resp {
-        Ok(r) if r.ok => r.data,
-        _ => {
-            // Disk fallback (worker dead). Keep the same shape an agent polls
-            // for: `output_bytes` is always derivable from the log size;
-            // `screen_seq` is live-only, so report it as null.
-            let mut obj = serde_json::to_value(session::read_status(&id).await?)?;
-            if let serde_json::Value::Object(map) = &mut obj {
-                let output_bytes = match paths::output_log_path(&id) {
-                    Ok(p) => tokio::fs::metadata(&p).await.map(|m| m.len()).unwrap_or(0),
-                    Err(_) => 0,
-                };
-                map.insert("output_bytes".into(), output_bytes.into());
-                map.insert("screen_seq".into(), serde_json::Value::Null);
-            }
-            obj
-        }
-    };
+/// Print log output, either as raw text or as JSON `{text, offset, done}`
+/// (so a poller can resume from `offset` and stop when `done`).
+async fn emit_log(bs: &Babysit, id: &str, text: String, offset: u64, json: bool) -> Result<()> {
     if json {
-        let mut out = serde_json::Map::new();
-        out.insert("session".into(), serde_json::Value::String(id));
-        out.insert("status".into(), data);
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        let done = is_finished(bs, id).await;
+        let obj = serde_json::json!({ "text": text, "offset": offset, "done": done });
+        println!("{}", serde_json::to_string(&obj)?);
     } else {
-        let s: Status = serde_json::from_value(data)?;
-        let meta = session::read_meta(&id).await.ok();
-        println!("session: {id}");
-        if let Some(m) = meta.as_ref() {
-            println!("cmd:     {}", m.cmd.join(" "));
-        }
-        println!("state:   {}", state_label_for(meta.as_ref(), &s));
-        if let Some(c) = s.exit_code {
-            println!("exit:    {c}");
-        }
-        if let Some(note) = session::read_note(&id).await {
-            println!("flag:    ⚑ {note}");
-        }
+        print!("{text}");
     }
     Ok(())
-}
-
-pub async fn log(
-    session: Option<String>,
-    tail: Option<usize>,
-    grep: Option<String>,
-    raw: bool,
-    since: Option<u64>,
-    follow: bool,
-    json: bool,
-) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let path = paths::output_log_path(&id)?;
-    let re = grep
-        .as_deref()
-        .map(Regex::new)
-        .transpose()
-        .context("invalid --grep regex")?;
-
-    if follow {
-        return follow_log(&id, &path, raw, since.unwrap_or(0), re.as_ref()).await;
-    }
-
-    if let Some(off) = since {
-        // Incremental read straight from the (append-only) log file.
-        let (text, offset) = read_slice(&path, off, raw).await?;
-        emit_log(&id, grep_filter(text, re.as_ref()), offset, json).await
-    } else {
-        // Whole log (or --tail). Prefer the live socket; fall back to disk.
-        // With --grep we fetch the full log and filter+tail client-side, so
-        // the server-side tail is skipped.
-        let server_tail = if re.is_some() { None } else { tail };
-        let resp = request(
-            &id,
-            &Request::Log {
-                tail: server_tail,
-                raw,
-            },
-        )
-        .await;
-        let text = match resp {
-            Ok(r) if r.ok => r
-                .data
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            _ => {
-                let bytes = tokio::fs::read(&path).await.unwrap_or_default();
-                let processed = if raw {
-                    bytes
-                } else {
-                    strip_ansi_escapes::strip(&bytes)
-                };
-                let text = String::from_utf8_lossy(&processed).into_owned();
-                match server_tail {
-                    Some(n) => last_n_lines(&text, n),
-                    None => text,
-                }
-            }
-        };
-        // Apply --grep, then --tail to the matching lines.
-        let text = match re.as_ref() {
-            Some(re) => {
-                let filtered = grep_filter(text, Some(re));
-                match tail {
-                    Some(n) => last_n_lines(&filtered, n),
-                    None => filtered,
-                }
-            }
-            None => text,
-        };
-        let offset = tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        emit_log(&id, text, offset, json).await
-    }
 }
 
 /// Keep only lines matching `re` (no-op when `re` is None). Each kept line is
@@ -391,56 +762,14 @@ fn grep_filter(text: String, re: Option<&Regex>) -> String {
     out
 }
 
-/// Capture the current visible screen of a session. Prefers the live worker
-/// (via the control socket); if the worker is gone, falls back to replaying
-/// the on-disk output log through a fresh virtual terminal.
-pub async fn screenshot(session: Option<String>, format: ShotFormat, trim: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let req = Request::Screenshot { format, trim };
-    let data = match request(&id, &req).await {
-        Ok(r) if r.ok => r.data,
-        _ => {
-            // Worker not running: render from the log on disk.
-            let path = paths::output_log_path(&id)?;
-            let bytes = tokio::fs::read(&path).await.unwrap_or_default();
-            crate::render::render_log(&bytes, format, trim)
-        }
-    };
-
-    match format {
-        // For text formats the rendered screen is the payload; print it raw.
-        // JSON returns the full metadata object (size, cursor, cells).
-        ShotFormat::Plain | ShotFormat::Ansi => {
-            if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
-                println!("{text}");
-            }
-        }
-        ShotFormat::Json => println!("{}", serde_json::to_string_pretty(&data)?),
-    }
-    Ok(())
-}
-
-/// Print log output, either as raw text or as JSON `{text, offset, done}`
-/// (so a poller can resume from `offset` and stop when `done`).
-async fn emit_log(id: &str, text: String, offset: u64, json: bool) -> Result<()> {
-    if json {
-        let done = is_finished(id).await;
-        let obj = serde_json::json!({ "text": text, "offset": offset, "done": done });
-        println!("{}", serde_json::to_string(&obj)?);
-    } else {
-        print!("{text}");
-    }
-    Ok(())
-}
-
 /// Read the raw log from byte `off` to EOF. Returns the (optionally
 /// ANSI-stripped) text plus the new raw-byte offset to resume from.
 ///
-/// To keep incremental readers (`--since`, `--follow`, `expect`) from
-/// splitting a multi-byte UTF-8 char or an ANSI escape across a chunk
-/// boundary, a partial trailing sequence is held back: only the safe prefix
-/// is returned and the resume offset stops before it, so the next read picks
-/// it up once the rest has been written.
+/// To keep incremental readers (`--since`, `--follow`, `expect`) from splitting
+/// a multi-byte UTF-8 char or an ANSI escape across a chunk boundary, a partial
+/// trailing sequence is held back: only the safe prefix is returned and the
+/// resume offset stops before it, so the next read picks it up once the rest has
+/// been written.
 async fn read_slice(path: &std::path::Path, off: u64, raw: bool) -> Result<(String, u64)> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut f = match tokio::fs::File::open(path).await {
@@ -469,9 +798,9 @@ async fn read_slice(path: &std::path::Path, off: u64, raw: bool) -> Result<(Stri
 }
 
 /// How many leading bytes of `bytes` are safe to emit right now. Holds back a
-/// trailing unterminated ANSI escape and a trailing truncated UTF-8 char so
-/// an incremental reader never splits one. Genuinely invalid mid-stream bytes
-/// are NOT held back (they'd never complete) — they fall through to lossy
+/// trailing unterminated ANSI escape and a trailing truncated UTF-8 char so an
+/// incremental reader never splits one. Genuinely invalid mid-stream bytes are
+/// NOT held back (they'd never complete) — they fall through to lossy
 /// replacement.
 fn safe_prefix_len(bytes: &[u8]) -> usize {
     let mut end = bytes.len();
@@ -509,8 +838,8 @@ fn escape_complete(tail: &[u8]) -> bool {
     }
 }
 
-async fn is_finished(id: &str) -> bool {
-    session::read_status(id)
+async fn is_finished(bs: &Babysit, id: &str) -> bool {
+    session::read_status(bs, id)
         .await
         .map(|s| s.state.is_terminal())
         .unwrap_or(false)
@@ -518,6 +847,7 @@ async fn is_finished(id: &str) -> bool {
 
 /// Stream new log output to stdout until the session finishes (tail -f style).
 async fn follow_log(
+    bs: &Babysit,
     id: &str,
     path: &std::path::Path,
     raw: bool,
@@ -540,7 +870,7 @@ async fn follow_log(
         // The worker flips status to terminal slightly before its final
         // post-exit flush completes, so wait for a couple of idle polls after
         // `done` before stopping, to avoid cutting off the tail.
-        if is_finished(id).await {
+        if is_finished(bs, id).await {
             if advanced {
                 idle_after_done = 0;
             } else {
@@ -557,21 +887,26 @@ async fn follow_log(
 
 /// Send a control request that needs a live worker, mapping failures to an
 /// actionable message instead of a raw socket error.
-async fn operate(id: &str, req: &Request, action: &str) -> Result<serde_json::Value> {
-    match request(id, req).await {
+async fn operate(bs: &Babysit, id: &str, req: &Request, action: &str) -> Result<serde_json::Value> {
+    match request(bs, id, req).await {
         Ok(r) if r.ok => Ok(r.data),
         Ok(r) => Err(anyhow!(
             r.error.unwrap_or_else(|| format!("{action} failed"))
         )),
-        Err(e) => Err(dead_worker_error(id, action, e).await),
+        Err(e) => Err(dead_worker_error(bs, id, action, e).await),
     }
 }
 
-/// Explain why a control op couldn't reach the worker: a finished session, or
-/// a worker that's gone. Falls back to the underlying error if state is
+/// Explain why a control op couldn't reach the worker: a finished session, or a
+/// worker that's gone. Falls back to the underlying error if state is
 /// unreadable.
-async fn dead_worker_error(id: &str, action: &str, err: anyhow::Error) -> anyhow::Error {
-    match session::read_status(id).await {
+async fn dead_worker_error(
+    bs: &Babysit,
+    id: &str,
+    action: &str,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    match session::read_status(bs, id).await {
         Ok(s) if s.state.is_terminal() => anyhow!(
             "cannot {action}: session {id} has already finished — it no longer accepts input"
         ),
@@ -589,86 +924,119 @@ fn emit_result(json: bool, data: serde_json::Value, human: impl FnOnce() -> Stri
     Ok(())
 }
 
-pub async fn restart(session: Option<String>, json: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let data = operate(&id, &Request::Restart, "restart").await?;
-    emit_result(json, data, || format!("restart queued for session {id}"))
-}
-
-pub async fn kill(session: Option<String>, json: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let data = operate(&id, &Request::Kill, "kill").await?;
-    emit_result(json, data, || format!("killed session {id}"))
-}
-
-pub async fn send(session: Option<String>, text: String, newline: bool, json: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let data = operate(&id, &Request::Send { text, newline }, "send").await?;
-    // Non-JSON success stays silent (as before); JSON returns {sent, offset}.
-    if json {
-        println!("{}", serde_json::to_string(&data)?);
+/// `expect --screen`: poll the rendered virtual-terminal grid and match the
+/// regex against the on-screen text. Returns 0 on match, 124 on timeout, 1 if
+/// the session ends without the pattern showing.
+async fn expect_screen(
+    bs: &Babysit,
+    id: &str,
+    re: &Regex,
+    pattern: &str,
+    deadline: Option<std::time::Instant>,
+    json: bool,
+) -> Result<i32> {
+    loop {
+        let text = current_screen_text(bs, id).await;
+        if let Some(m) = re.find(&text) {
+            if json {
+                let obj = serde_json::json!({ "matched": m.as_str() });
+                println!("{}", serde_json::to_string(&obj)?);
+            } else {
+                println!("{}", m.as_str());
+            }
+            return Ok(0);
+        }
+        if is_finished(bs, id).await {
+            // One last look in case the final frame landed after the check.
+            let text = current_screen_text(bs, id).await;
+            if re.is_match(&text) {
+                return Ok(0);
+            }
+            eprintln!("babysit: session {id} ended before matching /{pattern}/ on screen");
+            return Ok(1);
+        }
+        if let Some(dl) = deadline
+            && std::time::Instant::now() >= dl
+        {
+            eprintln!("babysit: timed out waiting for /{pattern}/ on screen of session {id}");
+            return Ok(124);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    Ok(())
 }
 
-/// Send one or more named keys (e.g. `Down Down Enter`, `C-c`) to the wrapped
-/// command by encoding them to their terminal byte sequences and writing them
-/// raw (no trailing newline).
-pub async fn key(session: Option<String>, keys: Vec<String>, json: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let mut bytes = Vec::new();
-    for name in &keys {
-        let seq = key_to_bytes(name)
-            .ok_or_else(|| anyhow!("unknown key `{name}` (try Enter, Tab, Esc, Up, C-c, F1, …)"))?;
-        bytes.extend_from_slice(&seq);
+/// Fetch the current rendered screen as plain text. Prefers the live worker;
+/// falls back to replaying the on-disk log through a fresh parser when the
+/// worker is gone.
+async fn current_screen_text(bs: &Babysit, id: &str) -> String {
+    let req = Request::Screenshot {
+        format: ShotFormat::Plain,
+        trim: false,
+    };
+    let data = match request(bs, id, &req).await {
+        Ok(r) if r.ok => r.data,
+        _ => {
+            let bytes = tokio::fs::read(bs.output_log_path(id))
+                .await
+                .unwrap_or_default();
+            crate::render::render_log(&bytes, ShotFormat::Plain, false)
+        }
+    };
+    data.get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Open a short-lived connection to the session's control socket, send a single
+/// JSON request, and parse the JSON response.
+async fn request(bs: &Babysit, id: &str, req: &Request) -> Result<Response> {
+    let path = bs.control_socket_path(id);
+    let mut stream = connect_with_retry(bs, id, &path).await?;
+    let mut bytes = serde_json::to_vec(req)?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+
+    let mut br = BufReader::new(stream);
+    let mut line = String::new();
+    br.read_line(&mut line).await?;
+    let resp: Response = serde_json::from_str(line.trim())?;
+    Ok(resp)
+}
+
+/// Connect to a session's control socket, retrying for up to ~1s while the
+/// worker is still binding it. Bails immediately if the session is already in a
+/// terminal state or its owner process has died (no socket is coming).
+async fn connect_with_retry(bs: &Babysit, id: &str, path: &std::path::Path) -> Result<UnixStream> {
+    // ~1s total: 25 attempts × 40ms. Covers fork+exec+tokio+PTY spawn before
+    // the worker binds, without hanging on a truly absent worker.
+    for attempt in 0..25 {
+        match UnixStream::connect(path).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                // Don't keep retrying a session that will never bind.
+                if let Ok(status) = session::read_status(bs, id).await {
+                    if status.state.is_terminal() {
+                        return Err(anyhow!("{e}"));
+                    }
+                    if let Ok(meta) = session::read_meta(bs, id).await
+                        && !session::is_pid_alive(meta.babysit_pid)
+                    {
+                        return Err(anyhow!("{e}"));
+                    }
+                }
+                if attempt < 24 {
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                } else {
+                    return Err::<UnixStream, _>(e).with_context(|| {
+                        format!("connecting to control socket {}", path.display())
+                    });
+                }
+            }
+        }
     }
-    // Key escape sequences are ASCII, so a lossless String round-trips them
-    // over the JSON `send` op without a newline.
-    let text = String::from_utf8(bytes).expect("key sequences are ASCII");
-    let data = operate(
-        &id,
-        &Request::Send {
-            text,
-            newline: false,
-        },
-        "send keys",
-    )
-    .await?;
-    if json {
-        println!("{}", serde_json::to_string(&data)?);
-    }
-    Ok(())
-}
-
-/// Resize a session's terminal from a `COLSxROWS` string.
-pub async fn resize(session: Option<String>, size: String, json: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let (cols, rows) = crate::run::parse_size(&size)?;
-    let data = operate(&id, &Request::Resize { cols, rows }, "resize").await?;
-    emit_result(json, data, || {
-        format!("resized session {id} to {cols}x{rows}")
-    })
-}
-
-/// Flag a session for human attention, with an optional note.
-pub async fn flag(session: Option<String>, message: Option<String>, json: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    let msg = message.unwrap_or_else(|| "needs attention".to_string());
-    session::write_note(&id, &msg).await?;
-    emit_result(
-        json,
-        serde_json::json!({ "flagged": true, "note": msg }),
-        || format!("flagged session {id}: {msg}"),
-    )
-}
-
-/// Clear a session's attention flag.
-pub async fn unflag(session: Option<String>, json: bool) -> Result<()> {
-    let id = session::resolve(session).await?;
-    session::clear_note(&id).await?;
-    emit_result(json, serde_json::json!({ "unflagged": true }), || {
-        format!("unflagged session {id}")
-    })
+    unreachable!("loop returns on the final attempt")
 }
 
 /// Map a key name to the bytes a terminal sends for it. Names are
@@ -721,352 +1089,6 @@ fn key_to_bytes(name: &str) -> Option<Vec<u8>> {
     Some(seq.to_vec())
 }
 
-/// Block until `pattern` (a regex) appears in the output, or `timeout`
-/// elapses. Scans incrementally from `since` if given, else from the current
-/// end when `from_now`, else from the start of the log (so an already-printed
-/// marker still matches). With `screen`, matches against the rendered
-/// virtual-terminal grid instead of the raw stream (for full-screen TUIs).
-/// Returns 0 on match, 124 on timeout, 1 if the session ends before the
-/// pattern appears.
-#[allow(clippy::too_many_arguments)]
-pub async fn expect(
-    session: Option<String>,
-    pattern: String,
-    timeout: String,
-    since: Option<u64>,
-    from_now: bool,
-    raw: bool,
-    screen: bool,
-    json: bool,
-) -> Result<i32> {
-    let id = session::resolve(session).await?;
-    let path = paths::output_log_path(&id)?;
-    let re = Regex::new(&pattern).context("invalid expect regex")?;
-    let timeout = crate::run::parse_timeout(&timeout)?;
-    let deadline = timeout.map(|d| std::time::Instant::now() + d);
-
-    if screen {
-        return expect_screen(&id, &re, &pattern, deadline, json).await;
-    }
-
-    // Where to start scanning. Default: the whole log, so an already-printed
-    // marker still matches (the send→expect response usually lands before this
-    // call starts). `--from-now` opts into stream semantics; `--since` is the
-    // race-free way to wait for output after a specific point.
-    let mut off = match since {
-        Some(o) => o,
-        None if from_now => tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0),
-        None => 0,
-    };
-    let mut buf = String::new();
-
-    loop {
-        let (text, new_off) = read_slice(&path, off, raw).await?;
-        off = new_off;
-        if !text.is_empty() {
-            buf.push_str(&text);
-            if let Some(m) = re.find(&buf) {
-                if json {
-                    let obj = serde_json::json!({
-                        "matched": m.as_str(),
-                        "offset": off,
-                    });
-                    println!("{}", serde_json::to_string(&obj)?);
-                } else {
-                    println!("{}", m.as_str());
-                }
-                return Ok(0);
-            }
-        }
-        if is_finished(&id).await {
-            // Drain any final bytes once more before giving up.
-            let (tail, _) = read_slice(&path, off, raw).await?;
-            buf.push_str(&tail);
-            if re.is_match(&buf) {
-                return Ok(0);
-            }
-            eprintln!("babysit: session {id} ended before matching /{pattern}/");
-            return Ok(1);
-        }
-        if let Some(dl) = deadline
-            && std::time::Instant::now() >= dl
-        {
-            eprintln!("babysit: timed out waiting for /{pattern}/ in session {id}");
-            return Ok(124);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
-/// `expect --screen`: poll the rendered virtual-terminal grid and match the
-/// regex against the on-screen text. Used for full-screen TUIs that redraw in
-/// place, where the visible text never appears as a contiguous run in the raw
-/// output stream. Returns 0 on match, 124 on timeout, 1 if the session ends
-/// without the pattern showing.
-async fn expect_screen(
-    id: &str,
-    re: &Regex,
-    pattern: &str,
-    deadline: Option<std::time::Instant>,
-    json: bool,
-) -> Result<i32> {
-    loop {
-        let text = current_screen_text(id).await;
-        if let Some(m) = re.find(&text) {
-            if json {
-                let obj = serde_json::json!({ "matched": m.as_str() });
-                println!("{}", serde_json::to_string(&obj)?);
-            } else {
-                println!("{}", m.as_str());
-            }
-            return Ok(0);
-        }
-        if is_finished(id).await {
-            // One last look in case the final frame landed after the check.
-            let text = current_screen_text(id).await;
-            if re.is_match(&text) {
-                return Ok(0);
-            }
-            eprintln!("babysit: session {id} ended before matching /{pattern}/ on screen");
-            return Ok(1);
-        }
-        if let Some(dl) = deadline
-            && std::time::Instant::now() >= dl
-        {
-            eprintln!("babysit: timed out waiting for /{pattern}/ on screen of session {id}");
-            return Ok(124);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
-/// Fetch the current rendered screen as plain text. Prefers the live worker
-/// (which holds the authoritative virtual terminal); falls back to replaying
-/// the on-disk log through a fresh parser when the worker is gone.
-async fn current_screen_text(id: &str) -> String {
-    let req = Request::Screenshot {
-        format: ShotFormat::Plain,
-        trim: false,
-    };
-    let data = match request(id, &req).await {
-        Ok(r) if r.ok => r.data,
-        _ => match paths::output_log_path(id) {
-            Ok(path) => {
-                let bytes = tokio::fs::read(&path).await.unwrap_or_default();
-                crate::render::render_log(&bytes, ShotFormat::Plain, false)
-            }
-            Err(_) => return String::new(),
-        },
-    };
-    data.get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-/// Block until the session's output has been quiet for `settle`. Returns
-/// immediately (idle) if the session already finished; exits 124 on timeout.
-pub async fn wait_idle(session: Option<String>, settle: String, timeout: String) -> Result<i32> {
-    let id = session::resolve(session).await?;
-    let path = paths::output_log_path(&id)?;
-    let settle = crate::run::parse_duration(&settle)?;
-    let timeout = crate::run::parse_timeout(&timeout)?;
-    let deadline = timeout.map(|d| std::time::Instant::now() + d);
-
-    let mut last_size = tokio::fs::metadata(&path)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let mut quiet_since = std::time::Instant::now();
-
-    loop {
-        let size = tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if size != last_size {
-            last_size = size;
-            quiet_since = std::time::Instant::now();
-        } else if quiet_since.elapsed() >= settle {
-            return Ok(0);
-        }
-        // A finished session is, by definition, idle.
-        if is_finished(&id).await {
-            return Ok(0);
-        }
-        if let Some(dl) = deadline
-            && std::time::Instant::now() >= dl
-        {
-            eprintln!("babysit: timed out waiting for session {id} to settle");
-            return Ok(124);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
-
-/// Block until the session's wrapped command exits, then return its exit
-/// code. Polls the on-disk status (so it works regardless of who owns the
-/// session) and gives up with exit 124 after `timeout`, mirroring coreutils
-/// `timeout`. If the owning babysit process dies without recording a
-/// terminal state, returns 137.
-pub async fn wait(session: Option<String>, timeout: Option<String>) -> Result<i32> {
-    let id = session::resolve(session).await?;
-    let timeout = match timeout {
-        Some(s) => crate::run::parse_timeout(&s)?,
-        None => None,
-    };
-    let deadline = timeout.map(|d| std::time::Instant::now() + d);
-
-    loop {
-        if let Ok(status) = session::read_status(&id).await {
-            match status.state {
-                State::Exited => return Ok(status.exit_code.unwrap_or(0)),
-                State::Killed => return Ok(status.exit_code.unwrap_or(130)),
-                State::Starting | State::Running => {
-                    // Owner gone without a terminal state ⇒ it crashed.
-                    if let Ok(meta) = session::read_meta(&id).await
-                        && !session::is_pid_alive(meta.babysit_pid)
-                    {
-                        eprintln!("babysit: session {id} owner died before exiting");
-                        return Ok(137);
-                    }
-                }
-            }
-        }
-        if let Some(dl) = deadline
-            && std::time::Instant::now() >= dl
-        {
-            eprintln!("babysit: timed out waiting for session {id}");
-            return Ok(124);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-}
-
-/// Delete session directories for sessions that are in a terminal state
-/// (exited / killed) or whose owning babysit process has died.
-///
-/// Live sessions (running, with a live owner) are never touched.
-pub async fn prune(dry_run: bool, json: bool) -> Result<()> {
-    let ids = session::list_ids().await?;
-    let mut targets: Vec<(String, Meta)> = Vec::new();
-    for id in &ids {
-        let meta = match session::read_meta(id).await {
-            Ok(m) => m,
-            // Unparseable meta — leave it alone rather than silently nuke it.
-            Err(_) => continue,
-        };
-        let status = session::read_status(id).await.ok();
-        let alive = session::is_pid_alive(meta.babysit_pid);
-        let should_delete = match status.as_ref().map(|s| s.state) {
-            Some(State::Exited | State::Killed) => true,
-            // Starting/Running with a dead owner ⇒ "dead" in `babysit list`.
-            Some(State::Starting | State::Running) if !alive => true,
-            // No status file at all and no live owner ⇒ orphan.
-            None if !alive => true,
-            _ => false,
-        };
-        if should_delete {
-            targets.push((id.clone(), meta));
-        }
-    }
-
-    if targets.is_empty() {
-        if json {
-            println!("[]");
-        } else {
-            println!("(nothing to prune)");
-        }
-        return Ok(());
-    }
-
-    let mut results = Vec::new();
-    for (id, meta) in &targets {
-        let cmd = meta.cmd.join(" ");
-        if dry_run {
-            if !json {
-                println!("would delete {id}  {cmd}");
-            }
-            results.push(serde_json::json!({ "id": id, "cmd": cmd, "deleted": false }));
-        } else {
-            let dir = paths::session_dir(id)?;
-            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-                eprintln!("babysit: failed to remove {}: {e}", dir.display());
-                continue;
-            }
-            if !json {
-                println!("deleted {id}  {cmd}");
-            }
-            results.push(serde_json::json!({ "id": id, "cmd": cmd, "deleted": true }));
-        }
-    }
-    if json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
-    }
-    Ok(())
-}
-
-/// Open a short-lived connection to the session's control socket, send a
-/// single JSON request, and parse the JSON response.
-///
-/// Briefly retries the connect: a worker spawned by `babysit run -d` writes
-/// meta/status and spawns the PTY before it binds the control socket, so a
-/// command issued immediately after `run -d` can race the bind. Without the
-/// retry that surfaces as a misleading "worker is gone" error. We stop early
-/// once the session reaches a terminal state or its owner is gone, so a
-/// genuinely dead session still fails fast.
-async fn request(id: &str, req: &Request) -> Result<Response> {
-    let path = paths::control_socket_path(id)?;
-    let mut stream = connect_with_retry(id, &path).await?;
-    let mut bytes = serde_json::to_vec(req)?;
-    bytes.push(b'\n');
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
-
-    let mut br = BufReader::new(stream);
-    let mut line = String::new();
-    br.read_line(&mut line).await?;
-    let resp: Response = serde_json::from_str(line.trim())?;
-    Ok(resp)
-}
-
-/// Connect to a session's control socket, retrying for up to ~1s while the
-/// worker is still binding it. Bails immediately if the session is already in
-/// a terminal state or its owner process has died (no socket is coming).
-async fn connect_with_retry(id: &str, path: &std::path::Path) -> Result<UnixStream> {
-    // ~1s total: 25 attempts × 40ms. Covers fork+exec+tokio+PTY spawn before
-    // the worker binds, without hanging on a truly absent worker.
-    for attempt in 0..25 {
-        match UnixStream::connect(path).await {
-            Ok(s) => return Ok(s),
-            Err(e) => {
-                // Don't keep retrying a session that will never bind.
-                if let Ok(status) = session::read_status(id).await {
-                    if status.state.is_terminal() {
-                        return Err(anyhow!("{e}"));
-                    }
-                    if let Ok(meta) = session::read_meta(id).await
-                        && !session::is_pid_alive(meta.babysit_pid)
-                    {
-                        return Err(anyhow!("{e}"));
-                    }
-                }
-                if attempt < 24 {
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                } else {
-                    return Err::<UnixStream, _>(e).with_context(|| {
-                        format!("connecting to control socket {}", path.display())
-                    });
-                }
-            }
-        }
-    }
-    unreachable!("loop returns on the final attempt")
-}
-
 /// ANSI SGR color for a state label (see `state_label_for`). Green for
 /// healthy/clean-exit, yellow for transient/unknown, red for failure.
 fn state_color(label: &str) -> &'static str {
@@ -1081,10 +1103,10 @@ fn state_color(label: &str) -> &'static str {
 }
 
 fn state_label_for(meta: Option<&Meta>, s: &Status) -> String {
-    // A persisted Starting/Running state only reflects reality while the
-    // owning babysit process is still alive. If the process is gone (crash,
-    // kill -9, reboot, or an early spawn failure that bailed before writing
-    // a terminal state) the on-disk value is stale — surface that instead.
+    // A persisted Starting/Running state only reflects reality while the owning
+    // babysit process is still alive. If the process is gone (crash, kill -9,
+    // reboot, or an early spawn failure that bailed before writing a terminal
+    // state) the on-disk value is stale — surface that instead.
     if matches!(s.state, State::Starting | State::Running) && !is_owner_alive_meta(meta) {
         return "dead".into();
     }
