@@ -53,8 +53,12 @@ async fn main() -> Result<()> {
         cli::Command::Run { root: Some(r), .. } => Some(r.clone()),
         _ => None,
     };
+    // This is the `babysit` CLI binary, so mark the context cli_mode (the
+    // --root branch is the detached-worker re-exec, still the CLI): it exposes
+    // BABYSIT_SESSION_ID to wrapped commands and prints the attach banner.
+    // Library embedders construct Babysit::new directly and stay invisible.
     let bs = match root_override {
-        Some(r) => Babysit::new(r),
+        Some(r) => Babysit::new(r).cli_mode(),
         None => Babysit::from_env()?,
     };
 

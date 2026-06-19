@@ -16,6 +16,13 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct Babysit {
     root: PathBuf,
+    /// True only for the `babysit` CLI binary. The CLI exposes its session id to
+    /// wrapped commands (BABYSIT_SESSION_ID, so nested `babysit` calls can omit
+    /// -s) and prints the attach banner. Library embedders (e.g. `looop`) leave
+    /// this off so babysit stays INVISIBLE to the wrapped program — otherwise an
+    /// embedder's child (e.g. an LLM agent) sees babysit's identity and parrots
+    /// `babysit attach -s …` guidance the human can't use.
+    cli: bool,
 }
 
 impl Babysit {
@@ -23,7 +30,23 @@ impl Babysit {
     /// `<root>/sessions/<id>/`. This is the explicit, env-free constructor that
     /// embedders use.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            cli: false,
+        }
+    }
+
+    /// Mark this context as the `babysit` CLI binary (not a library embedder).
+    /// Enables exposing BABYSIT_SESSION_ID to wrapped commands and the attach
+    /// banner. Library embedders never call this. Default: off (library-safe).
+    pub fn cli_mode(mut self) -> Self {
+        self.cli = true;
+        self
+    }
+
+    /// Whether this is the CLI context (see [`cli_mode`](Self::cli_mode)).
+    pub fn is_cli(&self) -> bool {
+        self.cli
     }
 
     /// Binary-boundary convenience: derive the root from `$BABYSIT_DIR` (which
@@ -41,10 +64,10 @@ impl Babysit {
                     path.display()
                 );
             }
-            return Ok(Self::new(path));
+            return Ok(Self::new(path).cli_mode());
         }
         let base = BaseDirs::new().context("could not determine home directory")?;
-        Ok(Self::new(base.home_dir().join(".babysit")))
+        Ok(Self::new(base.home_dir().join(".babysit")).cli_mode())
     }
 
     /// The state root (`<root>/sessions/<id>/...` live under it).
@@ -87,5 +110,24 @@ impl Babysit {
     /// message.
     pub fn note_path(&self, id: &str) -> PathBuf {
         self.session_dir(id).join("note")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_is_library_mode_cli_mode_opts_in() {
+        // Library embedders (Babysit::new) stay invisible: no BABYSIT_SESSION_ID
+        // injected into wrapped commands, no attach banner. Only the CLI opts in.
+        assert!(
+            !Babysit::new("/tmp/x").is_cli(),
+            "library default must be off"
+        );
+        assert!(
+            Babysit::new("/tmp/x").cli_mode().is_cli(),
+            "cli_mode opts in"
+        );
     }
 }
