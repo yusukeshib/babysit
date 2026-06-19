@@ -58,9 +58,10 @@ impl Babysit {
             // Machine-readable: an agent captures `.id` without scraping prose.
             println!("{}", serde_json::json!({ "id": session_id }));
             let _ = std::io::stdout().flush();
-        } else {
+        } else if self.is_cli() {
             print_banner(&session_id, &cmd.join(" "));
         }
+        // (library embedder, non-json: stay silent — the host owns its own UX)
         self.spawn_worker_process(&cmd, &session_id, no_tty, timeout, idle_timeout, size)?;
 
         if detach {
@@ -98,7 +99,15 @@ impl Babysit {
         let (cols, rows) = size.unwrap_or((80, 24));
 
         let log_path = self.output_log_path(&id);
-        let env = vec![("BABYSIT_SESSION_ID".into(), id.clone())];
+        // Only the CLI exposes the session id to the wrapped command (so nested
+        // `babysit` calls can omit -s). As a library, stay invisible: an
+        // embedder's wrapped program (e.g. an LLM agent) must not see — and then
+        // parrot — babysit's identity (`babysit attach -s …`).
+        let env = if self.is_cli() {
+            vec![("BABYSIT_SESSION_ID".into(), id.clone())]
+        } else {
+            vec![]
+        };
         let hub = OutputHub::new();
         let pane = match Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone(), tty) {
             Ok(p) => Arc::new(p),
