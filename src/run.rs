@@ -6,6 +6,7 @@ use crate::session::{self, Meta, State, Status};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -269,7 +270,7 @@ impl Babysit {
     ) -> Result<()> {
         use std::process::{Command, Stdio};
 
-        let exe = std::env::current_exe().context("locating the babysit executable")?;
+        let exe = self.supervisor_exe()?;
         let mut command = Command::new(exe);
         command
             .arg("run")
@@ -318,6 +319,31 @@ impl Babysit {
             .spawn()
             .context("spawning detached babysit worker")?;
         Ok(())
+    }
+
+    /// Resolve the executable to re-exec as the detached worker supervisor.
+    ///
+    /// Precedence:
+    ///   1. an explicit [`with_supervisor_exe`](crate::Babysit::with_supervisor_exe)
+    ///      override (the embedder knows a stable path);
+    ///   2. on Linux, `/proc/self/exe` — the kernel keeps this pointing at the
+    ///      running image's inode even after the on-disk binary is replaced
+    ///      (upgrade) or unlinked (`nix gc`), so a long-lived supervisor can
+    ///      still re-exec itself; and it execs the right inode for free;
+    ///   3. `current_exe()` everywhere else (and if `/proc/self/exe` is absent,
+    ///      e.g. /proc not mounted).
+    fn supervisor_exe(&self) -> Result<PathBuf> {
+        if let Some(p) = self.supervisor_override() {
+            return Ok(p.to_path_buf());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let proc_self = PathBuf::from("/proc/self/exe");
+            if proc_self.exists() {
+                return Ok(proc_self);
+            }
+        }
+        std::env::current_exe().context("locating the babysit executable")
     }
 }
 

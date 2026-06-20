@@ -23,6 +23,14 @@ pub struct Babysit {
     /// embedder's child (e.g. an LLM agent) sees babysit's identity and parrots
     /// `babysit attach -s …` guidance the human can't use.
     cli: bool,
+    /// Explicit path to the executable re-exec'd as the detached worker
+    /// supervisor. `None` = resolve at spawn time (Linux: `/proc/self/exe`, which
+    /// survives the binary being replaced/deleted mid-run; elsewhere
+    /// `current_exe()`). An embedder that re-execs itself (e.g. `looop`, which
+    /// routes `run --detached-id` back into its own supervisor) can pin a stable
+    /// path here so a long-lived process isn't broken by an upgrade/move of its
+    /// own binary. See [`Babysit::with_supervisor_exe`].
+    supervisor: Option<PathBuf>,
 }
 
 impl Babysit {
@@ -33,7 +41,25 @@ impl Babysit {
         Self {
             root: root.into(),
             cli: false,
+            supervisor: None,
         }
+    }
+
+    /// Pin the executable that babysit re-execs as the detached worker
+    /// supervisor (it is invoked as `<exe> run --detached-id <id> --root <dir>
+    /// -- <cmd…>`). Use this when the embedder re-execs ITSELF and wants a stable
+    /// path that outlives an upgrade/move of the running binary. When unset,
+    /// babysit resolves it at spawn time, preferring `/proc/self/exe` on Linux
+    /// (which stays valid even after the on-disk binary is replaced or unlinked).
+    pub fn with_supervisor_exe(mut self, exe: impl Into<PathBuf>) -> Self {
+        self.supervisor = Some(exe.into());
+        self
+    }
+
+    /// The pinned supervisor exe override, if any (see
+    /// [`with_supervisor_exe`](Self::with_supervisor_exe)).
+    pub fn supervisor_override(&self) -> Option<&Path> {
+        self.supervisor.as_deref()
     }
 
     /// Mark this context as the `babysit` CLI binary (not a library embedder).
@@ -128,6 +154,21 @@ mod tests {
         assert!(
             Babysit::new("/tmp/x").cli_mode().is_cli(),
             "cli_mode opts in"
+        );
+    }
+
+    #[test]
+    fn supervisor_exe_override_defaults_off_and_is_settable() {
+        assert_eq!(
+            Babysit::new("/tmp/x").supervisor_override(),
+            None,
+            "no override by default — babysit resolves the exe at spawn time"
+        );
+        let b = Babysit::new("/tmp/x").with_supervisor_exe("/usr/local/bin/looop");
+        assert_eq!(
+            b.supervisor_override(),
+            Some(Path::new("/usr/local/bin/looop")),
+            "an embedder can pin a stable supervisor path"
         );
     }
 }
