@@ -433,18 +433,24 @@ impl Drop for ViewChild {
             p.abort();
         }
         if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            // Reap the formatter so it never lingers as a zombie. Prefer an
-            // explicit background `wait()`; fall back to `kill_on_drop` (set at
-            // spawn) reaping the child via tokio's orphan queue when no runtime
-            // handle is available (e.g. dropped outside an async context).
+            // Reap the formatter so it never lingers as a zombie. Prefer a
+            // background task that both kills and awaits the child: `kill()`
+            // issues the signal and then `wait()`s, so a transient
+            // `start_kill` failure is retried and the child is always reaped
+            // when a runtime is available. Fall back to `start_kill` +
+            // `kill_on_drop` (set at spawn) reaping via tokio's orphan queue
+            // only when no runtime handle exists (e.g. dropped outside an
+            // async context).
             match tokio::runtime::Handle::try_current() {
                 Ok(rt) => {
                     rt.spawn(async move {
-                        let _ = child.wait().await;
+                        let _ = child.kill().await;
                     });
                 }
-                Err(_) => drop(child),
+                Err(_) => {
+                    let _ = child.start_kill();
+                    drop(child);
+                }
             }
         }
     }
