@@ -330,6 +330,11 @@ async fn handle_attach(
     // (backlog + live) through it before rendering; the recorded log and vt100
     // screenshot stay raw. The formatter is killed when `_view_child` drops at
     // the end of this fn, so it never outlives the client.
+    //
+    // Note: under `--view-cmd` the *formatted* live view has no tail-delivery
+    // guarantee — on session exit the formatter may still be flushing, so its
+    // final bytes can be truncated. The raw recorded log is always complete,
+    // so this only affects the transformed on-screen view, not the record.
     let raw_output = handle.hub.subscribe();
     let (mut output, _view_child) = match handle.view_cmd.as_deref() {
         Some(cmd) if !cmd.trim().is_empty() => match spawn_view_filter(raw_output, cmd) {
@@ -460,14 +465,14 @@ fn spawn_view_filter(
     let mut stdout = child.stdout.take().context("view-cmd stdout")?;
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    // hub → formatter stdin. Dropping `stdin` on exit closes the pipe so the
-    // formatter sees EOF.
+    // hub → formatter stdin. `write_all` already pushes each chunk into the
+    // pipe, so no per-chunk `flush` is needed; dropping `stdin` at the end of
+    // this task closes the pipe and delivers EOF to the formatter.
     let feed = tokio::spawn(async move {
         while let Some(chunk) = output.recv().await {
             if stdin.write_all(&chunk).await.is_err() {
                 break;
             }
-            let _ = stdin.flush().await;
         }
     });
 
