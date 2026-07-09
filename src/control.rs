@@ -328,7 +328,7 @@ async fn handle_attach(
 
     // When a view command is configured, pipe this client's byte stream
     // (backlog + live) through it before rendering; the recorded log and vt100
-    // screenshot stay raw. The formatter is killed when `_view_child` drops at
+    // screenshot stay raw. The formatter is killed when `view_child` drops at
     // the end of this fn, so it never outlives the client.
     //
     // Note: under `--view-cmd` the *formatted* live view has no tail-delivery
@@ -348,7 +348,7 @@ async fn handle_attach(
     // `hub.clients` until the next broadcast — which may never come once the
     // session has exited, leaking across repeated attaches with a broken
     // `--view-cmd`.
-    let (mut output, _view_child) = match handle.view_cmd.as_deref() {
+    let (mut output, view_child) = match handle.view_cmd.as_deref() {
         Some(cmd) if !cmd.trim().is_empty() => {
             match spawn_view_filter(|| handle.hub.subscribe(), cmd, already_exited) {
                 Ok((rx, guard)) => (rx, Some(guard)),
@@ -359,7 +359,7 @@ async fn handle_attach(
     };
     // Whether output is routed through a formatter. The already-exited EXIT
     // fast-path below only holds for the raw hub stream, not the formatted one.
-    let has_view = _view_child.is_some();
+    let has_view = view_child.is_some();
     let mut detach_rx = handle.detach_tx.subscribe();
 
     // Grace period bounding the already-exited + `--view-cmd` drain. A
