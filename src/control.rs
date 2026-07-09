@@ -335,6 +335,13 @@ async fn handle_attach(
     // guarantee — on session exit the formatter may still be flushing, so its
     // final bytes can be truncated. The raw recorded log is always complete,
     // so this only affects the transformed on-screen view, not the record.
+    // Compute this before spawning the formatter: when the session has already
+    // exited, the hub delivers its whole backlog as a single pre-queued
+    // snapshot and will never broadcast again, so the formatter's feed task
+    // must close stdin after that finite backlog (see `spawn_view_filter`).
+    let mut exit_rx = handle.exit_rx.clone();
+    let already_exited = exit_rx.borrow().is_some();
+
     // Subscribe lazily via a closure so the hub subscription only happens
     // once the formatter has actually spawned. If `spawn_view_filter` failed
     // eagerly (before subscribing) it would leave a dead sender parked in
@@ -343,18 +350,17 @@ async fn handle_attach(
     // `--view-cmd`.
     let (mut output, _view_child) = match handle.view_cmd.as_deref() {
         Some(cmd) if !cmd.trim().is_empty() => {
-            match spawn_view_filter(|| handle.hub.subscribe(), cmd) {
+            match spawn_view_filter(|| handle.hub.subscribe(), cmd, already_exited) {
                 Ok((rx, guard)) => (rx, Some(guard)),
                 Err(_) => (handle.hub.subscribe(), None),
             }
         }
         _ => (handle.hub.subscribe(), None),
     };
-    let mut exit_rx = handle.exit_rx.clone();
+    // Whether output is routed through a formatter. The already-exited EXIT
+    // fast-path below only holds for the raw hub stream, not the formatted one.
+    let has_view = _view_child.is_some();
     let mut detach_rx = handle.detach_tx.subscribe();
-
-    // If the session already ended, just deliver any backlog then EXIT.
-    let already_exited = exit_rx.borrow().is_some();
 
     // Reader half: client → PTY (input/resize). Runs as its own task so a
     // read mid-frame is never cancelled by the writer's select.
@@ -393,7 +399,19 @@ async fn handle_attach(
                         break;
                     }
                 }
-                None => break,
+                None => {
+                    // Output stream closed. For the already-exited view-cmd
+                    // path this is the formatter's drain-complete signal: its
+                    // stdin was closed after the finite backlog, so stdout hit
+                    // EOF and the drain task dropped the sender. Deliver EXIT
+                    // before leaving so the formatted backlog is never dropped.
+                    if already_exited {
+                        let info = *exit_rx.borrow();
+                        let _ = attach::write_frame(&mut wr, S_EXIT, &attach::exit_payload(info))
+                            .await;
+                    }
+                    break;
+                }
             },
             _ = exit_rx.changed() => {
                 let info = *exit_rx.borrow();
@@ -408,7 +426,14 @@ async fn handle_attach(
             },
             _ = gone.notified() => break,
         }
-        if already_exited && output.is_empty() {
+        // Raw already-exited fast-path: the hub delivers its whole backlog as
+        // one pre-queued chunk, so once the channel is drained we can EXIT
+        // immediately. The view-cmd path must NOT use this heuristic — the
+        // formatter's output can be momentarily empty while more formatted
+        // bytes are still in flight (or buffered pending EOF), which would
+        // prematurely EXIT and truncate the formatted backlog. That path
+        // instead relies on the channel-close signal handled above.
+        if already_exited && !has_view && output.is_empty() {
             let info = *exit_rx.borrow();
             let _ = attach::write_frame(&mut wr, S_EXIT, &attach::exit_payload(info)).await;
             break;
@@ -464,9 +489,18 @@ impl Drop for ViewChild {
 /// `subscribe` is only invoked *after* the formatter has spawned and its
 /// stdio pipes are wired, so a spawn failure never registers (and then
 /// orphans) a client sender in the hub.
+///
+/// When `finite_backlog` is set the session has already exited: the hub
+/// delivers its whole backlog as a single pre-queued snapshot and will never
+/// broadcast again (its sender stays parked in the hub, so `recv` would block
+/// forever). In that case the feed task drains only what is already queued and
+/// then closes stdin, so the formatter sees EOF, flushes any buffered output,
+/// and exits — letting the drain task close the client channel to signal that
+/// the formatted backlog has been fully delivered.
 fn spawn_view_filter(
     subscribe: impl FnOnce() -> mpsc::UnboundedReceiver<Vec<u8>>,
     view_cmd: &str,
+    finite_backlog: bool,
 ) -> Result<(mpsc::UnboundedReceiver<Vec<u8>>, ViewChild)> {
     use tokio::io::AsyncReadExt;
     let mut child = tokio::process::Command::new("sh")
@@ -488,11 +522,23 @@ fn spawn_view_filter(
     // pipe, so no per-chunk `flush` is needed; dropping `stdin` at the end of
     // this task closes the pipe and delivers EOF to the formatter.
     let feed = tokio::spawn(async move {
-        while let Some(chunk) = output.recv().await {
-            if stdin.write_all(&chunk).await.is_err() {
-                break;
+        if finite_backlog {
+            // Already-exited: drain only the pre-queued backlog snapshot
+            // (non-blocking) then fall through to drop stdin, delivering EOF.
+            // `recv().await` would block forever on the parked hub sender.
+            while let Ok(chunk) = output.try_recv() {
+                if stdin.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        } else {
+            while let Some(chunk) = output.recv().await {
+                if stdin.write_all(&chunk).await.is_err() {
+                    break;
+                }
             }
         }
+        // stdin dropped here → EOF to the formatter.
     });
 
     // formatter stdout → client. Ends when the formatter exits (EOF) or the
@@ -586,7 +632,7 @@ mod tests {
         tx.send(b"abc".to_vec()).unwrap();
         tx.send(b"def".to_vec()).unwrap();
         // An uppercasing filter proves bytes actually flow through `sh -c`.
-        let (mut out, guard) = spawn_view_filter(|| rx, "tr a-z A-Z").unwrap();
+        let (mut out, guard) = spawn_view_filter(|| rx, "tr a-z A-Z", false).unwrap();
         // Close the hub side so the formatter sees EOF, flushes, and exits.
         drop(tx);
         let mut got = Vec::new();
@@ -594,6 +640,26 @@ mod tests {
             got.extend_from_slice(&chunk);
         }
         assert_eq!(got, b"ABCDEF");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn view_filter_finite_backlog_closes_stdin_without_dropping_hub() {
+        // Simulate an already-exited session: the hub pre-queues the whole
+        // backlog as one snapshot and keeps its sender parked (never dropped).
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tx.send(b"hello".to_vec()).unwrap();
+        // A buffer-until-EOF filter (`cat`) only flushes once stdin is closed,
+        // proving the feed task closes stdin after the finite backlog even
+        // though the hub sender is still alive.
+        let (mut out, guard) = spawn_view_filter(|| rx, "cat", true).unwrap();
+        let mut got = Vec::new();
+        while let Some(chunk) = out.recv().await {
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, b"hello");
+        // The hub sender is deliberately kept alive the whole time.
+        drop(tx);
         drop(guard);
     }
 
