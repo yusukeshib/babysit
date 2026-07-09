@@ -400,15 +400,26 @@ async fn handle_attach(
                     }
                 }
                 None => {
-                    // Output stream closed. For the already-exited view-cmd
-                    // path this is the formatter's drain-complete signal: its
-                    // stdin was closed after the finite backlog, so stdout hit
-                    // EOF and the drain task dropped the sender. Deliver EXIT
-                    // before leaving so the formatted backlog is never dropped.
-                    if already_exited {
-                        let info = *exit_rx.borrow();
+                    // Output stream closed. Re-check the live session state so
+                    // we always send a well-formed terminal frame instead of
+                    // just dropping the socket (which the client would misread
+                    // as an unexpected worker death, `Ok(None) | Err(_)`).
+                    let info = *exit_rx.borrow();
+                    if info.is_some() {
+                        // The session has exited: either the already-exited
+                        // view-cmd drain completed (formatter saw EOF after the
+                        // finite backlog and dropped its sender) or the session
+                        // exited concurrently. Deliver EXIT so the formatted
+                        // backlog's final frame is the recorded exit.
                         let _ = attach::write_frame(&mut wr, S_EXIT, &attach::exit_payload(info))
                             .await;
+                    } else {
+                        // The session is still running but the output channel
+                        // closed — e.g. a `--view-cmd` formatter exited/crashed
+                        // early. This is not worker death, so detach cleanly:
+                        // the client restores the terminal and the session
+                        // keeps running.
+                        let _ = attach::write_frame(&mut wr, S_DETACHED, &[]).await;
                     }
                     break;
                 }
