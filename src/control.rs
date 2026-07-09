@@ -371,7 +371,18 @@ async fn handle_attach(
     // every forwarded chunk, so a slow-but-streaming formatter is never cut
     // off; it only fires after the formatter goes silent, at which point we
     // deliver EXIT and detach.
-    const VIEW_DRAIN_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+    //
+    // Tradeoff: the grace period is also the budget for a *buffer-until-EOF*
+    // formatter to emit its first byte after we close its stdin. Such a
+    // formatter reads the whole (finite) backlog, then does its work, and only
+    // then flushes — so if that post-EOF processing exceeds the grace period
+    // before any output appears, the idle guard fires and we EXIT early,
+    // truncating (or entirely skipping) the transformed backlog. The raw
+    // recorded log is always complete, so this only ever affects the on-screen
+    // formatted view of an already-exited session. We keep the window generous
+    // enough to accommodate a slow full-backlog transform while still bounding
+    // a genuinely hung formatter.
+    const VIEW_DRAIN_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
     // Reader half: client → PTY (input/resize). Runs as its own task so a
     // read mid-frame is never cancelled by the writer's select.
@@ -688,9 +699,11 @@ mod tests {
         // backlog as one snapshot and keeps its sender parked (never dropped).
         let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
         tx.send(b"hello".to_vec()).unwrap();
-        // A buffer-until-EOF filter (`cat`) only flushes once stdin is closed,
-        // proving the feed task closes stdin after the finite backlog even
-        // though the hub sender is still alive.
+        // `cat` streams its input, but with stdin never reaching EOF it would
+        // block open forever. It exits (closing stdout, ending the receiver
+        // loop below) only once stdin is closed — proving the feed task closes
+        // stdin after the finite backlog even though the hub sender is still
+        // alive.
         let (mut out, guard) = spawn_view_filter(|| rx, "cat", true).unwrap();
         let mut got = Vec::new();
         while let Some(chunk) = out.recv().await {
