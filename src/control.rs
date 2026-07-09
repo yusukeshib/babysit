@@ -332,7 +332,7 @@ async fn handle_attach(
     // the end of this fn, so it never outlives the client.
     let raw_output = handle.hub.subscribe();
     let (mut output, _view_child) = match handle.view_cmd.as_deref() {
-        Some(cmd) if !cmd.is_empty() => match spawn_view_filter(raw_output, cmd) {
+        Some(cmd) if !cmd.trim().is_empty() => match spawn_view_filter(raw_output, cmd) {
             Ok((rx, guard)) => (rx, Some(guard)),
             Err(_) => (handle.hub.subscribe(), None),
         },
@@ -411,15 +411,29 @@ async fn handle_attach(
 /// (client detached/exited) it kills the formatter and aborts the pumps, so a
 /// formatter process/task never outlives the client it was serving.
 struct ViewChild {
-    child: tokio::process::Child,
+    child: Option<tokio::process::Child>,
     pumps: [tokio::task::JoinHandle<()>; 2],
 }
 
 impl Drop for ViewChild {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
         for p in &self.pumps {
             p.abort();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            // Reap the formatter so it never lingers as a zombie. Prefer an
+            // explicit background `wait()`; fall back to `kill_on_drop` (set at
+            // spawn) reaping the child via tokio's orphan queue when no runtime
+            // handle is available (e.g. dropped outside an async context).
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    rt.spawn(async move {
+                        let _ = child.wait().await;
+                    });
+                }
+                Err(_) => drop(child),
+            }
         }
     }
 }
@@ -476,7 +490,7 @@ fn spawn_view_filter(
     Ok((
         rx,
         ViewChild {
-            child,
+            child: Some(child),
             pumps: [feed, drain],
         },
     ))
@@ -538,7 +552,26 @@ pub fn cleanup(bs: &Babysit, session_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::last_n_lines;
+    use super::{last_n_lines, spawn_view_filter};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn view_filter_pipes_backlog_and_live_through_command() {
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Queue a backlog chunk plus a "live" chunk before the filter drains.
+        tx.send(b"abc".to_vec()).unwrap();
+        tx.send(b"def".to_vec()).unwrap();
+        // An uppercasing filter proves bytes actually flow through `sh -c`.
+        let (mut out, guard) = spawn_view_filter(rx, "tr a-z A-Z").unwrap();
+        // Close the hub side so the formatter sees EOF, flushes, and exits.
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(chunk) = out.recv().await {
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, b"ABCDEF");
+        drop(guard);
+    }
 
     #[test]
     fn tail_respects_trailing_newline() {
