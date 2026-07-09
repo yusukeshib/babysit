@@ -362,6 +362,17 @@ async fn handle_attach(
     let has_view = _view_child.is_some();
     let mut detach_rx = handle.detach_tx.subscribe();
 
+    // Grace period bounding the already-exited + `--view-cmd` drain. A
+    // cooperative formatter exits on stdin EOF, closing stdout so
+    // `output.recv()` returns `None` and we EXIT cleanly. A pathological
+    // formatter that ignores EOF (or stalls) would otherwise never close the
+    // channel, and since the session already exited `exit_rx.changed()` can
+    // never fire — the client would hang forever. This idle timer resets on
+    // every forwarded chunk, so a slow-but-streaming formatter is never cut
+    // off; it only fires after the formatter goes silent, at which point we
+    // deliver EXIT and detach.
+    const VIEW_DRAIN_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
     // Reader half: client → PTY (input/resize). Runs as its own task so a
     // read mid-frame is never cancelled by the writer's select.
     let gone = Arc::new(Notify::new());
@@ -389,6 +400,15 @@ async fn handle_attach(
     };
 
     loop {
+        // Arm the idle-drain timeout only for the already-exited view-cmd path;
+        // otherwise wait forever so the timer never fires.
+        let idle_guard = async {
+            if already_exited && has_view {
+                tokio::time::sleep(VIEW_DRAIN_IDLE_GRACE).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             biased;
             // Drain queued output (backlog + live) before honoring exit, so
@@ -436,6 +456,14 @@ async fn handle_attach(
                 break;
             },
             _ = gone.notified() => break,
+            _ = idle_guard => {
+                // Already-exited view-cmd formatter went idle without closing
+                // stdout — assume the finite backlog is fully formatted (or the
+                // formatter is stuck) and deliver EXIT instead of hanging.
+                let info = *exit_rx.borrow();
+                let _ = attach::write_frame(&mut wr, S_EXIT, &attach::exit_payload(info)).await;
+                break;
+            }
         }
         // Raw already-exited fast-path: the hub delivers its whole backlog as
         // one pre-queued chunk, so once the channel is drained we can EXIT

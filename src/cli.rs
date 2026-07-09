@@ -122,9 +122,10 @@ pub enum Command {
         /// (default 80x24; an attaching client overrides it).
         #[arg(long, value_name = "COLSxROWS")]
         size: Option<String>,
-        /// Pipe the live view through this shell command before it reaches an
-        /// attached client (e.g. a JSONL→human formatter). Only the interactive
-        /// attach/stream view is transformed; the recorded log and screenshots
+        /// Pipe the attach view through this shell command before it reaches an
+        /// attached client (e.g. a JSONL→human formatter). Both the replayed
+        /// backlog and the live stream are transformed; only the interactive
+        /// attach/stream view is affected — the recorded log and screenshots
         /// stay raw, so `log`/`screenshot` and machine scrapers are unaffected.
         #[arg(long = "view-cmd", value_name = "CMD")]
         view_cmd: Option<String>,
