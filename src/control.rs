@@ -335,13 +335,20 @@ async fn handle_attach(
     // guarantee — on session exit the formatter may still be flushing, so its
     // final bytes can be truncated. The raw recorded log is always complete,
     // so this only affects the transformed on-screen view, not the record.
-    let raw_output = handle.hub.subscribe();
+    // Subscribe lazily via a closure so the hub subscription only happens
+    // once the formatter has actually spawned. If `spawn_view_filter` failed
+    // eagerly (before subscribing) it would leave a dead sender parked in
+    // `hub.clients` until the next broadcast — which may never come once the
+    // session has exited, leaking across repeated attaches with a broken
+    // `--view-cmd`.
     let (mut output, _view_child) = match handle.view_cmd.as_deref() {
-        Some(cmd) if !cmd.trim().is_empty() => match spawn_view_filter(raw_output, cmd) {
-            Ok((rx, guard)) => (rx, Some(guard)),
-            Err(_) => (handle.hub.subscribe(), None),
-        },
-        _ => (raw_output, None),
+        Some(cmd) if !cmd.trim().is_empty() => {
+            match spawn_view_filter(|| handle.hub.subscribe(), cmd) {
+                Ok((rx, guard)) => (rx, Some(guard)),
+                Err(_) => (handle.hub.subscribe(), None),
+            }
+        }
+        _ => (handle.hub.subscribe(), None),
     };
     let mut exit_rx = handle.exit_rx.clone();
     let mut detach_rx = handle.detach_tx.subscribe();
@@ -447,8 +454,12 @@ impl Drop for ViewChild {
 /// client: hub bytes are written to the formatter's stdin, and its stdout is
 /// forwarded to the client. Returns the display-byte receiver plus a
 /// `ViewChild` guard that tears everything down when dropped.
+///
+/// `subscribe` is only invoked *after* the formatter has spawned and its
+/// stdio pipes are wired, so a spawn failure never registers (and then
+/// orphans) a client sender in the hub.
 fn spawn_view_filter(
-    mut output: mpsc::UnboundedReceiver<Vec<u8>>,
+    subscribe: impl FnOnce() -> mpsc::UnboundedReceiver<Vec<u8>>,
     view_cmd: &str,
 ) -> Result<(mpsc::UnboundedReceiver<Vec<u8>>, ViewChild)> {
     use tokio::io::AsyncReadExt;
@@ -463,6 +474,8 @@ fn spawn_view_filter(
         .context("spawning view-cmd")?;
     let mut stdin = child.stdin.take().context("view-cmd stdin")?;
     let mut stdout = child.stdout.take().context("view-cmd stdout")?;
+    // All fallible setup is done; now it is safe to register with the hub.
+    let mut output = subscribe();
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // hub → formatter stdin. `write_all` already pushes each chunk into the
@@ -567,7 +580,7 @@ mod tests {
         tx.send(b"abc".to_vec()).unwrap();
         tx.send(b"def".to_vec()).unwrap();
         // An uppercasing filter proves bytes actually flow through `sh -c`.
-        let (mut out, guard) = spawn_view_filter(rx, "tr a-z A-Z").unwrap();
+        let (mut out, guard) = spawn_view_filter(|| rx, "tr a-z A-Z").unwrap();
         // Close the hub side so the formatter sees EOF, flushes, and exits.
         drop(tx);
         let mut got = Vec::new();
