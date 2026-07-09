@@ -128,6 +128,10 @@ pub struct Handle {
     /// Count of currently-attached clients, so shutdown can wait for them to
     /// drain the final output + exit frame before tearing the socket down.
     pub attached: Arc<AtomicUsize>,
+    /// Optional shell command the live output is piped through per attached
+    /// client (e.g. a JSONL→human formatter). `None` streams raw bytes. The
+    /// recorded log and vt100 screenshot always stay raw regardless.
+    pub view_cmd: Option<String>,
 }
 
 impl Handle {
@@ -141,6 +145,7 @@ impl Handle {
         exit_rx: watch::Receiver<Option<ExitInfo>>,
         detach_tx: Arc<watch::Sender<u64>>,
         attached: Arc<AtomicUsize>,
+        view_cmd: Option<String>,
     ) -> Self {
         Self {
             bs,
@@ -151,6 +156,7 @@ impl Handle {
             exit_rx,
             detach_tx,
             attached,
+            view_cmd,
         }
     }
 
@@ -320,7 +326,18 @@ async fn handle_attach(
         handle.cmd_pane.lock().await.clone().resize(rows, cols);
     }
 
-    let mut output = handle.hub.subscribe();
+    // When a view command is configured, pipe this client's byte stream
+    // (backlog + live) through it before rendering; the recorded log and vt100
+    // screenshot stay raw. The formatter is killed when `_view_child` drops at
+    // the end of this fn, so it never outlives the client.
+    let raw_output = handle.hub.subscribe();
+    let (mut output, _view_child) = match handle.view_cmd.as_deref() {
+        Some(cmd) if !cmd.is_empty() => match spawn_view_filter(raw_output, cmd) {
+            Ok((rx, guard)) => (rx, Some(guard)),
+            Err(_) => (handle.hub.subscribe(), None),
+        },
+        _ => (raw_output, None),
+    };
     let mut exit_rx = handle.exit_rx.clone();
     let mut detach_rx = handle.detach_tx.subscribe();
 
@@ -388,6 +405,81 @@ async fn handle_attach(
 
     reader.abort();
     Ok(())
+}
+
+/// Owns the per-client view-cmd formatter and its two pump tasks. On drop
+/// (client detached/exited) it kills the formatter and aborts the pumps, so a
+/// formatter process/task never outlives the client it was serving.
+struct ViewChild {
+    child: tokio::process::Child,
+    pumps: [tokio::task::JoinHandle<()>; 2],
+}
+
+impl Drop for ViewChild {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        for p in &self.pumps {
+            p.abort();
+        }
+    }
+}
+
+/// Spawn `sh -c <view_cmd>` and splice it between the hub and an attached
+/// client: hub bytes are written to the formatter's stdin, and its stdout is
+/// forwarded to the client. Returns the display-byte receiver plus a
+/// `ViewChild` guard that tears everything down when dropped.
+fn spawn_view_filter(
+    mut output: mpsc::UnboundedReceiver<Vec<u8>>,
+    view_cmd: &str,
+) -> Result<(mpsc::UnboundedReceiver<Vec<u8>>, ViewChild)> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(view_cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning view-cmd")?;
+    let mut stdin = child.stdin.take().context("view-cmd stdin")?;
+    let mut stdout = child.stdout.take().context("view-cmd stdout")?;
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    // hub → formatter stdin. Dropping `stdin` on exit closes the pipe so the
+    // formatter sees EOF.
+    let feed = tokio::spawn(async move {
+        while let Some(chunk) = output.recv().await {
+            if stdin.write_all(&chunk).await.is_err() {
+                break;
+            }
+            let _ = stdin.flush().await;
+        }
+    });
+
+    // formatter stdout → client. Ends when the formatter exits (EOF) or the
+    // client's receiver is dropped.
+    let drain = tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok((
+        rx,
+        ViewChild {
+            child,
+            pumps: [feed, drain],
+        },
+    ))
 }
 
 async fn read_log(path: &Path, tail: Option<usize>, raw: bool) -> Result<serde_json::Value> {

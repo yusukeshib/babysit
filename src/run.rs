@@ -31,6 +31,7 @@ impl Babysit {
         timeout: Option<String>,
         idle_timeout: Option<String>,
         size: Option<String>,
+        view_cmd: Option<String>,
         json: bool,
     ) -> Result<i32> {
         // Parse the inputs up front so a bad value errors before we spawn.
@@ -48,8 +49,16 @@ impl Babysit {
         // We are the detached worker (re-exec'd with --detached-id): run the
         // headless server loop and never come back until the command exits.
         if let Some(worker_id) = detached_id {
-            self.serve_worker(cmd, worker_id, !no_tty, timeout, idle_timeout, size)
-                .await?;
+            self.serve_worker(
+                cmd,
+                worker_id,
+                !no_tty,
+                timeout,
+                idle_timeout,
+                size,
+                view_cmd,
+            )
+            .await?;
             return Ok(0);
         }
 
@@ -63,7 +72,15 @@ impl Babysit {
             print_banner(&session_id, &cmd.join(" "));
         }
         // (library embedder, non-json: stay silent — the host owns its own UX)
-        self.spawn_worker_process(&cmd, &session_id, no_tty, timeout, idle_timeout, size)?;
+        self.spawn_worker_process(
+            &cmd,
+            &session_id,
+            no_tty,
+            timeout,
+            idle_timeout,
+            size,
+            view_cmd.as_deref(),
+        )?;
 
         if detach {
             return Ok(0);
@@ -76,6 +93,7 @@ impl Babysit {
 
     /// The headless worker: owns the PTY + control socket, fans output out to
     /// attached clients, and supervises restarts until the command exits.
+    #[allow(clippy::too_many_arguments)] // supervisor loop; each arg is a distinct run flag
     async fn serve_worker(
         &self,
         cmd: Vec<String>,
@@ -84,6 +102,7 @@ impl Babysit {
         timeout: Option<Duration>,
         idle_timeout: Option<Duration>,
         size: Option<(u16, u16)>,
+        view_cmd: Option<String>,
     ) -> Result<()> {
         let meta = Meta {
             id: id.clone(),
@@ -155,6 +174,7 @@ impl Babysit {
             exit_rx,
             detach_tx,
             attached.clone(),
+            view_cmd,
         );
         control::serve(handle.clone()).await?;
 
@@ -259,6 +279,7 @@ impl Babysit {
     /// clients). The chosen `id` is handed down via `--detached-id`, and the
     /// state root via `--root`, so the worker reconstructs THIS context without
     /// reading the environment.
+    #[allow(clippy::too_many_arguments)] // re-exec builder; mirrors run()'s flags
     fn spawn_worker_process(
         &self,
         cmd: &[String],
@@ -267,6 +288,7 @@ impl Babysit {
         timeout: Option<Duration>,
         idle_timeout: Option<Duration>,
         size: Option<(u16, u16)>,
+        view_cmd: Option<&str>,
     ) -> Result<()> {
         use std::process::{Command, Stdio};
 
@@ -293,6 +315,9 @@ impl Babysit {
         }
         if let Some((c, r)) = size {
             command.arg("--size").arg(format!("{c}x{r}"));
+        }
+        if let Some(v) = view_cmd {
+            command.arg("--view-cmd").arg(v);
         }
         command.arg("--").args(cmd);
         command
