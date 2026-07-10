@@ -39,7 +39,9 @@ async fn main() -> Result<()> {
         }
         let bs = Babysit::from_env()?;
         let code = bs
-            .run(cmd, None, detach, None, false, None, None, None, false)
+            .run(
+                cmd, None, detach, None, false, None, None, None, None, false,
+            )
             .await?;
         std::process::exit(code);
     }
@@ -71,6 +73,7 @@ async fn main() -> Result<()> {
             timeout,
             idle_timeout,
             size,
+            view_cmd,
             json,
             root: _,
             cmd,
@@ -85,6 +88,7 @@ async fn main() -> Result<()> {
                     timeout,
                     idle_timeout,
                     size,
+                    view_cmd,
                     json,
                 )
                 .await?;
