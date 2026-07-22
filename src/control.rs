@@ -18,6 +18,8 @@ use crate::paths::Babysit;
 use crate::session;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::io::ErrorKind;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -170,10 +172,89 @@ impl Handle {
 /// The task is detached; on shutdown the caller should call `cleanup()`.
 pub async fn serve(handle: Handle) -> Result<()> {
     let path = handle.bs.control_socket_path(&handle.session_id);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("control socket has no parent: {}", path.display()))?;
+    let user_dir = parent.parent().ok_or_else(|| {
+        anyhow!(
+            "control socket directory has no parent: {}",
+            parent.display()
+        )
+    })?;
+    ensure_private_dir(user_dir)?;
+    ensure_private_dir(parent)?;
+
     // If a stale socket exists from a prior run with the same id, remove it.
     let _ = tokio::fs::remove_file(&path).await;
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("binding control socket at {}", path.display()))?;
+    secure_socket(&path)?;
+    spawn_listener(listener, handle.clone());
+
+    // Best-effort reverse compatibility: when the legacy path fits, bind it as
+    // well so a pre-upgrade client can still control this new worker. A path
+    // length failure is expected for the exact sessions this layout fixes.
+    let legacy = handle.bs.legacy_control_socket_path(&handle.session_id);
+    let _ = tokio::fs::remove_file(&legacy).await;
+    if let Ok(listener) = UnixListener::bind(&legacy) {
+        if secure_socket(&legacy).is_ok() {
+            spawn_listener(listener, handle);
+        } else {
+            drop(listener);
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("creating control socket directory {}", path.display()));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting control socket directory {}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "control socket directory is not a real directory: {}",
+            path.display()
+        );
+    }
+    let expected_uid = nix::unistd::Uid::effective().as_raw();
+    if metadata.uid() != expected_uid {
+        anyhow::bail!(
+            "control socket directory {} is owned by uid {}, expected {}",
+            path.display(),
+            metadata.uid(),
+            expected_uid
+        );
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)
+        .with_context(|| format!("securing control socket directory {}", path.display()))?;
+    Ok(())
+}
+
+fn secure_socket(path: &Path) -> Result<()> {
+    let mut permissions = std::fs::metadata(path)
+        .with_context(|| {
+            format!(
+                "inspecting control socket permissions at {}",
+                path.display()
+            )
+        })?
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+        .with_context(|| format!("securing control socket at {}", path.display()))
+}
+
+fn spawn_listener(listener: UnixListener, handle: Handle) {
     tokio::spawn(async move {
         loop {
             let stream = match listener.accept().await {
@@ -186,7 +267,6 @@ pub async fn serve(handle: Handle) -> Result<()> {
             });
         }
     });
-    Ok(())
 }
 
 async fn handle_conn(stream: UnixStream, handle: Handle) -> Result<()> {
@@ -668,12 +748,40 @@ impl Drop for AttachedGuard {
 /// Best-effort cleanup: remove the socket file. Called on graceful shutdown.
 pub fn cleanup(bs: &Babysit, session_id: &str) {
     let _ = std::fs::remove_file(bs.control_socket_path(session_id));
+    let _ = std::fs::remove_file(bs.legacy_control_socket_path(session_id));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{last_n_lines, spawn_view_filter};
+    use super::{ensure_private_dir, last_n_lines, secure_socket, spawn_view_filter};
+    use crate::paths::Babysit;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn hashed_socket_for_long_root_binds_in_private_directory() {
+        let bs = Babysit::new(format!("/tmp/{}", "long-root-".repeat(20)));
+        let path = bs.control_socket_path(&"x".repeat(64));
+        let root_dir = path.parent().unwrap();
+        let user_dir = root_dir.parent().unwrap();
+        ensure_private_dir(user_dir).unwrap();
+        ensure_private_dir(root_dir).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        secure_socket(&path).unwrap();
+        assert!(path.as_os_str().as_encoded_bytes().len() < 100);
+        assert_eq!(
+            std::fs::metadata(root_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn view_filter_pipes_backlog_and_live_through_command() {

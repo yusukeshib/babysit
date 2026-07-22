@@ -176,7 +176,33 @@ impl Babysit {
             attached.clone(),
             view_cmd,
         );
-        control::serve(handle.clone()).await?;
+        if let Err(error) = control::serve(handle.clone()).await {
+            // A bind/setup failure happens after the child and `running` status
+            // exist. Finalize both explicitly instead of letting the detached
+            // supervisor exit and leave a misleading stale-running session.
+            pane.kill();
+            // Child termination is best-effort; never let a broken child keep
+            // supervisor setup failure handling stuck indefinitely.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                pane.exit_notify.notified(),
+            )
+            .await;
+            session::write_status(
+                self,
+                &id,
+                &Status {
+                    state: State::Killed,
+                    child_pid: None,
+                    // This is a supervisor setup failure regardless of whether
+                    // the wrapped command happened to exit 0 first.
+                    exit_code: Some(1),
+                    last_change: Utc::now(),
+                },
+            )
+            .await?;
+            return Err(error);
+        }
 
         let mut current_pane = pane;
         let info: Option<ExitInfo>;

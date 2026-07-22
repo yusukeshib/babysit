@@ -1,12 +1,15 @@
 //! The `Babysit` context — an explicit handle to a state root.
 //!
 //! Every operation in the library goes through a `Babysit` value, which owns the
-//! root directory (`<root>/sessions/<id>/{meta.json,status.json,output.log,
-//! control.sock,note}`). The library NEVER reads the environment to discover its
-//! root: the embedder passes it in via [`Babysit::new`]. The only place the
-//! environment is consulted is [`Babysit::from_env`], a convenience for the
-//! `babysit` binary itself — embedders (e.g. `looop`) compute their own root and
-//! call `new`.
+//! root directory. Session files live under
+//! `<root>/sessions/<id>/{meta.json,status.json,output.log,note}` and short,
+//! hashed control-socket paths live under the user's private
+//! `~/.babysit-sockets/` directory (falling back to `/tmp/babysit-<uid>` when a
+//! home directory is unavailable). The library NEVER reads the environment to
+//! discover its state root: the embedder passes it in via [`Babysit::new`].
+//! [`BaseDirs`] is used only to locate per-user storage; [`Babysit::from_env`]
+//! is the only place `$BABYSIT_DIR` is read. Embedders (e.g. `looop`) compute
+//! their own state root and call `new`.
 
 use anyhow::{Context, Result};
 use directories::BaseDirs;
@@ -16,6 +19,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct Babysit {
     root: PathBuf,
+    sockets: PathBuf,
     /// True only for the `babysit` CLI binary. The CLI exposes its session id to
     /// wrapped commands (BABYSIT_SESSION_ID, so nested `babysit` calls can omit
     /// -s) and prints the attach banner. Library embedders (e.g. `looop`) leave
@@ -38,8 +42,13 @@ impl Babysit {
     /// `<root>/sessions/<id>/`. This is the explicit, env-free constructor that
     /// embedders use.
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let sockets = BaseDirs::new()
+            .map(|base| base.home_dir().join(".babysit-sockets"))
+            .unwrap_or_else(|| PathBuf::from(format!("/tmp/babysit-{uid}")));
         Self {
             root: root.into(),
+            sockets,
             cli: false,
             supervisor: None,
         }
@@ -126,8 +135,25 @@ impl Babysit {
         self.session_dir(id).join("output.log")
     }
 
-    /// `<session_dir>/control.sock` — the per-session control socket.
+    /// `~/.babysit-sockets/<root-hash>/<id-hash>` — the per-session control
+    /// socket.
+    ///
+    /// Unix-domain socket paths are limited to roughly 104–108 bytes. Hashing
+    /// both the root and session id keeps the socket path bounded even when the
+    /// state root or valid 64-character session id is long. The control server
+    /// creates the per-user directory privately (0700) before binding.
     pub fn control_socket_path(&self, id: &str) -> PathBuf {
+        self.sockets
+            .join(format!(
+                "{:016x}",
+                stable_hash(self.root.as_os_str().as_encoded_bytes())
+            ))
+            .join(format!("{:016x}", stable_hash(id.as_bytes())))
+    }
+
+    /// Socket location used before 0.13. Clients probe this as a fallback so an
+    /// upgraded CLI can still control workers started by an older binary.
+    pub fn legacy_control_socket_path(&self, id: &str) -> PathBuf {
         self.session_dir(id).join("control.sock")
     }
 
@@ -137,6 +163,18 @@ impl Babysit {
     pub fn note_path(&self, id: &str) -> PathBuf {
         self.session_dir(id).join("note")
     }
+}
+
+/// Stable, dependency-free FNV-1a hash for compact socket names. This is not a
+/// security primitive; it only needs deterministic, negligible-collision names
+/// within one babysit root.
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -169,6 +207,24 @@ mod tests {
             b.supervisor_override(),
             Some(Path::new("/usr/local/bin/looop")),
             "an embedder can pin a stable supervisor path"
+        );
+    }
+
+    #[test]
+    fn control_socket_path_is_short_and_stable_for_long_roots_and_session_ids() {
+        let root = format!("/tmp/{}", "root".repeat(40));
+        let bs = Babysit::new(&root);
+        let id = "x".repeat(64);
+        let path = bs.control_socket_path(&id);
+        assert_eq!(path, bs.control_socket_path(&id));
+        assert!(path.starts_with(&bs.sockets));
+        assert_eq!(path.file_name().unwrap().to_string_lossy().len(), 16);
+        assert!(path.as_os_str().as_encoded_bytes().len() < 100);
+        assert_ne!(path, bs.control_socket_path(&"y".repeat(64)));
+        assert_ne!(path, Babysit::new("/tmp/other").control_socket_path(&id));
+        assert_eq!(
+            bs.legacy_control_socket_path("worker"),
+            Path::new(&root).join("sessions/worker/control.sock")
         );
     }
 }

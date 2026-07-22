@@ -558,6 +558,8 @@ impl Babysit {
                     eprintln!("babysit: failed to remove {}: {e}", dir.display());
                     continue;
                 }
+                let _ = tokio::fs::remove_file(self.control_socket_path(id)).await;
+                let _ = tokio::fs::remove_file(self.legacy_control_socket_path(id)).await;
                 if !json {
                     println!("deleted {id}  {cmd}");
                 }
@@ -991,8 +993,7 @@ async fn current_screen_text(bs: &Babysit, id: &str) -> String {
 /// Open a short-lived connection to the session's control socket, send a single
 /// JSON request, and parse the JSON response.
 async fn request(bs: &Babysit, id: &str, req: &Request) -> Result<Response> {
-    let path = bs.control_socket_path(id);
-    let mut stream = connect_with_retry(bs, id, &path).await?;
+    let mut stream = connect_with_retry(bs, id).await?;
     let mut bytes = serde_json::to_vec(req)?;
     bytes.push(b'\n');
     stream.write_all(&bytes).await?;
@@ -1008,35 +1009,44 @@ async fn request(bs: &Babysit, id: &str, req: &Request) -> Result<Response> {
 /// Connect to a session's control socket, retrying for up to ~1s while the
 /// worker is still binding it. Bails immediately if the session is already in a
 /// terminal state or its owner process has died (no socket is coming).
-async fn connect_with_retry(bs: &Babysit, id: &str, path: &std::path::Path) -> Result<UnixStream> {
+async fn connect_with_retry(bs: &Babysit, id: &str) -> Result<UnixStream> {
+    let paths = [
+        bs.control_socket_path(id),
+        bs.legacy_control_socket_path(id),
+    ];
+    let mut last_error = None;
     // ~1s total: 25 attempts × 40ms. Covers fork+exec+tokio+PTY spawn before
-    // the worker binds, without hanging on a truly absent worker.
+    // the worker binds, without hanging on a truly absent worker. Probe the
+    // legacy location too so upgraded clients can control older workers.
     for attempt in 0..25 {
-        match UnixStream::connect(path).await {
-            Ok(s) => return Ok(s),
-            Err(e) => {
-                // Don't keep retrying a session that will never bind.
-                if let Ok(status) = session::read_status(bs, id).await {
-                    if status.state.is_terminal() {
-                        return Err(anyhow!("{e}"));
-                    }
-                    if let Ok(meta) = session::read_meta(bs, id).await
-                        && !session::is_pid_alive(meta.babysit_pid)
-                    {
-                        return Err(anyhow!("{e}"));
-                    }
-                }
-                if attempt < 24 {
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                } else {
-                    return Err::<UnixStream, _>(e).with_context(|| {
-                        format!("connecting to control socket {}", path.display())
-                    });
-                }
+        for path in &paths {
+            match UnixStream::connect(path).await {
+                Ok(s) => return Ok(s),
+                Err(e) => last_error = Some(e),
             }
         }
+        // Don't keep retrying a session that will never bind.
+        if let Ok(status) = session::read_status(bs, id).await {
+            if status.state.is_terminal() {
+                return Err(anyhow!("session {id} is no longer running"));
+            }
+            if let Ok(meta) = session::read_meta(bs, id).await
+                && !session::is_pid_alive(meta.babysit_pid)
+            {
+                return Err(anyhow!("session {id} supervisor is not running"));
+            }
+        }
+        if attempt < 24 {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
     }
-    unreachable!("loop returns on the final attempt")
+    Err(last_error.unwrap()).with_context(|| {
+        format!(
+            "connecting to control sockets {} or {}",
+            paths[0].display(),
+            paths[1].display()
+        )
+    })
 }
 
 /// Map a key name to the bytes a terminal sends for it. Names are

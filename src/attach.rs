@@ -108,9 +108,13 @@ fn resize_payload(cols: u16, rows: u16) -> Vec<u8> {
 pub async fn detach(bs: &Babysit, session: Option<String>, json: bool) -> Result<()> {
     let id = session::resolve(bs, session).await?;
     let path = bs.control_socket_path(&id);
-    let mut stream = UnixStream::connect(&path)
-        .await
-        .with_context(|| format!("connecting to session {id}"))?;
+    let legacy = bs.legacy_control_socket_path(&id);
+    let mut stream = match UnixStream::connect(&path).await {
+        Ok(stream) => stream,
+        Err(_) => UnixStream::connect(&legacy)
+            .await
+            .with_context(|| format!("connecting to session {id}"))?,
+    };
     stream.write_all(b"{\"op\":\"detach\"}\n").await?;
     stream.flush().await?;
     // Best-effort: drain the one-line response.
@@ -140,9 +144,7 @@ pub async fn attach(bs: &Babysit, session: Option<String>) -> Result<i32> {
 /// worker to bind its socket, so this is safe to call right after spawning a
 /// worker (the `babysit run` path) before the session dir is written.
 pub async fn attach_to(bs: &Babysit, id: String) -> Result<i32> {
-    let path = bs.control_socket_path(&id);
-
-    let stream = match connect_retry(bs, &path, &id).await? {
+    let stream = match connect_retry(bs, &id).await? {
         Some(s) => s,
         // Session already finished before we could attach: print whatever the
         // log captured and report the recorded exit code.
@@ -257,21 +259,21 @@ fn restore_terminal_modes() {
 /// Connect to the worker's socket, retrying briefly while it binds. Returns
 /// `Ok(None)` if the session has already reached a terminal state (so the
 /// caller should fall back to the on-disk log + status).
-async fn connect_retry(
-    bs: &Babysit,
-    path: &std::path::Path,
-    id: &str,
-) -> Result<Option<UnixStream>> {
+async fn connect_retry(bs: &Babysit, id: &str) -> Result<Option<UnixStream>> {
+    let paths = [
+        bs.control_socket_path(id),
+        bs.legacy_control_socket_path(id),
+    ];
     for _ in 0..75 {
-        match UnixStream::connect(path).await {
-            Ok(s) => return Ok(Some(s)),
-            Err(_) => {
-                if session_finished(bs, id).await {
-                    return Ok(None);
-                }
-                tokio::time::sleep(Duration::from_millis(40)).await;
+        for path in &paths {
+            if let Ok(stream) = UnixStream::connect(path).await {
+                return Ok(Some(stream));
             }
         }
+        if session_finished(bs, id).await {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
     }
     if session_finished(bs, id).await {
         Ok(None)
