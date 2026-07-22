@@ -180,14 +180,10 @@ impl Babysit {
             // A bind/setup failure happens after the child and `running` status
             // exist. Finalize both explicitly instead of letting the detached
             // supervisor exit and leave a misleading stale-running session.
-            pane.kill();
-            // Child termination is best-effort; never let a broken child keep
-            // supervisor setup failure handling stuck indefinitely.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                pane.exit_notify.notified(),
-            )
-            .await;
+            // Child termination is best-effort here; the setup error remains
+            // primary, but use the same escalation path so descendants do not
+            // leak if they ignore SIGHUP.
+            let _ = terminate_pane(&pane).await;
             session::write_status(
                 self,
                 &id,
@@ -206,10 +202,11 @@ impl Babysit {
 
         let mut current_pane = pane;
         let info: Option<ExitInfo>;
+        let mut terminal_status_written = false;
+        let mut termination_requested = false;
         // Optional auto-kill deadline. Fires once; after that the branch is
         // disabled so we don't busy-loop re-killing.
         let timeout_at = timeout.map(|d| tokio::time::Instant::now() + d);
-        let mut timed_out = false;
 
         // Optional inactivity watchdog: poll the pane's idle time and kill once
         // it exceeds the limit. Polled (rather than event-driven) since output
@@ -217,7 +214,6 @@ impl Babysit {
         let idle_limit_ms = idle_timeout.map(|d| d.as_millis() as u64);
         let mut idle_tick =
             idle_limit_ms.map(|_| tokio::time::interval(Duration::from_millis(500)));
-        let mut idle_killed = false;
 
         loop {
             let exit_notify = current_pane.exit_notify.clone();
@@ -227,27 +223,30 @@ impl Babysit {
                         Some(t) => tokio::time::sleep_until(t).await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if !timed_out => {
-                    timed_out = true;
-                    current_pane.kill();
+                } => {
+                    let termination = terminate_pane(&current_pane).await?;
+                    termination_requested = termination.signal_sent;
+                    info = Some(termination.info);
+                    break;
                 }
                 _ = async {
                     match idle_tick.as_mut() {
                         Some(t) => { t.tick().await; }
                         None => std::future::pending::<()>().await,
                     }
-                }, if !idle_killed => {
+                } => {
                     if let Some(limit) = idle_limit_ms
                         && current_pane.idle_ms() >= limit
                     {
-                        idle_killed = true;
-                        current_pane.kill();
+                        let termination = terminate_pane(&current_pane).await?;
+                        termination_requested = termination.signal_sent;
+                        info = Some(termination.info);
+                        break;
                     }
                 }
                 Some(msg) = action_rx.recv() => match msg {
                     LoopMessage::Restart => {
-                        current_pane.kill();
-                        current_pane.exit_notify.notified().await;
+                        let _ = terminate_pane(&current_pane).await?;
                         let new_pane = Arc::new(Pane::spawn(&cmd, rows, cols, &env, Some(&log_path), hub.clone(), tty)?);
                         handle.replace_cmd_pane(new_pane.clone()).await;
                         session::write_status(self, &id, &Status {
@@ -258,20 +257,68 @@ impl Babysit {
                         }).await?;
                         current_pane = new_pane;
                     }
+                    LoopMessage::Kill { reply } => {
+                        match terminate_pane(&current_pane).await {
+                            Ok(termination) => {
+                                let state = if termination.signal_sent || termination.info.signaled {
+                                    State::Killed
+                                } else {
+                                    State::Exited
+                                };
+                                session::write_status(self, &id, &Status {
+                                    state,
+                                    child_pid: None,
+                                    exit_code: termination.info.code,
+                                    last_change: Utc::now(),
+                                }).await?;
+                                terminal_status_written = true;
+                                if termination.signal_sent {
+                                    let _ = reply.send(Ok(serde_json::json!({
+                                        "killed": true,
+                                        "confirmed": true,
+                                        "escalated": termination.escalated,
+                                        "state": state,
+                                        "exit_code": termination.info.code,
+                                    })));
+                                } else {
+                                    let _ = reply.send(Err(
+                                        "session exited before kill could be applied".into(),
+                                    ));
+                                }
+                                info = Some(termination.info);
+                                break;
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(format!("{error:#}")));
+                            }
+                        }
+                    }
                 },
                 _ = exit_notify.notified() => {
                     info = current_pane.exit_info();
-                    let signaled = info.map(|i| i.signaled).unwrap_or(true);
-                    let state = if signaled { State::Killed } else { State::Exited };
-                    session::write_status(self, &id, &Status {
-                        state,
-                        child_pid: None,
-                        exit_code: info.and_then(|i| i.code),
-                        last_change: Utc::now(),
-                    }).await?;
                     break;
                 }
             }
+        }
+
+        if !terminal_status_written {
+            let signaled = info.map(|i| i.signaled).unwrap_or(true);
+            let state = if termination_requested || signaled {
+                State::Killed
+            } else {
+                State::Exited
+            };
+            session::write_status(
+                self,
+                &id,
+                &Status {
+                    state,
+                    child_pid: None,
+                    exit_code: info.and_then(|i| i.code),
+                    last_change: Utc::now(),
+                },
+            )
+            .await?;
         }
 
         // Let the reader thread drain the final PTY output to the log and to any
@@ -398,6 +445,94 @@ impl Babysit {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Termination {
+    info: ExitInfo,
+    signal_sent: bool,
+    escalated: bool,
+}
+
+/// Terminate a pane with confirmation. A graceful SIGHUP keeps interactive
+/// programs able to clean up; stubborn process-group members are escalated to
+/// SIGKILL. Success means both the direct child and its isolated process group
+/// are gone, not merely that a signal syscall accepted the request.
+async fn terminate_pane(pane: &Arc<Pane>) -> Result<Termination> {
+    if let Some(info) = pane.exit_info() {
+        if !pane.process_group_alive()? {
+            return Ok(Termination {
+                info,
+                signal_sent: false,
+                escalated: false,
+            });
+        }
+        // The leader exited before this request, but members of its process
+        // group remain. They still need forced cleanup.
+        pane.force_kill()
+            .context("cleaning up remaining process-group members")?;
+        wait_for_process_group_exit(pane, Duration::from_secs(2)).await?;
+        return Ok(Termination {
+            info,
+            signal_sent: true,
+            escalated: true,
+        });
+    }
+
+    pane.kill().context("requesting graceful termination")?;
+    let graceful_info = wait_for_pane_exit(pane, Duration::from_millis(300)).await;
+    if let Some(info) = graceful_info
+        && !pane.process_group_alive()?
+    {
+        return Ok(Termination {
+            info,
+            signal_sent: true,
+            escalated: false,
+        });
+    }
+
+    // The direct child may already be gone while process-group members remain.
+    // Always escalate the still-live group before confirming.
+    pane.force_kill().context("escalating termination")?;
+    let info = match graceful_info {
+        Some(info) => info,
+        None => wait_for_pane_exit(pane, Duration::from_secs(2))
+            .await
+            .ok_or_else(|| anyhow!("process did not exit after SIGKILL"))?,
+    };
+    wait_for_process_group_exit(pane, Duration::from_secs(2)).await?;
+    Ok(Termination {
+        info,
+        signal_sent: true,
+        escalated: true,
+    })
+}
+
+/// Wait for exit without losing a notification that races the initial status
+/// check. The wait thread also leaves a Notify permit armed, but checking both
+/// sides makes this safe if that implementation detail changes.
+async fn wait_for_pane_exit(pane: &Arc<Pane>, timeout: Duration) -> Option<ExitInfo> {
+    if let Some(info) = pane.exit_info() {
+        return Some(info);
+    }
+    let notified = pane.exit_notify.notified();
+    tokio::pin!(notified);
+    if let Some(info) = pane.exit_info() {
+        return Some(info);
+    }
+    let _ = tokio::time::timeout(timeout, &mut notified).await;
+    pane.exit_info()
+}
+
+async fn wait_for_process_group_exit(pane: &Arc<Pane>, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while pane.process_group_alive()? {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("process group still exists after SIGKILL"));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
 /// Print the session-id banner to the user's terminal.
 fn print_banner(id: &str, cmd_title: &str) {
     let (on, off) = if std::io::stdout().is_terminal() {
@@ -475,7 +610,15 @@ pub fn parse_size(s: &str) -> Result<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::terminate_pane;
     use super::{parse_duration, parse_timeout};
+    #[cfg(unix)]
+    use crate::pane::{OutputHub, Pane};
+    #[cfg(unix)]
+    use crate::session::is_pid_alive;
+    #[cfg(unix)]
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -525,5 +668,112 @@ mod tests {
         assert!(parse_size("120").is_err());
         assert!(parse_size("0x10").is_err());
         assert!(parse_size("axb").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn termination_cleans_group_after_leader_already_exited() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "babysit-kill-orphan-group-{}-{}.pid",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let script = format!(
+            "(trap '' HUP; while :; do sleep 1; done) & echo $! > {}; exit 0",
+            pid_file.display(),
+        );
+        let pane = Arc::new(
+            Pane::spawn(
+                &["sh".into(), "-c".into(), script],
+                24,
+                80,
+                &[],
+                None,
+                OutputHub::new(),
+                false,
+            )
+            .unwrap(),
+        );
+        let child_pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = raw.trim().parse::<u32>()
+                    && pane.exit_info().is_some()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader did not exit or child pid was not written");
+
+        let termination = terminate_pane(&pane).await.unwrap();
+        assert!(termination.signal_sent);
+        assert!(termination.escalated);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while is_pid_alive(child_pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("orphaned process-group member survived cleanup");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn termination_escalates_and_kills_the_process_group() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "babysit-kill-group-{}-{}.pid",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let script = format!(
+            "trap '' HUP; (trap '' HUP; while :; do sleep 1; done) & echo $! > {}; while :; do sleep 1; done",
+            pid_file.display(),
+        );
+        let pane = Arc::new(
+            Pane::spawn(
+                &["sh".into(), "-c".into(), script],
+                24,
+                80,
+                &[],
+                None,
+                OutputHub::new(),
+                false,
+            )
+            .unwrap(),
+        );
+        let parent_pid = pane.pid.unwrap();
+
+        let child_pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = raw.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child pid was not written");
+
+        let termination = terminate_pane(&pane).await.unwrap();
+        assert!(
+            termination.info.signaled,
+            "ignored SIGHUP should require SIGKILL"
+        );
+        assert!(termination.escalated);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while is_pid_alive(parent_pid) || is_pid_alive(child_pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("parent or descendant survived confirmed termination");
+        let _ = std::fs::remove_file(pid_file);
     }
 }
