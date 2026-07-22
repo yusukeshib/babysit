@@ -154,3 +154,83 @@ jobs:
           prerelease: ${{ contains(needs.check-version.outputs.version, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    needs: [check-version, build, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: yusukeshib/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          checksum() {
+            awk '{print $1}' "artifacts/$1/$1.sha256"
+          }
+
+          ARM_DARWIN_SHA=$(checksum babysit-aarch64-darwin)
+          INTEL_DARWIN_SHA=$(checksum babysit-x86_64-darwin)
+          ARM_LINUX_SHA=$(checksum babysit-aarch64-linux)
+          INTEL_LINUX_SHA=$(checksum babysit-x86_64-linux)
+
+          cat > homebrew-tap/Formula/babysit.rb <<EOF
+          class Babysit < Formula
+            desc "Wrap shell commands in a PTY for external AI agents"
+            homepage "https://github.com/yusukeshib/babysit"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/yusukeshib/babysit/releases/download/v#{version}/babysit-aarch64-darwin"
+                sha256 "$ARM_DARWIN_SHA"
+              end
+              on_intel do
+                url "https://github.com/yusukeshib/babysit/releases/download/v#{version}/babysit-x86_64-darwin"
+                sha256 "$INTEL_DARWIN_SHA"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/yusukeshib/babysit/releases/download/v#{version}/babysit-aarch64-linux"
+                sha256 "$ARM_LINUX_SHA"
+              end
+              on_intel do
+                url "https://github.com/yusukeshib/babysit/releases/download/v#{version}/babysit-x86_64-linux"
+                sha256 "$INTEL_LINUX_SHA"
+              end
+            end
+
+            def install
+              bin.install Dir["babysit-*-#{OS.mac? ? "darwin" : "linux"}"].first => "babysit"
+            end
+
+            test do
+              assert_match "Usage:", shell_output("#{bin}/babysit --help")
+            end
+          end
+          EOF
+
+      - name: Commit and push formula
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/babysit.rb
+          git commit -m "babysit: update to v$VERSION"
+          git push
