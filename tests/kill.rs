@@ -47,7 +47,7 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
 }
 
 #[test]
-fn kill_confirms_state_and_removes_stubborn_command_tree() {
+fn kill_confirms_state_and_removes_stubborn_process_group() {
     for no_tty in [false, true] {
         let root = temp_root(if no_tty { "kill-pipe" } else { "kill-pty" });
         let pid_file = root.join("descendant.pid");
@@ -97,6 +97,36 @@ fn kill_confirms_state_and_removes_stubborn_command_tree() {
         });
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn escalated_kill_is_persisted_as_killed_even_when_leader_exits_zero() {
+    let root = temp_root("kill-escalated-state");
+    let pid_file = root.join("descendant.pid");
+    let script = format!(
+        "trap 'exit 0' HUP; (trap '' HUP; while :; do sleep 1; done) & echo $! > {}; wait",
+        pid_file.display(),
+    );
+    let started = cli(&root, &["run", "-d", "--json", "--", "sh", "-c", &script]);
+    assert!(started.status.success());
+    let id = json(&started)["id"].as_str().unwrap().to_string();
+    wait_until(Duration::from_secs(2), || {
+        pid_file.metadata().is_ok_and(|m| m.len() > 0)
+    });
+
+    let killed = cli(&root, &["kill", "-s", &id, "--json"]);
+    assert!(
+        killed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    let result = json(&killed);
+    assert_eq!(result["confirmed"], true);
+    assert_eq!(result["escalated"], true);
+    assert_eq!(result["state"], "killed");
+    let status = json(&cli(&root, &["status", "-s", &id, "--json"]));
+    assert_eq!(status["status"]["state"], "killed");
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

@@ -209,7 +209,7 @@ impl Pane {
                 .stderr(Stdio::piped());
             // PTY children call setsid() inside portable-pty. Pipe-mode
             // children need equivalent isolation before we can safely signal
-            // the whole command tree without also signaling this supervisor.
+            // their process group without also signaling this supervisor.
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
@@ -376,7 +376,7 @@ impl Pane {
         now_ms().saturating_sub(self.activity.last_ms.load(Ordering::Relaxed))
     }
 
-    /// Ask the command tree to terminate gracefully. On Unix portable-pty's
+    /// Ask the isolated process group to terminate gracefully. On Unix portable-pty's
     /// cloned killer only sends SIGHUP to the direct child and never escalates;
     /// signal the isolated process group ourselves so descendants receive it.
     pub fn kill(&self) -> Result<()> {
@@ -393,9 +393,9 @@ impl Pane {
     }
 
     /// True while any process remains in this command's isolated process
-    /// group. A shell can exit after SIGHUP while a descendant ignores it, so
-    /// direct-child exit alone is not sufficient termination confirmation.
-    pub fn command_tree_alive(&self) -> Result<bool> {
+    /// group. A shell can exit after SIGHUP while another group member ignores
+    /// it, so direct-child exit alone is not sufficient confirmation.
+    pub fn process_group_alive(&self) -> Result<bool> {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
             use nix::errno::Errno;
@@ -411,7 +411,7 @@ impl Pane {
         Ok(self.exit_info().is_none())
     }
 
-    /// Force the complete command tree to stop after graceful termination did
+    /// Force the isolated process group to stop after graceful termination did
     /// not work. The caller must still wait for both direct-child exit and
     /// process-group disappearance before reporting success.
     pub fn force_kill(&self) -> Result<()> {

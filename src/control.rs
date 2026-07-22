@@ -59,7 +59,7 @@ pub enum Request {
     Resize { cols: u16, rows: u16 },
     /// Restart the wrapped command (kill + respawn with the same argv).
     Restart,
-    /// Terminate the wrapped command tree (SIGHUP, then SIGKILL if needed).
+    /// Terminate the wrapped command's process group (SIGHUP, then SIGKILL).
     Kill,
     /// Attach this connection to the live PTY: stream output and accept
     /// input/resize frames. Upgrades the connection to the frame protocol.
@@ -376,16 +376,16 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
                 .send(LoopMessage::Kill { reply: reply_tx })
                 .map_err(|_| anyhow!("main loop is gone"))?;
 
-            match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(7), reply_rx).await {
                 Ok(Ok(Ok(data))) => Ok(data),
                 Ok(Ok(Err(error))) => Err(anyhow!(error)),
                 Ok(Err(_)) => {
                     // The process can exit naturally while the kill request is
                     // racing the exit branch. Wait briefly for the terminal
-                    // status write instead of sampling stale Running state.
-                    confirmed_terminal_status(handle, std::time::Duration::from_millis(500)).await
+                    // status write, but do not claim that this request killed it.
+                    kill_race_error(handle, std::time::Duration::from_millis(500)).await
                 }
-                Err(_) => confirmed_terminal_status(handle, std::time::Duration::from_millis(500))
+                Err(_) => kill_race_error(handle, std::time::Duration::from_millis(500))
                     .await
                     .context("timed out waiting for kill confirmation"),
             }
@@ -407,7 +407,7 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
     }
 }
 
-async fn confirmed_terminal_status(
+async fn kill_race_error(
     handle: &Handle,
     timeout: std::time::Duration,
 ) -> Result<serde_json::Value> {
@@ -415,12 +415,10 @@ async fn confirmed_terminal_status(
     loop {
         let status = session::read_status(&handle.bs, &handle.session_id).await?;
         if status.state.is_terminal() {
-            return Ok(serde_json::json!({
-                "killed": true,
-                "confirmed": true,
-                "state": status.state,
-                "exit_code": status.exit_code,
-            }));
+            return Err(anyhow!(
+                "session finished before kill request could be applied (state={:?})",
+                status.state,
+            ));
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(anyhow!("kill ended without a persisted terminal state"));
