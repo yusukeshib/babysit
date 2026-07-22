@@ -82,9 +82,13 @@ pub struct Pane {
     master: Option<Mutex<Box<dyn MasterPty + Send>>>,
     /// Independent signaller for the child. Kept separate from the child
     /// handle (which the wait thread holds locked for the entire duration of
-    /// its blocking `wait()`) so `kill()` never has to contend with it.
+    /// its blocking `wait()`) so termination never has to contend with it.
+    /// On Unix we prefer signaling the isolated child process group via `pid`;
+    /// this remains the cross-platform fallback.
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    /// OS process id of the child, if known.
+    /// OS process id of the child, if known. On Unix the child is also the
+    /// leader of an isolated process group, so descendants can be terminated
+    /// together instead of leaking after their parent exits.
     pub pid: Option<u32>,
     /// Latest known exit status, set by the wait thread when the child exits.
     pub exit_status: Arc<Mutex<Option<ExitInfo>>>,
@@ -203,6 +207,14 @@ impl Pane {
             c.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            // PTY children call setsid() inside portable-pty. Pipe-mode
+            // children need equivalent isolation before we can safely signal
+            // the whole command tree without also signaling this supervisor.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                c.process_group(0);
+            }
             let mut spawned = c.spawn().with_context(|| format!("spawning {:?}", cmd))?;
             writer = Box::new(spawned.stdin.take().context("taking child stdin")?);
             readers.push(Box::new(
@@ -364,11 +376,68 @@ impl Pane {
         now_ms().saturating_sub(self.activity.last_ms.load(Ordering::Relaxed))
     }
 
-    /// Signal the child to terminate (best-effort). Uses the independent
-    /// killer so it works even while the wait thread is blocked in `wait()`.
-    pub fn kill(&self) {
-        if let Ok(mut k) = self.killer.lock() {
-            let _ = k.kill();
+    /// Ask the command tree to terminate gracefully. On Unix portable-pty's
+    /// cloned killer only sends SIGHUP to the direct child and never escalates;
+    /// signal the isolated process group ourselves so descendants receive it.
+    pub fn kill(&self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            return signal_process_group(pid, nix::sys::signal::Signal::SIGHUP);
+        }
+
+        let mut killer = self
+            .killer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child killer lock is poisoned"))?;
+        killer.kill().context("signaling child")
+    }
+
+    /// True while any process remains in this command's isolated process
+    /// group. A shell can exit after SIGHUP while a descendant ignores it, so
+    /// direct-child exit alone is not sufficient termination confirmation.
+    pub fn command_tree_alive(&self) -> Result<bool> {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            use nix::errno::Errno;
+            use nix::sys::signal::kill;
+            use nix::unistd::Pid;
+            return match kill(Pid::from_raw(-(pid as i32)), None) {
+                Ok(()) | Err(Errno::EPERM) => Ok(true),
+                Err(Errno::ESRCH) => Ok(false),
+                Err(error) => Err(error).with_context(|| format!("probing process group {pid}")),
+            };
+        }
+
+        Ok(self.exit_info().is_none())
+    }
+
+    /// Force the complete command tree to stop after graceful termination did
+    /// not work. The caller must still wait for both direct-child exit and
+    /// process-group disappearance before reporting success.
+    pub fn force_kill(&self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            return signal_process_group(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+
+        let mut killer = self
+            .killer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child killer lock is poisoned"))?;
+        killer.kill().context("force-killing child")
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: nix::sys::signal::Signal) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+
+    match killpg(Pid::from_raw(pid as i32), signal) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("sending {signal:?} to process group {pid}"))
         }
     }
 }

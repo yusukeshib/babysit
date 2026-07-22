@@ -105,7 +105,7 @@ Run without installing: `nix run github:yusukeshib/babysit -- -- make local-ci`.
 | `resize` | Resize the terminal (`COLSxROWS`) |
 | `flag` / `unflag` | Flag a session for attention / clear it |
 | `restart` | Restart the command |
-| `kill` | Terminate the command |
+| `kill` | Terminate the command tree (graceful signal, then forced escalation) and return only after exit is confirmed |
 | `attach` / `detach` | Attach your terminal (detach: `Ctrl-\ Ctrl-\`) / detach others |
 | `prune` | Delete finished or dead sessions |
 | `upgrade` | Self-update |

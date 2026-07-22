@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Notify, mpsc, watch};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
 /// Operations a client can request via the control socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ pub enum Request {
     Resize { cols: u16, rows: u16 },
     /// Restart the wrapped command (kill + respawn with the same argv).
     Restart,
-    /// Terminate the wrapped command (SIGHUP).
+    /// Terminate the wrapped command tree (SIGHUP, then SIGKILL if needed).
     Kill,
     /// Attach this connection to the live PTY: stream output and accept
     /// input/resize frames. Upgrades the connection to the frame protocol.
@@ -104,9 +104,13 @@ impl Response {
 }
 
 /// Message from the control loop to the main loop, for actions that need
-/// to mutate the App's state (i.e. restart, which replaces the pane).
+/// coordinated lifecycle changes. Kill carries a reply so the client is not
+/// acknowledged until the worker has confirmed exit and persisted state.
 pub enum LoopMessage {
     Restart,
+    Kill {
+        reply: oneshot::Sender<std::result::Result<serde_json::Value, String>>,
+    },
 }
 
 /// Shared handle that the control socket task reads from. Includes a
@@ -366,9 +370,25 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
             Ok(serde_json::json!({ "cols": cols, "rows": rows }))
         }
         Request::Kill => {
-            let pane = handle.cmd_pane.lock().await.clone();
-            pane.kill();
-            Ok(serde_json::json!({"killed": true}))
+            let (reply_tx, reply_rx) = oneshot::channel();
+            handle
+                .action_tx
+                .send(LoopMessage::Kill { reply: reply_tx })
+                .map_err(|_| anyhow!("main loop is gone"))?;
+
+            match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+                Ok(Ok(Ok(data))) => Ok(data),
+                Ok(Ok(Err(error))) => Err(anyhow!(error)),
+                Ok(Err(_)) => {
+                    // The process can exit naturally while the kill request is
+                    // racing the exit branch. Wait briefly for the terminal
+                    // status write instead of sampling stale Running state.
+                    confirmed_terminal_status(handle, std::time::Duration::from_millis(500)).await
+                }
+                Err(_) => confirmed_terminal_status(handle, std::time::Duration::from_millis(500))
+                    .await
+                    .context("timed out waiting for kill confirmation"),
+            }
         }
         Request::Restart => {
             handle
@@ -384,6 +404,28 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
             Ok(serde_json::json!({"detached": true}))
         }
         Request::Attach { .. } => unreachable!("attach handled before dispatch"),
+    }
+}
+
+async fn confirmed_terminal_status(
+    handle: &Handle,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let status = session::read_status(&handle.bs, &handle.session_id).await?;
+        if status.state.is_terminal() {
+            return Ok(serde_json::json!({
+                "killed": true,
+                "confirmed": true,
+                "state": status.state,
+                "exit_code": status.exit_code,
+            }));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("kill ended without a persisted terminal state"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
