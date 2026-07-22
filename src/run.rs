@@ -181,7 +181,13 @@ impl Babysit {
             // exist. Finalize both explicitly instead of letting the detached
             // supervisor exit and leave a misleading stale-running session.
             pane.kill();
-            pane.exit_notify.notified().await;
+            // Child termination is best-effort; never let a broken child keep
+            // supervisor setup failure handling stuck indefinitely.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                pane.exit_notify.notified(),
+            )
+            .await;
             session::write_status(
                 self,
                 &id,

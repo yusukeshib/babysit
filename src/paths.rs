@@ -4,12 +4,12 @@
 //! root directory. Session files live under
 //! `<root>/sessions/<id>/{meta.json,status.json,output.log,note}` and short,
 //! hashed control-socket paths live under the user's private
-//! `~/.babysit-sockets/` directory. The library NEVER reads the environment to
-//! discover its state root: the embedder passes it in via
-//! [`Babysit::new`]. The only place the
-//! environment is consulted is [`Babysit::from_env`], a convenience for the
-//! `babysit` binary itself — embedders (e.g. `looop`) compute their own root and
-//! call `new`.
+//! `~/.babysit-sockets/` directory (falling back to `/tmp/babysit-<uid>` when a
+//! home directory is unavailable). The library NEVER reads the environment to
+//! discover its state root: the embedder passes it in via [`Babysit::new`].
+//! [`BaseDirs`] is used only to locate per-user storage; [`Babysit::from_env`]
+//! is the only place `$BABYSIT_DIR` is read. Embedders (e.g. `looop`) compute
+//! their own state root and call `new`.
 
 use anyhow::{Context, Result};
 use directories::BaseDirs;
@@ -217,7 +217,7 @@ mod tests {
         let id = "x".repeat(64);
         let path = bs.control_socket_path(&id);
         assert_eq!(path, bs.control_socket_path(&id));
-        assert!(path.starts_with(BaseDirs::new().unwrap().home_dir().join(".babysit-sockets")));
+        assert!(path.starts_with(&bs.sockets));
         assert_eq!(path.file_name().unwrap().to_string_lossy().len(), 16);
         assert!(path.as_os_str().as_encoded_bytes().len() < 100);
         assert_ne!(path, bs.control_socket_path(&"y".repeat(64)));

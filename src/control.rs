@@ -185,7 +185,7 @@ pub async fn serve(handle: Handle) -> Result<()> {
     ensure_private_dir(parent)?;
 
     // If a stale socket exists from a prior run with the same id, remove it.
-    let _ = std::fs::remove_file(&path);
+    let _ = tokio::fs::remove_file(&path).await;
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("binding control socket at {}", path.display()))?;
     secure_socket(&path)?;
@@ -195,7 +195,7 @@ pub async fn serve(handle: Handle) -> Result<()> {
     // well so a pre-upgrade client can still control this new worker. A path
     // length failure is expected for the exact sessions this layout fixes.
     let legacy = handle.bs.legacy_control_socket_path(&handle.session_id);
-    let _ = std::fs::remove_file(&legacy);
+    let _ = tokio::fs::remove_file(&legacy).await;
     if let Ok(listener) = UnixListener::bind(&legacy) {
         if secure_socket(&legacy).is_ok() {
             spawn_listener(listener, handle);
