@@ -104,12 +104,13 @@ impl Response {
 }
 
 /// Message from the control loop to the main loop, for actions that need
-/// coordinated lifecycle changes. Kill carries a reply so the client is not
-/// acknowledged until the worker has confirmed exit and persisted state.
+/// coordinated lifecycle changes. Kill carries a reply plus a flush acknowledgement
+/// so the worker stays alive until the client has received the response.
 pub enum LoopMessage {
     Restart,
     Kill {
         reply: oneshot::Sender<std::result::Result<serde_json::Value, String>>,
+        response_flushed: oneshot::Receiver<()>,
     },
 }
 
@@ -300,20 +301,33 @@ async fn handle_conn(stream: UnixStream, handle: Handle) -> Result<()> {
         return handle_attach(br.into_inner(), wr, handle, cols, rows).await;
     }
 
-    let resp = match dispatch(req, &handle).await {
+    let is_kill = matches!(req, Request::Kill);
+    let (response_flushed_tx, response_flushed_rx) = oneshot::channel();
+    let resp = match dispatch(req, &handle, is_kill.then_some(response_flushed_rx)).await {
         Ok(data) => Response::ok(data),
         Err(e) => Response::err(format!("{e}")),
     };
 
-    let mut bytes = serde_json::to_vec(&resp)?;
-    bytes.push(b'\n');
-    wr.write_all(&bytes).await?;
-    wr.flush().await?;
-    wr.shutdown().await?;
-    Ok(())
+    let write_result = async {
+        let mut bytes = serde_json::to_vec(&resp)?;
+        bytes.push(b'\n');
+        wr.write_all(&bytes).await?;
+        wr.flush().await?;
+        wr.shutdown().await?;
+        Ok(())
+    }
+    .await;
+    if is_kill {
+        let _ = response_flushed_tx.send(());
+    }
+    write_result
 }
 
-async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
+async fn dispatch(
+    req: Request,
+    handle: &Handle,
+    response_flushed: Option<oneshot::Receiver<()>>,
+) -> Result<serde_json::Value> {
     match req {
         Request::Status => {
             let status = session::read_status(&handle.bs, &handle.session_id).await?;
@@ -373,7 +387,11 @@ async fn dispatch(req: Request, handle: &Handle) -> Result<serde_json::Value> {
             let (reply_tx, reply_rx) = oneshot::channel();
             handle
                 .action_tx
-                .send(LoopMessage::Kill { reply: reply_tx })
+                .send(LoopMessage::Kill {
+                    reply: reply_tx,
+                    response_flushed: response_flushed
+                        .expect("kill requests include a flush acknowledgement"),
+                })
                 .map_err(|_| anyhow!("main loop is gone"))?;
 
             match tokio::time::timeout(std::time::Duration::from_secs(7), reply_rx).await {
