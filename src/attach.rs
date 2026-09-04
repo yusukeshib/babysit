@@ -40,7 +40,11 @@ pub const C_RESIZE: u8 = 2;
 /// pressed twice. Enhanced keyboard modes encode the same key as an escape
 /// sequence; `DetachFilter` handles both forms.
 const DETACH_KEY: u8 = 0x1c;
+// CSI and a lone Escape share a prefix, so a finite disambiguation timeout is
+// unavoidable. Match pi's local-terminal timeout to keep Escape responsive;
+// fragments already queued by the terminal are consumed in the same read loop.
 const ESCAPE_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(10);
+const MAX_WITHHELD_INPUT: usize = 1024;
 
 /// Write one frame: `[tag][len: u32 BE][payload]`.
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(
@@ -401,7 +405,10 @@ impl DetachFilter {
                 self.withheld.extend_from_slice(token);
                 false
             }
-            Some(DetachEvent::RepeatOrRelease) if !self.withheld.is_empty() => {
+            Some(DetachEvent::RepeatOrRelease)
+                if !self.withheld.is_empty()
+                    && self.withheld.len() + token.len() <= MAX_WITHHELD_INPUT =>
+            {
                 self.withheld.extend_from_slice(token);
                 false
             }
@@ -491,7 +498,7 @@ impl Drop for RawGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::DetachFilter;
+    use super::{DetachFilter, MAX_WITHHELD_INPUT};
 
     const K: u8 = 0x1c; // Ctrl-\
     const KITTY_PRESS: &[u8] = b"\x1b[92;5u";
@@ -549,6 +556,26 @@ mod tests {
             filter.push(&input),
             ([KITTY_PRESS, KITTY_RELEASE, b"a"].concat(), false)
         );
+    }
+
+    #[test]
+    fn bounds_withheld_repeat_events_and_forwards_them_in_order() {
+        let mut filter = DetachFilter::default();
+        assert_eq!(filter.push(KITTY_PRESS), (vec![], false));
+
+        let mut expected = KITTY_PRESS.to_vec();
+        let forwarded = loop {
+            expected.extend_from_slice(KITTY_REPEAT);
+            let (forward, detach) = filter.push(KITTY_REPEAT);
+            assert!(!detach);
+            if !forward.is_empty() {
+                break forward;
+            }
+            assert!(filter.withheld.len() <= MAX_WITHHELD_INPUT);
+        };
+
+        assert_eq!(forwarded, expected);
+        assert!(filter.withheld.is_empty());
     }
 
     #[test]
