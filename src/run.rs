@@ -257,7 +257,7 @@ impl Babysit {
                         }).await?;
                         current_pane = new_pane;
                     }
-                    LoopMessage::Kill { reply } => {
+                    LoopMessage::Kill { reply, response_flushed } => {
                         match terminate_pane(&current_pane).await {
                             Ok(termination) => {
                                 let state = if termination.signal_sent || termination.info.signaled {
@@ -285,6 +285,15 @@ impl Babysit {
                                         "session exited before kill could be applied".into(),
                                     ));
                                 }
+                                // The response is written by a detached connection task.
+                                // Keep the worker alive until that task flushes it, otherwise
+                                // process exit can close the socket after the kill succeeded
+                                // but before the client receives its confirmation.
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    response_flushed,
+                                )
+                                .await;
                                 info = Some(termination.info);
                                 break;
                             }

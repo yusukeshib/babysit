@@ -13,6 +13,8 @@
 //! terminal. Ctrl-\ is used instead of a flow-control key like Ctrl-Q
 //! (XON, often swallowed by the terminal) or Ctrl-P (commonly bound by
 //! TUIs/shells, e.g. history) so it doesn't collide with the wrapped app.
+//! Enhanced keyboard protocols are decoded here too: applications such as pi
+//! enable Kitty CSI-u reporting, so Ctrl-\ no longer arrives as byte 0x1c.
 
 use crate::pane::ExitInfo;
 use crate::paths::Babysit;
@@ -34,10 +36,15 @@ pub const S_DETACHED: u8 = 3;
 pub const C_INPUT: u8 = 1;
 pub const C_RESIZE: u8 = 2;
 
-/// Detach hotkey: Ctrl-\ (FS, 0x1c) pressed twice in a row. Chosen because
-/// it's not a flow-control key and is rarely bound by interactive programs;
-/// in raw mode ISIG is off, so it arrives as a byte rather than SIGQUIT.
+/// Legacy encoding of the Ctrl-\ detach hotkey (FS, 0x1c), which must be
+/// pressed twice. Enhanced keyboard modes encode the same key as an escape
+/// sequence; `DetachFilter` handles both forms.
 const DETACH_KEY: u8 = 0x1c;
+// CSI and a lone Escape share a prefix, so a finite disambiguation timeout is
+// unavoidable. Match pi's local-terminal timeout to keep Escape responsive;
+// fragments already queued by the terminal are consumed in the same read loop.
+const ESCAPE_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(10);
+const MAX_WITHHELD_INPUT: usize = 1024;
 
 /// Write one frame: `[tag][len: u32 BE][payload]`.
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(
@@ -187,9 +194,11 @@ pub async fn attach_to(bs: &Babysit, id: String) -> Result<i32> {
     });
 
     let mut winch = signal(SignalKind::window_change())?;
-    // Carries the "first Ctrl-\ seen" state across stdin chunks for the
-    // two-press detach sequence (see filter_detach).
-    let mut saw_detach_key = false;
+    // Carries a first Ctrl-\ and partial enhanced-key escape sequences across
+    // stdin chunks. A short timeout keeps a lone Escape responsive.
+    let mut detach_filter = DetachFilter::default();
+    let escape_timeout = tokio::time::sleep(Duration::from_secs(24 * 60 * 60));
+    tokio::pin!(escape_timeout);
     let exit_code: i32;
     // Whether we left the session running (detached / worker vanished) vs the
     // command actually exiting. On the former the wrapped program is still
@@ -218,13 +227,24 @@ pub async fn attach_to(bs: &Babysit, id: String) -> Result<i32> {
             },
             chunk = stdin_rx.recv() => match chunk {
                 Some(bytes) => {
-                    let (forward, do_detach) = filter_detach(&mut saw_detach_key, &bytes);
+                    let (forward, do_detach) = detach_filter.push(&bytes);
                     if !forward.is_empty() {
                         write_frame(&mut wr, C_INPUT, &forward).await?;
                     }
                     if do_detach { exit_code = 0; restore_terminal = true; break; }
+                    if detach_filter.has_partial_escape() {
+                        escape_timeout.as_mut().reset(
+                            tokio::time::Instant::now() + ESCAPE_SEQUENCE_TIMEOUT,
+                        );
+                    }
                 }
                 None => { /* stdin closed; keep streaming output */ }
+            },
+            _ = &mut escape_timeout, if detach_filter.has_partial_escape() => {
+                let forward = detach_filter.flush_partial_escape();
+                if !forward.is_empty() {
+                    write_frame(&mut wr, C_INPUT, &forward).await?;
+                }
             },
             _ = winch.recv() => {
                 if let Ok((c, r)) = crossterm::terminal::size() {
@@ -314,29 +334,150 @@ async fn fallback_finished(bs: &Babysit, id: &str) -> Result<i32> {
     Ok(recorded_exit_code(bs, id).await)
 }
 
-/// Strip the `Ctrl-\ Ctrl-\` detach sequence from a stdin chunk. Returns the
-/// bytes to forward to the PTY and whether the detach sequence completed. A
-/// lone `Ctrl-\` is withheld until the next byte (state carried in `saw`);
-/// if the next byte isn't another `Ctrl-\`, both are forwarded.
-fn filter_detach(saw: &mut bool, chunk: &[u8]) -> (Vec<u8>, bool) {
-    let mut out = Vec::with_capacity(chunk.len() + 1);
-    for &b in chunk {
-        if *saw {
-            *saw = false;
-            if b == DETACH_KEY {
-                // Two in a row → detach; drop both bytes.
+/// Streaming filter for the `Ctrl-\ Ctrl-\` detach sequence.
+///
+/// Most programs leave Ctrl-\ in its legacy one-byte form (0x1c), but TUIs can
+/// ask the terminal for enhanced key reporting. In particular, pi requests
+/// Kitty keyboard protocol flags 1+2+4, making the same key arrive as CSI-u
+/// press/release events such as `ESC [ 92 ; 5 u` and `ESC [ 92 ; 5 : 3 u`.
+/// xterm's modifyOtherKeys form is accepted as well.
+#[derive(Default)]
+struct DetachFilter {
+    /// The first detach press and any repeat/release events belonging to it.
+    withheld: Vec<u8>,
+    /// A possibly incomplete CSI sequence split across stdin reads.
+    escape: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetachEvent {
+    Press,
+    RepeatOrRelease,
+}
+
+impl DetachFilter {
+    fn push(&mut self, chunk: &[u8]) -> (Vec<u8>, bool) {
+        let mut out = Vec::with_capacity(self.withheld.len() + chunk.len());
+
+        for &byte in chunk {
+            if !self.escape.is_empty() {
+                self.escape.push(byte);
+                let not_csi = self.escape.len() == 2 && byte != b'[';
+                let csi_complete = self.escape.len() >= 3 && (0x40..=0x7e).contains(&byte);
+                let too_long = self.escape.len() > 128;
+                if not_csi || csi_complete || too_long {
+                    let sequence = std::mem::take(&mut self.escape);
+                    if self.handle_token(&sequence, &mut out) {
+                        return (out, true);
+                    }
+                }
+            } else if byte == 0x1b {
+                self.escape.push(byte);
+            } else if self.handle_token(&[byte], &mut out) {
                 return (out, true);
             }
-            // Not the sequence: emit the withheld key, then this byte.
-            out.push(DETACH_KEY);
-            out.push(b);
-        } else if b == DETACH_KEY {
-            *saw = true;
+        }
+
+        (out, false)
+    }
+
+    fn has_partial_escape(&self) -> bool {
+        !self.escape.is_empty()
+    }
+
+    fn flush_partial_escape(&mut self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.withheld.len() + self.escape.len());
+        let sequence = std::mem::take(&mut self.escape);
+        self.handle_other(&sequence, &mut out);
+        out
+    }
+
+    fn handle_token(&mut self, token: &[u8], out: &mut Vec<u8>) -> bool {
+        let event = if token == [DETACH_KEY] {
+            Some(DetachEvent::Press)
         } else {
-            out.push(b);
+            enhanced_detach_event(token)
+        };
+
+        match event {
+            Some(DetachEvent::Press) if !self.withheld.is_empty() => true,
+            Some(DetachEvent::Press) => {
+                self.withheld.extend_from_slice(token);
+                false
+            }
+            Some(DetachEvent::RepeatOrRelease)
+                if !self.withheld.is_empty()
+                    && self.withheld.len() + token.len() <= MAX_WITHHELD_INPUT =>
+            {
+                self.withheld.extend_from_slice(token);
+                false
+            }
+            _ => {
+                self.handle_other(token, out);
+                false
+            }
         }
     }
-    (out, false)
+
+    fn handle_other(&mut self, token: &[u8], out: &mut Vec<u8>) {
+        out.append(&mut self.withheld);
+        out.extend_from_slice(token);
+    }
+}
+
+fn enhanced_detach_event(sequence: &[u8]) -> Option<DetachEvent> {
+    if !sequence.starts_with(b"\x1b[") {
+        return None;
+    }
+
+    if sequence.ends_with(b"u") {
+        let body = &sequence[2..sequence.len() - 1];
+        let mut params = body.split(|&byte| byte == b';');
+        let codepoint = parse_decimal(params.next()?.split(|&byte| byte == b':').next()?)?;
+        let mut modifier_and_event = params.next()?.split(|&byte| byte == b':');
+        let modifier = parse_decimal(modifier_and_event.next()?)?.checked_sub(1)?;
+        let event = match modifier_and_event.next() {
+            Some(value) => Some(parse_decimal(value)?),
+            None => None,
+        };
+
+        if codepoint != b'\\' as u16 || modifier & !(64 | 128) != 4 {
+            return None;
+        }
+        return match event.unwrap_or(1) {
+            1 => Some(DetachEvent::Press),
+            2 | 3 => Some(DetachEvent::RepeatOrRelease),
+            _ => None,
+        };
+    }
+
+    // xterm modifyOtherKeys: CSI 27 ; modifier ; codepoint ~
+    if sequence.ends_with(b"~") {
+        let body = &sequence[2..sequence.len() - 1];
+        let mut params = body.split(|&byte| byte == b';');
+        let prefix = parse_decimal(params.next()?)?;
+        let modifier = parse_decimal(params.next()?)?.checked_sub(1)?;
+        let codepoint = parse_decimal(params.next()?)?;
+        if prefix == 27 && codepoint == b'\\' as u16 && modifier & !(64 | 128) == 4 {
+            return Some(DetachEvent::Press);
+        }
+    }
+
+    None
+}
+
+fn parse_decimal(bytes: &[u8]) -> Option<u16> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = 0u16;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as u16)?;
+    }
+    Some(value)
 }
 
 /// RAII guard that puts the terminal in raw mode and restores it on drop.
@@ -357,36 +498,98 @@ impl Drop for RawGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_detach;
+    use super::{DetachFilter, MAX_WITHHELD_INPUT};
 
     const K: u8 = 0x1c; // Ctrl-\
+    const KITTY_PRESS: &[u8] = b"\x1b[92;5u";
+    const KITTY_REPEAT: &[u8] = b"\x1b[92;5:2u";
+    const KITTY_RELEASE: &[u8] = b"\x1b[92;5:3u";
 
     #[test]
     fn passes_normal_input() {
-        let mut p = false;
-        assert_eq!(filter_detach(&mut p, b"hello"), (b"hello".to_vec(), false));
-        assert!(!p);
+        let mut filter = DetachFilter::default();
+        assert_eq!(filter.push(b"hello"), (b"hello".to_vec(), false));
     }
 
     #[test]
-    fn detects_detach_sequence_in_one_chunk() {
-        let mut p = false;
-        assert_eq!(filter_detach(&mut p, &[K, K]), (vec![], true));
+    fn detects_legacy_detach_sequence_in_one_chunk() {
+        let mut filter = DetachFilter::default();
+        assert_eq!(filter.push(&[K, K]), (vec![], true));
     }
 
     #[test]
-    fn detects_detach_sequence_across_chunks() {
-        let mut p = false;
-        assert_eq!(filter_detach(&mut p, &[K]), (vec![], false));
-        assert!(p);
-        assert_eq!(filter_detach(&mut p, &[K]), (vec![], true));
+    fn detects_legacy_detach_sequence_across_chunks() {
+        let mut filter = DetachFilter::default();
+        assert_eq!(filter.push(&[K]), (vec![], false));
+        assert_eq!(filter.push(&[K]), (vec![], true));
     }
 
     #[test]
-    fn lone_ctrl_backslash_then_other_is_forwarded() {
-        let mut p = false;
-        // Ctrl-\ then 'a' → both forwarded, no detach.
-        assert_eq!(filter_detach(&mut p, &[K, b'a']), (vec![K, b'a'], false));
-        assert!(!p);
+    fn lone_legacy_ctrl_backslash_then_other_is_forwarded() {
+        let mut filter = DetachFilter::default();
+        assert_eq!(filter.push(&[K, b'a']), (vec![K, b'a'], false));
+    }
+
+    #[test]
+    fn detects_kitty_detach_while_ignoring_repeat_and_release_events() {
+        let mut filter = DetachFilter::default();
+        let input = [KITTY_PRESS, KITTY_REPEAT, KITTY_RELEASE, KITTY_PRESS].concat();
+        assert_eq!(filter.push(&input), (vec![], true));
+    }
+
+    #[test]
+    fn detects_fragmented_kitty_detach_sequence() {
+        let mut filter = DetachFilter::default();
+        assert_eq!(filter.push(b"\x1b[92;"), (vec![], false));
+        assert!(filter.has_partial_escape());
+        assert_eq!(filter.push(b"5u"), (vec![], false));
+        assert!(!filter.has_partial_escape());
+        assert_eq!(filter.push(KITTY_RELEASE), (vec![], false));
+        assert_eq!(filter.push(KITTY_PRESS), (vec![], true));
+    }
+
+    #[test]
+    fn forwards_a_lone_kitty_ctrl_backslash_when_another_key_arrives() {
+        let mut filter = DetachFilter::default();
+        let input = [KITTY_PRESS, KITTY_RELEASE, b"a"].concat();
+        assert_eq!(
+            filter.push(&input),
+            ([KITTY_PRESS, KITTY_RELEASE, b"a"].concat(), false)
+        );
+    }
+
+    #[test]
+    fn bounds_withheld_repeat_events_and_forwards_them_in_order() {
+        let mut filter = DetachFilter::default();
+        assert_eq!(filter.push(KITTY_PRESS), (vec![], false));
+
+        let mut expected = KITTY_PRESS.to_vec();
+        let forwarded = loop {
+            expected.extend_from_slice(KITTY_REPEAT);
+            let (forward, detach) = filter.push(KITTY_REPEAT);
+            assert!(!detach);
+            if !forward.is_empty() {
+                break forward;
+            }
+            assert!(filter.withheld.len() <= MAX_WITHHELD_INPUT);
+        };
+
+        assert_eq!(forwarded, expected);
+        assert!(filter.withheld.is_empty());
+    }
+
+    #[test]
+    fn accepts_kitty_alternate_keys_locks_and_xterm_encoding() {
+        let mut filter = DetachFilter::default();
+        assert_eq!(filter.push(b"\x1b[92:124:92;69u"), (vec![], false));
+        assert_eq!(filter.push(b"\x1b[27;5;92~"), (vec![], true));
+    }
+
+    #[test]
+    fn forwards_non_matching_and_timed_out_escape_sequences() {
+        let mut filter = DetachFilter::default();
+        assert_eq!(filter.push(b"\x1b[97;5u"), (b"\x1b[97;5u".to_vec(), false));
+        assert_eq!(filter.push(b"\x1b["), (vec![], false));
+        assert_eq!(filter.flush_partial_escape(), b"\x1b[".to_vec());
     }
 }
