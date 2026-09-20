@@ -18,9 +18,20 @@ _babysit() {
 	_init_completion || return
 
 	local subcommands="run list status log screenshot send key expect wait-idle wait resize flag unflag restart kill attach detach prune upgrade config help"
+	local subcmd_index=1
+	if [[ "${words[1]}" == "--host" ]]; then
+		subcmd_index=3
+	elif [[ "${words[1]}" == --host=* ]]; then
+		subcmd_index=2
+	fi
+	local subcmd="${words[$subcmd_index]}"
 
 	if [[ $cword -eq 1 ]]; then
-		COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
+		COMPREPLY=($(compgen -W "--host $subcommands" -- "$cur"))
+		return
+	fi
+	if [[ "$prev" == "--host" ]]; then
+		COMPREPLY=($(compgen -A hostname -- "$cur"))
 		return
 	fi
 
@@ -30,7 +41,7 @@ _babysit() {
 		return
 	fi
 
-	case "${words[1]}" in
+	case "$subcmd" in
 	run)
 		case "$cur" in
 		-*) COMPREPLY=($(compgen -W "--id --detach --no-tty --timeout --idle-timeout --size --json" -- "$cur")) ;;

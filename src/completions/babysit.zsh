@@ -85,7 +85,13 @@ _babysit() {
             _describe 'subcommand' subcmds
             ;;
         args)
-            case ${words[1]} in
+            local subcmd_index=1
+            if [[ ${words[1]} == --host ]]; then
+                subcmd_index=3
+            elif [[ ${words[1]} == --host=* ]]; then
+                subcmd_index=2
+            fi
+            case ${words[$subcmd_index]} in
                 run)
                     _arguments \
                         '--id=[Session id to assign]:id:' \

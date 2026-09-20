@@ -129,6 +129,49 @@ fn direct_ssh_destination_runs_remote_commands() {
 }
 
 #[test]
+fn standalone_escape_is_forwarded_without_waiting_for_another_key() {
+    let root = temp_root("escape-timeout");
+    let ssh = fake_ssh(&root, false);
+    let started = cli(
+        &root,
+        &ssh,
+        &[
+            "--host",
+            "user@fake",
+            "run",
+            "-d",
+            "--json",
+            "--no-tty",
+            "--",
+            "sh",
+            "-c",
+            "dd bs=1 count=1 2>/dev/null | od -An -tx1",
+        ],
+    );
+    let id = serde_json::from_slice::<Value>(&started.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut child = cli_command(&root, &ssh)
+        .args(["--host", "user@fake", "attach", "-s", &id])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    child.stdin.take().unwrap().write_all(&[0x1b]).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1b"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn ambiguous_creation_recovers_the_generated_id_without_spawning_twice() {
     let root = temp_root("creation-drop");
     let ssh = fake_ssh_creation_drop(&root);
@@ -256,6 +299,45 @@ fn detach_sequence_works_while_waiting_to_reconnect() {
         "detach must not kill the session"
     );
     let _ = cli(&root, &ssh, &["--host", "user@fake", "wait", "-s", &id]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn transformed_view_fails_instead_of_replaying_duplicate_output() {
+    let root = temp_root("view-reconnect");
+    let ssh = fake_ssh(&root, true);
+    let started = cli(
+        &root,
+        &ssh,
+        &[
+            "--host",
+            "user@fake",
+            "run",
+            "-d",
+            "--json",
+            "--view-cmd",
+            "cat",
+            "--",
+            "sh",
+            "-c",
+            "printf A; sleep 2; printf B",
+        ],
+    );
+    let id = serde_json::from_slice::<Value>(&started.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let output = cli(&root, &ssh, &["--host", "user@fake", "attach", "-s", &id]);
+    assert!(!output.status.success());
+    assert!(output.stdout.starts_with(b"A"));
+    assert_eq!(
+        output.stdout.iter().filter(|&&byte| byte == b'A').count(),
+        1
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("reconnect is unavailable for --view-cmd")
+    );
+    let _ = cli(&root, &ssh, &["--host", "user@fake", "kill", "-s", &id]);
     let _ = fs::remove_dir_all(root);
 }
 

@@ -51,6 +51,7 @@ struct HubInner {
     backlog_start: u64,
     next_offset: u64,
     log: Option<File>,
+    log_error: Option<String>,
     clients: Vec<UnboundedSender<Vec<u8>>>,
     resume_clients: Vec<UnboundedSender<OutputChunk>>,
 }
@@ -73,6 +74,7 @@ impl OutputHub {
             g.next_offset = file.metadata()?.len();
             g.backlog_start = g.next_offset;
             g.log = Some(file);
+            g.log_error = None;
         }
         Ok(())
     }
@@ -82,8 +84,11 @@ impl OutputHub {
         let Ok(mut g) = self.inner.lock() else {
             return;
         };
-        if let Some(log) = g.log.as_mut() {
-            let _ = log.write_all(data);
+        if let Some(log) = g.log.as_mut()
+            && let Err(error) = log.write_all(data)
+        {
+            g.log_error = Some(error.to_string());
+            g.log = None;
         }
         let offset = g.next_offset;
         g.next_offset = g.next_offset.saturating_add(data.len() as u64);
@@ -129,6 +134,9 @@ impl OutputHub {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("output hub poisoned"))?;
+        if let Some(error) = &g.log_error {
+            anyhow::bail!("output log is unavailable for resume: {error}");
+        }
         if since.is_some_and(|offset| offset > g.next_offset) {
             anyhow::bail!("resume offset is beyond output end");
         }

@@ -227,6 +227,9 @@ pub async fn attach_to(bs: &Babysit, id: String) -> Result<i32> {
                     let _ = out.write_all(&payload[8..]);
                     let _ = out.flush();
                 }
+                Ok(Some((S_ERROR, payload))) => {
+                    return Err(anyhow!("attach failed: {}", String::from_utf8_lossy(&payload)));
+                }
                 Ok(Some((S_EXIT, payload))) => { exit_code = parse_exit(&payload); break; }
                 Ok(Some((S_DETACHED, _))) => { exit_code = 0; restore_terminal = true; break; }
                 Ok(Some(_)) => {}

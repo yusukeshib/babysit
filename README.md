@@ -56,7 +56,10 @@ same session automatically and resumes from the last raw-log byte, so the same
 process and PTY continue without duplicated output. Input typed while offline
 is discarded. Detach at any time with `Ctrl-\ Ctrl-\`, including while
 reconnecting; pass `attach --no-reconnect` to make a transport loss fatal.
-`run -d` starts the remote worker without attaching.
+Sessions using `run --view-cmd` have a transformed stream without stable raw
+byte offsets, so their remote attach returns an error after transport loss
+instead of replaying duplicate output. `run -d` starts the remote worker without
+attaching.
 
 `--host local` is the default and runs directly without SSH. Any other value is
 passed to `ssh` as its destination. The embedding API remains local-only.

@@ -13,7 +13,7 @@
 //! The connection closes after the response.
 
 use crate::attach::{
-    self, C_INPUT, C_RESIZE, S_DETACHED, S_EXIT, S_OUTPUT, S_OUTPUT_OFFSET, S_READY,
+    self, C_INPUT, C_RESIZE, S_DETACHED, S_ERROR, S_EXIT, S_OUTPUT, S_OUTPUT_OFFSET, S_READY,
 };
 use crate::pane::{ExitInfo, OutputChunk, OutputHub, Pane};
 use crate::paths::Babysit;
@@ -462,6 +462,32 @@ async fn kill_race_error(
 /// Serve an attached client: stream PTY output (plus the catch-up backlog)
 /// out as frames, and apply the input/resize frames it sends back. Ends when
 /// the client disconnects, the session exits, or a forced detach fires.
+enum AttachOutput {
+    Legacy(Vec<u8>),
+    Offset(OutputChunk),
+}
+
+enum AttachOutputReceiver {
+    Legacy(mpsc::UnboundedReceiver<Vec<u8>>),
+    Offset(mpsc::UnboundedReceiver<OutputChunk>),
+}
+
+impl AttachOutputReceiver {
+    async fn recv(&mut self) -> Option<AttachOutput> {
+        match self {
+            Self::Legacy(rx) => rx.recv().await.map(AttachOutput::Legacy),
+            Self::Offset(rx) => rx.recv().await.map(AttachOutput::Offset),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Legacy(rx) => rx.is_empty(),
+            Self::Offset(rx) => rx.is_empty(),
+        }
+    }
+}
+
 async fn handle_attach(
     rd: tokio::net::unix::OwnedReadHalf,
     mut wr: tokio::net::unix::OwnedWriteHalf,
@@ -496,71 +522,62 @@ async fn handle_attach(
     let mut exit_rx = handle.exit_rx.clone();
     let already_exited = exit_rx.borrow().is_some();
 
-    enum AttachOutput {
-        Legacy(Vec<u8>),
-        Offset(OutputChunk),
-    }
-
     // View filters transform raw bytes, so they use the legacy non-resumable
     // stream. Raw protocol-v1 clients receive exact offsets and can reconnect
-    // without duplicating output.
-    let (output_tx, mut output) = mpsc::unbounded_channel::<AttachOutput>();
+    // without duplicating output. Keep the hub receiver directly in this task:
+    // an intermediate forwarding task could race EXIT and drop final chunks.
+    let mut pending = std::collections::VecDeque::<AttachOutput>::new();
     let mut view_child = None;
     let has_view_cmd = handle
         .view_cmd
         .as_deref()
         .is_some_and(|cmd| !cmd.trim().is_empty());
-    if has_view_cmd {
+    let mut output = if has_view_cmd {
         let cmd = handle.view_cmd.as_deref().unwrap();
-        let (mut legacy, child) =
+        let (legacy, child) =
             match spawn_view_filter(|| handle.hub.subscribe(), cmd, already_exited) {
                 Ok((rx, guard)) => (rx, Some(guard)),
                 Err(_) => (handle.hub.subscribe(), None),
             };
         view_child = child;
-        tokio::spawn(async move {
-            while let Some(bytes) = legacy.recv().await {
-                if output_tx.send(AttachOutput::Legacy(bytes)).is_err() {
-                    break;
-                }
-            }
-        });
+        AttachOutputReceiver::Legacy(legacy)
     } else if protocol >= 1 {
-        let subscription = handle.hub.subscribe_resumable(since)?;
+        let subscription = match handle.hub.subscribe_resumable(since) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                attach::write_frame(&mut wr, S_READY, &[]).await?;
+                attach::write_frame(&mut wr, S_ERROR, error.to_string().as_bytes()).await?;
+                return Ok(());
+            }
+        };
         if let Some(offset) = since {
             if offset < subscription.snapshot_end {
-                let bytes = read_log_range(
+                let bytes = match read_log_range(
                     &handle.bs.output_log_path(&handle.session_id),
                     offset,
                     subscription.snapshot_end,
                 )
-                .await?;
-                let _ = output_tx.send(AttachOutput::Offset(OutputChunk {
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        attach::write_frame(&mut wr, S_READY, &[]).await?;
+                        attach::write_frame(&mut wr, S_ERROR, error.to_string().as_bytes()).await?;
+                        return Ok(());
+                    }
+                };
+                pending.push_back(AttachOutput::Offset(OutputChunk {
                     offset,
                     data: bytes,
                 }));
             }
         } else if let Some(backlog) = subscription.backlog {
-            let _ = output_tx.send(AttachOutput::Offset(backlog));
+            pending.push_back(AttachOutput::Offset(backlog));
         }
-        let mut live = subscription.output;
-        tokio::spawn(async move {
-            while let Some(chunk) = live.recv().await {
-                if output_tx.send(AttachOutput::Offset(chunk)).is_err() {
-                    break;
-                }
-            }
-        });
+        AttachOutputReceiver::Offset(subscription.output)
     } else {
-        let mut legacy = handle.hub.subscribe();
-        tokio::spawn(async move {
-            while let Some(bytes) = legacy.recv().await {
-                if output_tx.send(AttachOutput::Legacy(bytes)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
+        AttachOutputReceiver::Legacy(handle.hub.subscribe())
+    };
     // The already-exited EXIT fast-path only holds for a raw stream, not a
     // formatter which may still buffer output after its input closes.
     let has_view = view_child.is_some();
@@ -631,7 +648,12 @@ async fn handle_attach(
             biased;
             // Drain queued output (backlog + live) before honoring exit, so
             // the client never loses the tail.
-            data = output.recv() => match data {
+            data = async {
+                match pending.pop_front() {
+                    Some(data) => Some(data),
+                    None => output.recv().await,
+                }
+            } => match data {
                 Some(AttachOutput::Legacy(bytes)) => {
                     if attach::write_frame(&mut wr, S_OUTPUT, &bytes).await.is_err() {
                         break;
@@ -698,7 +720,7 @@ async fn handle_attach(
         // bytes are still in flight (or buffered pending EOF), which would
         // prematurely EXIT and truncate the formatted backlog. That path
         // instead relies on the channel-close signal handled above.
-        if already_exited && !has_view && output.is_empty() {
+        if already_exited && !has_view && pending.is_empty() && output.is_empty() {
             let info = *exit_rx.borrow();
             let _ = attach::write_frame(&mut wr, S_EXIT, &attach::exit_payload(info)).await;
             break;

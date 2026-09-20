@@ -107,10 +107,11 @@ pub async fn proxy(host: &str, args: &[String]) -> Result<i32> {
 }
 
 pub async fn capture(host: &str, args: &[String]) -> Result<std::process::Output> {
-    ssh_command(host, args)?
-        .stdin(Stdio::null())
-        .output()
+    let mut command = ssh_command(host, args)?;
+    command.stdin(Stdio::null()).kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(20), command.output())
         .await
+        .context("timed out waiting for remote babysit")?
         .context("starting ssh")
 }
 
@@ -185,6 +186,12 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
             socket.flush().await?;
             let (mut socket_rd, mut socket_wr) = socket.into_split();
             let mut stdout = tokio::io::stdout();
+            // The bridge itself defines transport readiness. New workers also
+            // send S_READY (harmlessly ignored after the handshake), while this
+            // lets a new bridge attach once to a pre-protocol worker.
+            if protocol >= 1 {
+                attach::write_frame(&mut stdout, S_READY, &[]).await?;
+            }
             let input =
                 tokio::spawn(async move { tokio::io::copy(&mut stdin, &mut socket_wr).await });
             let output = tokio::io::copy(&mut socket_rd, &mut stdout).await;
@@ -292,6 +299,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
     let mut winch = signal(SignalKind::window_change())?;
     let mut filter = DetachFilter::default();
     let mut cursor: Option<u64> = None;
+    let mut resumable = true;
     let mut established_once = false;
     let mut delay = Duration::from_millis(250);
     let mut cleanup = TerminalCleanup(false);
@@ -393,6 +401,8 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
             }
         }
 
+        let escape_timeout = tokio::time::sleep(Duration::from_secs(24 * 60 * 60));
+        tokio::pin!(escape_timeout);
         loop {
             tokio::select! {
                 frame = attach::read_frame(&mut reader) => match frame {
@@ -413,6 +423,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                         std::io::stdout().write_all(&payload)?;
                         std::io::stdout().flush()?;
                         cursor = None;
+                        resumable = false;
                     }
                     Ok(Some((S_ERROR, payload))) => {
                         let _ = child.kill().await;
@@ -433,6 +444,9 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                     Ok(None) | Err(_) => {
                         let _ = child.kill().await;
                         if !reconnect { bail!("remote attach transport disconnected"); }
+                        if !resumable {
+                            bail!("remote reconnect is unavailable for --view-cmd streams");
+                        }
                         reconnect_notice(host, delay);
                         if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                             attach::restore_terminal_modes();
@@ -448,6 +462,9 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                         && attach::write_frame(&mut child_in, C_INPUT, &forward).await.is_err()
                     {
                         if !reconnect { bail!("remote attach transport disconnected"); }
+                        if !resumable {
+                            bail!("remote reconnect is unavailable for --view-cmd streams");
+                        }
                         continue 'reconnect;
                     }
                     if detach {
@@ -456,11 +473,31 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                         cleanup.0 = false;
                         return Ok(0);
                     }
+                    if filter.has_partial_escape() {
+                        escape_timeout.as_mut().reset(
+                            tokio::time::Instant::now() + Duration::from_millis(10),
+                        );
+                    }
+                },
+                _ = &mut escape_timeout, if filter.has_partial_escape() => {
+                    let forward = filter.flush_partial_escape();
+                    if !forward.is_empty()
+                        && attach::write_frame(&mut child_in, C_INPUT, &forward).await.is_err()
+                    {
+                        if !reconnect { bail!("remote attach transport disconnected"); }
+                        if !resumable {
+                            bail!("remote reconnect is unavailable for --view-cmd streams");
+                        }
+                        continue 'reconnect;
+                    }
                 },
                 _ = winch.recv() => if let Ok((cols, rows)) = crossterm::terminal::size()
                     && attach::write_frame(&mut child_in, C_RESIZE, &attach::resize_payload(cols, rows)).await.is_err()
                 {
                     if !reconnect { bail!("remote attach transport disconnected"); }
+                    if !resumable {
+                        bail!("remote reconnect is unavailable for --view-cmd streams");
+                    }
                     continue 'reconnect;
                 }
             }
