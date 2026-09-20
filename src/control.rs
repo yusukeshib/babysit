@@ -12,8 +12,10 @@
 //!
 //! The connection closes after the response.
 
-use crate::attach::{self, C_INPUT, C_RESIZE, S_DETACHED, S_EXIT, S_OUTPUT};
-use crate::pane::{ExitInfo, OutputHub, Pane};
+use crate::attach::{
+    self, C_INPUT, C_RESIZE, S_DETACHED, S_ERROR, S_EXIT, S_OUTPUT, S_OUTPUT_OFFSET, S_READY,
+};
+use crate::pane::{ExitInfo, OutputChunk, OutputHub, Pane};
 use crate::paths::Babysit;
 use crate::session;
 use anyhow::{Context, Result, anyhow};
@@ -23,7 +25,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
@@ -68,6 +70,12 @@ pub enum Request {
         cols: u16,
         #[serde(default)]
         rows: u16,
+        /// Raw output byte offset to resume from.
+        #[serde(default)]
+        since: Option<u64>,
+        /// Attach stream protocol. Version 1 adds offset-bearing output frames.
+        #[serde(default)]
+        protocol: u8,
     },
     /// Detach any currently-attached clients, leaving the command running.
     Detach,
@@ -297,8 +305,14 @@ async fn handle_conn(stream: UnixStream, handle: Handle) -> Result<()> {
 
     // Attach upgrades the connection to the frame protocol; it never sends a
     // JSON response, so it's handled before the one-shot path.
-    if let Request::Attach { cols, rows } = req {
-        return handle_attach(br.into_inner(), wr, handle, cols, rows).await;
+    if let Request::Attach {
+        cols,
+        rows,
+        since,
+        protocol,
+    } = req
+    {
+        return handle_attach(br.into_inner(), wr, handle, cols, rows, since, protocol).await;
     }
 
     let is_kill = matches!(req, Request::Kill);
@@ -448,12 +462,40 @@ async fn kill_race_error(
 /// Serve an attached client: stream PTY output (plus the catch-up backlog)
 /// out as frames, and apply the input/resize frames it sends back. Ends when
 /// the client disconnects, the session exits, or a forced detach fires.
+enum AttachOutput {
+    Legacy(Vec<u8>),
+    Offset(OutputChunk),
+}
+
+enum AttachOutputReceiver {
+    Legacy(mpsc::UnboundedReceiver<Vec<u8>>),
+    Offset(mpsc::UnboundedReceiver<OutputChunk>),
+}
+
+impl AttachOutputReceiver {
+    async fn recv(&mut self) -> Option<AttachOutput> {
+        match self {
+            Self::Legacy(rx) => rx.recv().await.map(AttachOutput::Legacy),
+            Self::Offset(rx) => rx.recv().await.map(AttachOutput::Offset),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Legacy(rx) => rx.is_empty(),
+            Self::Offset(rx) => rx.is_empty(),
+        }
+    }
+}
+
 async fn handle_attach(
     rd: tokio::net::unix::OwnedReadHalf,
     mut wr: tokio::net::unix::OwnedWriteHalf,
     handle: Handle,
     cols: u16,
     rows: u16,
+    since: Option<u64>,
+    protocol: u8,
 ) -> Result<()> {
     // Track this client so worker shutdown can wait for it to drain.
     handle.attached.fetch_add(1, Ordering::SeqCst);
@@ -480,25 +522,65 @@ async fn handle_attach(
     let mut exit_rx = handle.exit_rx.clone();
     let already_exited = exit_rx.borrow().is_some();
 
-    // Subscribe lazily via a closure so the hub subscription only happens
-    // once the formatter has actually spawned. If `spawn_view_filter` failed
-    // eagerly (before subscribing) it would leave a dead sender parked in
-    // `hub.clients` until the next broadcast — which may never come once the
-    // session has exited, leaking across repeated attaches with a broken
-    // `--view-cmd`.
-    let (mut output, view_child) = match handle.view_cmd.as_deref() {
-        Some(cmd) if !cmd.trim().is_empty() => {
+    // View filters transform raw bytes, so they use the legacy non-resumable
+    // stream. Raw protocol-v1 clients receive exact offsets and can reconnect
+    // without duplicating output. Keep the hub receiver directly in this task:
+    // an intermediate forwarding task could race EXIT and drop final chunks.
+    let mut pending = std::collections::VecDeque::<AttachOutput>::new();
+    let mut ready_sent = false;
+    let mut view_child = None;
+    let has_view_cmd = handle
+        .view_cmd
+        .as_deref()
+        .is_some_and(|cmd| !cmd.trim().is_empty());
+    let mut output = if has_view_cmd {
+        let cmd = handle.view_cmd.as_deref().unwrap();
+        let (legacy, child) =
             match spawn_view_filter(|| handle.hub.subscribe(), cmd, already_exited) {
                 Ok((rx, guard)) => (rx, Some(guard)),
                 Err(_) => (handle.hub.subscribe(), None),
+            };
+        view_child = child;
+        AttachOutputReceiver::Legacy(legacy)
+    } else if protocol >= 1 {
+        let subscription = match handle.hub.subscribe_resumable(since) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                attach::write_frame(&mut wr, S_READY, &[]).await?;
+                attach::write_frame(&mut wr, S_ERROR, error.to_string().as_bytes()).await?;
+                return Ok(());
             }
+        };
+        if let Some(offset) = since {
+            if offset < subscription.snapshot_end {
+                attach::write_frame(&mut wr, S_READY, &[]).await?;
+                ready_sent = true;
+                if let Err(error) = write_log_range_frames(
+                    &mut wr,
+                    &handle.bs.output_log_path(&handle.session_id),
+                    offset,
+                    subscription.snapshot_end,
+                )
+                .await
+                {
+                    attach::write_frame(&mut wr, S_ERROR, error.to_string().as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+        } else if let Some(backlog) = subscription.backlog {
+            pending.push_back(AttachOutput::Offset(backlog));
         }
-        _ => (handle.hub.subscribe(), None),
+        AttachOutputReceiver::Offset(subscription.output)
+    } else {
+        AttachOutputReceiver::Legacy(handle.hub.subscribe())
     };
-    // Whether output is routed through a formatter. The already-exited EXIT
-    // fast-path below only holds for the raw hub stream, not the formatted one.
+    // The already-exited EXIT fast-path only holds for a raw stream, not a
+    // formatter which may still buffer output after its input closes.
     let has_view = view_child.is_some();
     let mut detach_rx = handle.detach_tx.subscribe();
+    if protocol >= 1 && !ready_sent {
+        attach::write_frame(&mut wr, S_READY, &[]).await?;
+    }
 
     // Grace period bounding the already-exited + `--view-cmd` drain. A
     // cooperative formatter exits on stdin EOF, closing stdout so
@@ -562,9 +644,22 @@ async fn handle_attach(
             biased;
             // Drain queued output (backlog + live) before honoring exit, so
             // the client never loses the tail.
-            data = output.recv() => match data {
-                Some(bytes) => {
+            data = async {
+                match pending.pop_front() {
+                    Some(data) => Some(data),
+                    None => output.recv().await,
+                }
+            } => match data {
+                Some(AttachOutput::Legacy(bytes)) => {
                     if attach::write_frame(&mut wr, S_OUTPUT, &bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Some(AttachOutput::Offset(chunk)) => {
+                    let mut payload = Vec::with_capacity(8 + chunk.data.len());
+                    payload.extend_from_slice(&chunk.offset.to_be_bytes());
+                    payload.extend_from_slice(&chunk.data);
+                    if attach::write_frame(&mut wr, S_OUTPUT_OFFSET, &payload).await.is_err() {
                         break;
                     }
                 }
@@ -621,7 +716,7 @@ async fn handle_attach(
         // bytes are still in flight (or buffered pending EOF), which would
         // prematurely EXIT and truncate the formatted backlog. That path
         // instead relies on the channel-close signal handled above.
-        if already_exited && !has_view && output.is_empty() {
+        if already_exited && !has_view && pending.is_empty() && output.is_empty() {
             let info = *exit_rx.borrow();
             let _ = attach::write_frame(&mut wr, S_EXIT, &attach::exit_payload(info)).await;
             break;
@@ -754,6 +849,41 @@ fn spawn_view_filter(
     ))
 }
 
+async fn write_log_range_frames<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    path: &Path,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    use std::io::{ErrorKind, SeekFrom};
+    if end < start {
+        return Err(anyhow!("invalid output range {start}..{end}"));
+    }
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.seek(SeekFrom::Start(start)).await?;
+    let mut offset = start;
+    let mut buffer = vec![0; 64 * 1024];
+    while offset < end {
+        let wanted = usize::try_from((end - offset).min(buffer.len() as u64)).unwrap();
+        let read = file.read(&mut buffer[..wanted]).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("output log ended before offset {end}"),
+            )
+            .into());
+        }
+        let mut payload = Vec::with_capacity(8 + read);
+        payload.extend_from_slice(&offset.to_be_bytes());
+        payload.extend_from_slice(&buffer[..read]);
+        attach::write_frame(writer, S_OUTPUT_OFFSET, &payload).await?;
+        offset += read as u64;
+    }
+    Ok(())
+}
+
 async fn read_log(path: &Path, tail: Option<usize>, raw: bool) -> Result<serde_json::Value> {
     let bytes = match tokio::fs::read(path).await {
         Ok(b) => b,
@@ -811,8 +941,10 @@ pub fn cleanup(bs: &Babysit, session_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_private_dir, last_n_lines, secure_socket, spawn_view_filter};
-    use crate::paths::Babysit;
+    use super::{
+        ensure_private_dir, last_n_lines, secure_socket, spawn_view_filter, write_log_range_frames,
+    };
+    use crate::{attach, paths::Babysit};
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
     use tokio::sync::mpsc;
@@ -838,6 +970,44 @@ mod tests {
             0o600
         );
         drop(listener);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn resumed_log_ranges_are_streamed_in_bounded_frames() {
+        let path = std::env::temp_dir().join(format!(
+            "babysit-resume-range-{}-{}.log",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let expected: Vec<u8> = (0..200_000).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&path, &expected).unwrap();
+        let (mut reader, mut writer) = tokio::io::duplex(1024);
+        let write_path = path.clone();
+        let sender = tokio::spawn(async move {
+            write_log_range_frames(&mut writer, &write_path, 0, 200_000)
+                .await
+                .unwrap();
+        });
+
+        let mut actual = Vec::new();
+        let mut expected_offset = 0_u64;
+        let mut frames = 0;
+        while actual.len() < expected.len() {
+            let (tag, payload) = attach::read_frame(&mut reader).await.unwrap().unwrap();
+            assert_eq!(tag, attach::S_OUTPUT_OFFSET);
+            let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
+            assert_eq!(offset, expected_offset);
+            actual.extend_from_slice(&payload[8..]);
+            expected_offset = actual.len() as u64;
+            frames += 1;
+        }
+        sender.await.unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            frames >= 4,
+            "large ranges should not be one allocation/frame"
+        );
         let _ = std::fs::remove_file(path);
     }
 

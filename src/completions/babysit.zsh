@@ -50,6 +50,7 @@ _babysit() {
     typeset -A opt_args
 
     _arguments -C \
+        '--host=[Run on an SSH destination]:host:_hosts' \
         '1: :->subcmd' \
         '*:: :->args'
 
@@ -84,7 +85,13 @@ _babysit() {
             _describe 'subcommand' subcmds
             ;;
         args)
-            case ${words[1]} in
+            local subcmd_index=1
+            if [[ ${words[1]} == --host ]]; then
+                subcmd_index=3
+            elif [[ ${words[1]} == --host=* ]]; then
+                subcmd_index=2
+            fi
+            case ${words[$subcmd_index]} in
                 run)
                     _arguments \
                         '--id=[Session id to assign]:id:' \
@@ -134,7 +141,8 @@ _babysit() {
                     ;;
                 attach|a)
                     _arguments \
-                        '--session[Session id]:session:__babysit_sessions'
+                        '--session[Session id]:session:__babysit_sessions' \
+                        '--no-reconnect[Return instead of reconnecting after SSH loss]'
                     ;;
                 expect)
                     _arguments \

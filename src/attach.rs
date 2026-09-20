@@ -32,6 +32,12 @@ use tokio::sync::mpsc;
 pub const S_OUTPUT: u8 = 1;
 pub const S_EXIT: u8 = 2;
 pub const S_DETACHED: u8 = 3;
+/// Output payload prefixed by its absolute raw-log offset (u64 BE).
+pub const S_OUTPUT_OFFSET: u8 = 4;
+/// Protocol-v1 attach handshake completed.
+pub const S_READY: u8 = 5;
+/// Fatal attach/session error; UTF-8 message payload.
+pub const S_ERROR: u8 = 6;
 // client → server
 pub const C_INPUT: u8 = 1;
 pub const C_RESIZE: u8 = 2;
@@ -95,7 +101,7 @@ pub fn exit_payload(info: Option<ExitInfo>) -> Vec<u8> {
     p
 }
 
-fn parse_exit(payload: &[u8]) -> i32 {
+pub(crate) fn parse_exit(payload: &[u8]) -> i32 {
     if payload.len() == 5 {
         i32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]])
     } else {
@@ -103,7 +109,7 @@ fn parse_exit(payload: &[u8]) -> i32 {
     }
 }
 
-fn resize_payload(cols: u16, rows: u16) -> Vec<u8> {
+pub(crate) fn resize_payload(cols: u16, rows: u16) -> Vec<u8> {
     let mut p = Vec::with_capacity(4);
     p.extend_from_slice(&cols.to_be_bytes());
     p.extend_from_slice(&rows.to_be_bytes());
@@ -160,7 +166,7 @@ pub async fn attach_to(bs: &Babysit, id: String) -> Result<i32> {
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut stream = stream;
-    let hello = format!("{{\"op\":\"attach\",\"cols\":{cols},\"rows\":{rows}}}\n");
+    let hello = format!("{{\"op\":\"attach\",\"cols\":{cols},\"rows\":{rows},\"protocol\":1}}\n");
     stream.write_all(hello.as_bytes()).await?;
     stream.flush().await?;
 
@@ -215,6 +221,15 @@ pub async fn attach_to(bs: &Babysit, id: String) -> Result<i32> {
                     let _ = out.write_all(&payload);
                     let _ = out.flush();
                 }
+                Ok(Some((S_OUTPUT_OFFSET, payload))) if payload.len() >= 8 => {
+                    use std::io::Write as _;
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&payload[8..]);
+                    let _ = out.flush();
+                }
+                Ok(Some((S_ERROR, payload))) => {
+                    return Err(anyhow!("attach failed: {}", String::from_utf8_lossy(&payload)));
+                }
                 Ok(Some((S_EXIT, payload))) => { exit_code = parse_exit(&payload); break; }
                 Ok(Some((S_DETACHED, _))) => { exit_code = 0; restore_terminal = true; break; }
                 Ok(Some(_)) => {}
@@ -265,7 +280,7 @@ pub async fn attach_to(bs: &Babysit, id: String) -> Result<i32> {
 /// return to would be left in alt-screen / mouse / bracketed-paste /
 /// enhanced-keyboard mode. Emit a best-effort cleanup, like tmux does on
 /// detach. Harmless if the program hadn't enabled these.
-fn restore_terminal_modes() {
+pub(crate) fn restore_terminal_modes() {
     use std::io::Write as _;
     // exit alt screens; show cursor; disable mouse (1000/1002/1003/1006/1015);
     // disable bracketed paste (2004) and focus reporting (1004); pop the kitty
@@ -279,7 +294,7 @@ fn restore_terminal_modes() {
 /// Connect to the worker's socket, retrying briefly while it binds. Returns
 /// `Ok(None)` if the session has already reached a terminal state (so the
 /// caller should fall back to the on-disk log + status).
-async fn connect_retry(bs: &Babysit, id: &str) -> Result<Option<UnixStream>> {
+pub(crate) async fn connect_retry(bs: &Babysit, id: &str) -> Result<Option<UnixStream>> {
     let paths = [
         bs.control_socket_path(id),
         bs.legacy_control_socket_path(id),
@@ -342,7 +357,7 @@ async fn fallback_finished(bs: &Babysit, id: &str) -> Result<i32> {
 /// press/release events such as `ESC [ 92 ; 5 u` and `ESC [ 92 ; 5 : 3 u`.
 /// xterm's modifyOtherKeys form is accepted as well.
 #[derive(Default)]
-struct DetachFilter {
+pub(crate) struct DetachFilter {
     /// The first detach press and any repeat/release events belonging to it.
     withheld: Vec<u8>,
     /// A possibly incomplete CSI sequence split across stdin reads.
@@ -356,7 +371,7 @@ enum DetachEvent {
 }
 
 impl DetachFilter {
-    fn push(&mut self, chunk: &[u8]) -> (Vec<u8>, bool) {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> (Vec<u8>, bool) {
         let mut out = Vec::with_capacity(self.withheld.len() + chunk.len());
 
         for &byte in chunk {
@@ -381,11 +396,16 @@ impl DetachFilter {
         (out, false)
     }
 
-    fn has_partial_escape(&self) -> bool {
+    pub(crate) fn has_partial_escape(&self) -> bool {
         !self.escape.is_empty()
     }
 
-    fn flush_partial_escape(&mut self) -> Vec<u8> {
+    pub(crate) fn discard_pending(&mut self) {
+        self.withheld.clear();
+        self.escape.clear();
+    }
+
+    pub(crate) fn flush_partial_escape(&mut self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.withheld.len() + self.escape.len());
         let sequence = std::mem::take(&mut self.escape);
         self.handle_other(&sequence, &mut out);
@@ -481,10 +501,10 @@ fn parse_decimal(bytes: &[u8]) -> Option<u16> {
 }
 
 /// RAII guard that puts the terminal in raw mode and restores it on drop.
-struct RawGuard;
+pub(crate) struct RawGuard;
 
 impl RawGuard {
-    fn enter() -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         enable_raw_mode()?;
         Ok(Self)
     }

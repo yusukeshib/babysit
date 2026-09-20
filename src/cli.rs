@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
     arg_required_else_help = true,
 )]
 pub struct Cli {
+    /// Run on an SSH destination (user@host or SSH config alias; default: local)
+    #[arg(long, global = true, default_value = "local", value_name = "HOST")]
+    pub host: String,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -85,6 +89,15 @@ pub struct SessionSel {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Internal: report remote transport compatibility
+    #[command(name = "__remote-info", hide = true)]
+    RemoteInfo,
+    /// Internal: bridge stdin/stdout to a session control socket
+    #[command(name = "__remote-bridge", hide = true)]
+    RemoteBridge {
+        #[command(flatten)]
+        sel: SessionSel,
+    },
     /// Wrap a shell command in a PTY and expose it via the other subcommands
     Run {
         /// Session id to assign (default: auto-generated). Must be unique;
@@ -365,6 +378,9 @@ pub enum Command {
     Attach {
         #[command(flatten)]
         sel: SessionSel,
+        /// Return if the SSH transport drops instead of reconnecting
+        #[arg(long)]
+        no_reconnect: bool,
     },
     /// Detach any terminal currently attached to a session
     Detach {

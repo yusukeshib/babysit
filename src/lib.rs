@@ -16,6 +16,7 @@ pub mod cli;
 pub mod control;
 pub mod pane;
 pub mod paths;
+pub mod remote;
 pub mod render;
 pub mod run;
 pub mod session;

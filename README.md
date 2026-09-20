@@ -36,6 +36,34 @@ change the root. `status`, `log`, and `screenshot` work after the worker exits;
 `-s <id>` selects a session; there is no "most recent" fallback. Inside the
 wrapped command the id is exported as `$BABYSIT_SESSION_ID`.
 
+## Remote hosts over SSH
+
+Pass an OpenSSH destination directly to global `--host`:
+
+```console
+$ babysit --host user@devbox run -- pi
+$ babysit --host user@devbox list
+$ babysit --host user@devbox attach -s ab12
+```
+
+SSH config aliases work too, so `--host dev` uses the `Host dev` entry from
+`~/.ssh/config` (including its user, port, ProxyJump, and keys). The remote host
+must already have a compatible `babysit` in its non-interactive PATH.
+
+A foreground remote `run` starts one detached worker on the remote machine and
+then attaches to it. If SSH drops after attachment, babysit reconnects to the
+same session automatically and resumes from the last raw-log byte, so the same
+process and PTY continue without duplicated output. Input typed while offline
+is discarded. Detach at any time with `Ctrl-\ Ctrl-\`, including while
+reconnecting; pass `attach --no-reconnect` to make a transport loss fatal.
+Sessions using `run --view-cmd` have a transformed stream without stable raw
+byte offsets, so their remote attach returns an error after transport loss
+instead of replaying duplicate output. `run -d` starts the remote worker without
+attaching.
+
+`--host local` is the default and runs directly without SSH. Any other value is
+passed to `ssh` as its destination. The embedding API remains local-only.
+
 ## Library use (embedding)
 
 babysit is also a library. Everything is reached through a `Babysit` context — an

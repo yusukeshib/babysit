@@ -3,8 +3,8 @@
 //! [`Babysit`] context (the ONE place the environment is consulted, via
 //! `from_env`), and routes each subcommand to a method on it.
 
-use anyhow::Result;
-use babysit::{Babysit, attach, cli};
+use anyhow::{Context, Result, bail};
+use babysit::{Babysit, attach, cli, remote, session};
 use clap::Parser;
 
 #[tokio::main]
@@ -47,6 +47,112 @@ async fn main() -> Result<()> {
     }
 
     let cli = cli::Cli::parse();
+
+    if matches!(cli.command, cli::Command::RemoteInfo) {
+        return remote::print_info();
+    }
+
+    // Route non-local operational commands over SSH. The remote worker itself
+    // is invoked without --host and therefore uses its own local state root.
+    if cli.host != "local" {
+        let host = cli.host.clone();
+        match cli.command {
+            cli::Command::Run {
+                id,
+                detach,
+                detached_id,
+                root,
+                no_tty,
+                timeout,
+                idle_timeout,
+                size,
+                view_cmd,
+                json,
+                cmd,
+            } => {
+                if detached_id.is_some() || root.is_some() {
+                    bail!("internal worker flags cannot be routed remotely");
+                }
+                if !detach {
+                    remote::verify(&host).await?;
+                }
+                let generated = id.is_none();
+                let id =
+                    id.unwrap_or_else(|| format!("{}{}", session::new_id(), session::new_id()));
+                let mut args = vec![
+                    "run".into(),
+                    "--id".into(),
+                    id.clone(),
+                    "--detach".into(),
+                    "--json".into(),
+                ];
+                if no_tty {
+                    args.push("--no-tty".into());
+                }
+                if let Some(value) = timeout {
+                    args.extend(["--timeout".into(), value]);
+                }
+                if let Some(value) = idle_timeout {
+                    args.extend(["--idle-timeout".into(), value]);
+                }
+                if let Some(value) = size {
+                    args.extend(["--size".into(), value]);
+                }
+                if let Some(value) = view_cmd {
+                    args.extend(["--view-cmd".into(), value]);
+                }
+                args.push("--".into());
+                args.extend(cmd.clone());
+                let output = remote::capture(&host, &args).await?;
+                let created = if output.status.success() {
+                    true
+                } else if generated && output.status.code() == Some(255) {
+                    remote::confirm_session(&host, &id).await?
+                } else {
+                    false
+                };
+                if !created {
+                    let detail = String::from_utf8_lossy(&output.stderr);
+                    if output.status.code() == Some(255) {
+                        bail!(
+                            "remote run outcome is unknown for session `{id}`; check with `babysit --host {} status -s {id}`\n{}",
+                            host,
+                            detail.trim()
+                        );
+                    }
+                    bail!("remote run failed ({}): {}", output.status, detail.trim());
+                }
+                if json {
+                    println!("{}", serde_json::json!({"id": id}));
+                } else {
+                    eprintln!("babysit: [{}] session {}: {}", host, id, cmd.join(" "));
+                }
+                if detach {
+                    std::process::exit(0);
+                }
+                let code = remote::attach(&host, id, true).await?;
+                std::process::exit(code);
+            }
+            cli::Command::Attach { sel, no_reconnect } => {
+                let id = sel
+                    .session
+                    .or_else(|| std::env::var("BABYSIT_SESSION_ID").ok())
+                    .context("remote attach requires --session <ID>")?;
+                let code = remote::attach(&host, id, !no_reconnect).await?;
+                std::process::exit(code);
+            }
+            cli::Command::Config { .. }
+            | cli::Command::RemoteInfo
+            | cli::Command::RemoteBridge { .. } => {
+                bail!("this command cannot be routed with --host");
+            }
+            _ => {
+                let args = remote::strip_host_args(&raw[1..])?;
+                let code = remote::proxy(&host, &args).await?;
+                std::process::exit(code);
+            }
+        }
+    }
 
     // Build the context once. The detached worker re-exec carries its root
     // explicitly via `--root` so it never depends on inherited env; every other
@@ -163,7 +269,10 @@ async fn main() -> Result<()> {
             let code = bs.wait(sel.session, timeout).await?;
             std::process::exit(code);
         }
-        cli::Command::Attach { sel } => {
+        cli::Command::Attach {
+            sel,
+            no_reconnect: _,
+        } => {
             let code = attach::attach(&bs, sel.session).await?;
             std::process::exit(code);
         }
@@ -188,5 +297,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        cli::Command::RemoteBridge { sel } => remote::bridge(&bs, sel.session).await,
+        cli::Command::RemoteInfo => unreachable!(),
     }
 }
