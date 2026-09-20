@@ -12,8 +12,10 @@
 //!
 //! The connection closes after the response.
 
-use crate::attach::{self, C_INPUT, C_RESIZE, S_DETACHED, S_EXIT, S_OUTPUT};
-use crate::pane::{ExitInfo, OutputHub, Pane};
+use crate::attach::{
+    self, C_INPUT, C_RESIZE, S_DETACHED, S_EXIT, S_OUTPUT, S_OUTPUT_OFFSET, S_READY,
+};
+use crate::pane::{ExitInfo, OutputChunk, OutputHub, Pane};
 use crate::paths::Babysit;
 use crate::session;
 use anyhow::{Context, Result, anyhow};
@@ -23,7 +25,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
@@ -68,6 +70,12 @@ pub enum Request {
         cols: u16,
         #[serde(default)]
         rows: u16,
+        /// Raw output byte offset to resume from.
+        #[serde(default)]
+        since: Option<u64>,
+        /// Attach stream protocol. Version 1 adds offset-bearing output frames.
+        #[serde(default)]
+        protocol: u8,
     },
     /// Detach any currently-attached clients, leaving the command running.
     Detach,
@@ -297,8 +305,14 @@ async fn handle_conn(stream: UnixStream, handle: Handle) -> Result<()> {
 
     // Attach upgrades the connection to the frame protocol; it never sends a
     // JSON response, so it's handled before the one-shot path.
-    if let Request::Attach { cols, rows } = req {
-        return handle_attach(br.into_inner(), wr, handle, cols, rows).await;
+    if let Request::Attach {
+        cols,
+        rows,
+        since,
+        protocol,
+    } = req
+    {
+        return handle_attach(br.into_inner(), wr, handle, cols, rows, since, protocol).await;
     }
 
     let is_kill = matches!(req, Request::Kill);
@@ -454,6 +468,8 @@ async fn handle_attach(
     handle: Handle,
     cols: u16,
     rows: u16,
+    since: Option<u64>,
+    protocol: u8,
 ) -> Result<()> {
     // Track this client so worker shutdown can wait for it to drain.
     handle.attached.fetch_add(1, Ordering::SeqCst);
@@ -480,25 +496,78 @@ async fn handle_attach(
     let mut exit_rx = handle.exit_rx.clone();
     let already_exited = exit_rx.borrow().is_some();
 
-    // Subscribe lazily via a closure so the hub subscription only happens
-    // once the formatter has actually spawned. If `spawn_view_filter` failed
-    // eagerly (before subscribing) it would leave a dead sender parked in
-    // `hub.clients` until the next broadcast — which may never come once the
-    // session has exited, leaking across repeated attaches with a broken
-    // `--view-cmd`.
-    let (mut output, view_child) = match handle.view_cmd.as_deref() {
-        Some(cmd) if !cmd.trim().is_empty() => {
+    enum AttachOutput {
+        Legacy(Vec<u8>),
+        Offset(OutputChunk),
+    }
+
+    // View filters transform raw bytes, so they use the legacy non-resumable
+    // stream. Raw protocol-v1 clients receive exact offsets and can reconnect
+    // without duplicating output.
+    let (output_tx, mut output) = mpsc::unbounded_channel::<AttachOutput>();
+    let mut view_child = None;
+    let has_view_cmd = handle
+        .view_cmd
+        .as_deref()
+        .is_some_and(|cmd| !cmd.trim().is_empty());
+    if has_view_cmd {
+        let cmd = handle.view_cmd.as_deref().unwrap();
+        let (mut legacy, child) =
             match spawn_view_filter(|| handle.hub.subscribe(), cmd, already_exited) {
                 Ok((rx, guard)) => (rx, Some(guard)),
                 Err(_) => (handle.hub.subscribe(), None),
+            };
+        view_child = child;
+        tokio::spawn(async move {
+            while let Some(bytes) = legacy.recv().await {
+                if output_tx.send(AttachOutput::Legacy(bytes)).is_err() {
+                    break;
+                }
             }
+        });
+    } else if protocol >= 1 {
+        let subscription = handle.hub.subscribe_resumable(since)?;
+        if let Some(offset) = since {
+            if offset < subscription.snapshot_end {
+                let bytes = read_log_range(
+                    &handle.bs.output_log_path(&handle.session_id),
+                    offset,
+                    subscription.snapshot_end,
+                )
+                .await?;
+                let _ = output_tx.send(AttachOutput::Offset(OutputChunk {
+                    offset,
+                    data: bytes,
+                }));
+            }
+        } else if let Some(backlog) = subscription.backlog {
+            let _ = output_tx.send(AttachOutput::Offset(backlog));
         }
-        _ => (handle.hub.subscribe(), None),
-    };
-    // Whether output is routed through a formatter. The already-exited EXIT
-    // fast-path below only holds for the raw hub stream, not the formatted one.
+        let mut live = subscription.output;
+        tokio::spawn(async move {
+            while let Some(chunk) = live.recv().await {
+                if output_tx.send(AttachOutput::Offset(chunk)).is_err() {
+                    break;
+                }
+            }
+        });
+    } else {
+        let mut legacy = handle.hub.subscribe();
+        tokio::spawn(async move {
+            while let Some(bytes) = legacy.recv().await {
+                if output_tx.send(AttachOutput::Legacy(bytes)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // The already-exited EXIT fast-path only holds for a raw stream, not a
+    // formatter which may still buffer output after its input closes.
     let has_view = view_child.is_some();
     let mut detach_rx = handle.detach_tx.subscribe();
+    if protocol >= 1 {
+        attach::write_frame(&mut wr, S_READY, &[]).await?;
+    }
 
     // Grace period bounding the already-exited + `--view-cmd` drain. A
     // cooperative formatter exits on stdin EOF, closing stdout so
@@ -563,8 +632,16 @@ async fn handle_attach(
             // Drain queued output (backlog + live) before honoring exit, so
             // the client never loses the tail.
             data = output.recv() => match data {
-                Some(bytes) => {
+                Some(AttachOutput::Legacy(bytes)) => {
                     if attach::write_frame(&mut wr, S_OUTPUT, &bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Some(AttachOutput::Offset(chunk)) => {
+                    let mut payload = Vec::with_capacity(8 + chunk.data.len());
+                    payload.extend_from_slice(&chunk.offset.to_be_bytes());
+                    payload.extend_from_slice(&chunk.data);
+                    if attach::write_frame(&mut wr, S_OUTPUT_OFFSET, &payload).await.is_err() {
                         break;
                     }
                 }
@@ -752,6 +829,25 @@ fn spawn_view_filter(
             pumps: [feed, drain],
         },
     ))
+}
+
+async fn read_log_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
+    use std::io::SeekFrom;
+    if end < start {
+        return Err(anyhow!("invalid output range {start}..{end}"));
+    }
+    let len: usize = (end - start)
+        .try_into()
+        .context("output range is too large")?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.seek(SeekFrom::Start(start)).await?;
+    let mut bytes = vec![0; len];
+    file.read_exact(&mut bytes)
+        .await
+        .with_context(|| format!("reading output range {start}..{end}"))?;
+    Ok(bytes)
 }
 
 async fn read_log(path: &Path, tail: Option<usize>, raw: bool) -> Result<serde_json::Value> {

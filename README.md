@@ -36,6 +36,35 @@ change the root. `status`, `log`, and `screenshot` work after the worker exits;
 `-s <id>` selects a session; there is no "most recent" fallback. Inside the
 wrapped command the id is exported as `$BABYSIT_SESSION_ID`.
 
+## Remote machines over SSH
+
+Save an SSH target, then use the same session commands with global `--host`:
+
+```console
+$ babysit machine add dev user@devbox
+$ babysit --host dev run -- pi
+$ babysit --host dev list
+$ babysit --host dev attach -s ab12
+```
+
+The remote machine must already have a compatible `babysit` in the PATH. Use
+`machine add ... --remote-command /path/to/babysit` when it is elsewhere.
+SSH authentication, aliases, ports, ProxyJump, and keys come from your normal
+`~/.ssh/config`.
+
+A foreground remote `run` starts one detached worker on the remote machine and
+then attaches to it. If SSH drops after attachment, babysit reconnects to the
+same session automatically and resumes from the last raw-log byte, so the same
+process and PTY continue without duplicated output. Input typed while offline
+is discarded. Detach at any time with `Ctrl-\ Ctrl-\`, including while
+reconnecting; pass `attach --no-reconnect` to make a transport loss fatal.
+`run -d` starts the remote worker without attaching.
+
+`--host local` is the default. `machine remove` removes only the local profile;
+it never stops remote sessions. Profiles live in
+`$XDG_CONFIG_HOME/babysit/machines.json` (override the file with
+`$BABYSIT_CONFIG`). The embedding API remains local-only.
+
 ## Library use (embedding)
 
 babysit is also a library. Everything is reached through a `Babysit` context — an
@@ -92,6 +121,7 @@ Run without installing: `nix run github:yusukeshib/babysit -- -- make local-ci`.
 
 | Command | Description |
 | --- | --- |
+| `machine` | Add, list, or remove saved SSH machines |
 | `run` | Wrap a command in a PTY (`babysit -- <cmd>` shorthand; `-d` detached; `--json` prints the id) |
 | `list` (`ls`) | List sessions |
 | `status` | Session state and exit code |

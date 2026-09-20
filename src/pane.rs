@@ -11,9 +11,9 @@ use crate::cli::ShotFormat;
 use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,10 +33,26 @@ pub struct OutputHub {
     inner: Mutex<HubInner>,
 }
 
+#[derive(Clone, Debug)]
+pub struct OutputChunk {
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+pub struct ResumeSubscription {
+    pub output: UnboundedReceiver<OutputChunk>,
+    pub snapshot_end: u64,
+    pub backlog: Option<OutputChunk>,
+}
+
 #[derive(Default)]
 struct HubInner {
     backlog: VecDeque<u8>,
+    backlog_start: u64,
+    next_offset: u64,
+    log: Option<File>,
     clients: Vec<UnboundedSender<Vec<u8>>>,
+    resume_clients: Vec<UnboundedSender<OutputChunk>>,
 }
 
 impl OutputHub {
@@ -44,25 +60,53 @@ impl OutputHub {
         Arc::new(Self::default())
     }
 
-    /// Append a chunk to the backlog and push it to every attached client,
-    /// dropping any client whose receiver has gone away.
+    /// Configure the append-only log once. All output readers write through
+    /// the hub so pipe-mode stdout/stderr have one total order and offsets map
+    /// exactly to bytes in the persisted log.
+    pub fn configure_log(&self, path: &Path) -> std::io::Result<()> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::other("output hub poisoned"))?;
+        if g.log.is_none() {
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            g.next_offset = file.metadata()?.len();
+            g.backlog_start = g.next_offset;
+            g.log = Some(file);
+        }
+        Ok(())
+    }
+
+    /// Append a chunk to the log/backlog and push it to every attached client.
     pub fn broadcast(&self, data: &[u8]) {
         let Ok(mut g) = self.inner.lock() else {
             return;
         };
+        if let Some(log) = g.log.as_mut() {
+            let _ = log.write_all(data);
+        }
+        let offset = g.next_offset;
+        g.next_offset = g.next_offset.saturating_add(data.len() as u64);
         g.backlog.extend(data);
         let overflow = g.backlog.len().saturating_sub(BACKLOG_CAP);
         if overflow > 0 {
             g.backlog.drain(..overflow);
+            g.backlog_start = g.backlog_start.saturating_add(overflow as u64);
         }
         if !g.clients.is_empty() {
-            let chunk = data.to_vec();
-            g.clients.retain(|tx| tx.send(chunk.clone()).is_ok());
+            let bytes = data.to_vec();
+            g.clients.retain(|tx| tx.send(bytes.clone()).is_ok());
+        }
+        if !g.resume_clients.is_empty() {
+            let chunk = OutputChunk {
+                offset,
+                data: data.to_vec(),
+            };
+            g.resume_clients.retain(|tx| tx.send(chunk.clone()).is_ok());
         }
     }
 
-    /// Register a client. Returns a receiver that first yields the current
-    /// backlog (if any), then live output.
+    /// Register a legacy client. It receives bounded backlog then live bytes.
     pub fn subscribe(&self) -> UnboundedReceiver<Vec<u8>> {
         let (tx, rx) = unbounded_channel();
         if let Ok(mut g) = self.inner.lock() {
@@ -73,6 +117,36 @@ impl OutputHub {
             g.clients.push(tx);
         }
         rx
+    }
+
+    /// Atomically capture the current end and subscribe to subsequent chunks.
+    /// A fresh client also receives the bounded backlog with its true offset;
+    /// resumed clients replay the older range from output.log before draining
+    /// the queued live receiver.
+    pub fn subscribe_resumable(&self, since: Option<u64>) -> Result<ResumeSubscription> {
+        let (tx, rx) = unbounded_channel();
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("output hub poisoned"))?;
+        if since.is_some_and(|offset| offset > g.next_offset) {
+            anyhow::bail!("resume offset is beyond output end");
+        }
+        let backlog = if since.is_none() && !g.backlog.is_empty() {
+            Some(OutputChunk {
+                offset: g.backlog_start,
+                data: g.backlog.iter().copied().collect(),
+            })
+        } else {
+            None
+        };
+        let snapshot_end = g.next_offset;
+        g.resume_clients.push(tx);
+        Ok(ResumeSubscription {
+            output: rx,
+            snapshot_end,
+            backlog,
+        })
     }
 }
 
@@ -237,7 +311,10 @@ impl Pane {
         let exit_status: Arc<Mutex<Option<ExitInfo>>> = Arc::new(Mutex::new(None));
         let exit_notify = Arc::new(tokio::sync::Notify::new());
         let reader_done = Arc::new(tokio::sync::Notify::new());
-        let log_path: Option<PathBuf> = output_log.map(|p| p.to_path_buf());
+        if let Some(path) = output_log {
+            hub.configure_log(path)
+                .with_context(|| format!("opening output log {}", path.display()))?;
+        }
         // Virtual terminal sized to the PTY (no scrollback: a screenshot is a
         // single visible frame). Kept in sync with the PTY via `resize`.
         let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
@@ -254,7 +331,6 @@ impl Pane {
         for reader in readers {
             spawn_output_reader(
                 reader,
-                log_path.clone(),
                 hub.clone(),
                 screen.clone(),
                 activity.clone(),
@@ -447,7 +523,6 @@ fn signal_process_group(pid: u32, signal: nix::sys::signal::Signal) -> Result<()
 /// `reader_done` so shutdown can wait for the final bytes.
 fn spawn_output_reader(
     mut reader: Box<dyn Read + Send>,
-    log_path: Option<PathBuf>,
     hub: Arc<OutputHub>,
     screen: Arc<Mutex<vt100::Parser>>,
     activity: Arc<Activity>,
@@ -455,10 +530,6 @@ fn spawn_output_reader(
     reader_done: Arc<tokio::sync::Notify>,
 ) {
     thread::spawn(move || {
-        // O_APPEND makes concurrent appends (stdout + stderr) safe without a
-        // shared lock.
-        let mut log_file =
-            log_path.and_then(|p| OpenOptions::new().create(true).append(true).open(&p).ok());
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
@@ -470,9 +541,6 @@ fn spawn_output_reader(
                         p.process(&buf[..n]);
                     }
                     hub.broadcast(&buf[..n]);
-                    if let Some(f) = log_file.as_mut() {
-                        let _ = f.write_all(&buf[..n]);
-                    }
                 }
                 Err(_) => break,
             }
@@ -483,4 +551,37 @@ fn spawn_output_reader(
             reader_done.notify_one();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resumable_subscription_uses_persisted_offsets_then_live_chunks() {
+        let path = std::env::temp_dir().join(format!(
+            "babysit-output-hub-{}-{}.log",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let hub = OutputHub::new();
+        hub.configure_log(&path).unwrap();
+        hub.broadcast(b"abc");
+        let mut resumed = hub.subscribe_resumable(Some(1)).unwrap();
+        assert_eq!(resumed.snapshot_end, 3);
+        assert!(resumed.backlog.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+
+        hub.broadcast(b"de");
+        let live = resumed.output.recv().await.unwrap();
+        assert_eq!(live.offset, 3);
+        assert_eq!(live.data, b"de");
+
+        let fresh = hub.subscribe_resumable(None).unwrap();
+        let backlog = fresh.backlog.unwrap();
+        assert_eq!(backlog.offset, 0);
+        assert_eq!(backlog.data, b"abcde");
+        assert!(hub.subscribe_resumable(Some(6)).is_err());
+        let _ = std::fs::remove_file(path);
+    }
 }
