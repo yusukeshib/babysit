@@ -527,6 +527,7 @@ async fn handle_attach(
     // without duplicating output. Keep the hub receiver directly in this task:
     // an intermediate forwarding task could race EXIT and drop final chunks.
     let mut pending = std::collections::VecDeque::<AttachOutput>::new();
+    let mut ready_sent = false;
     let mut view_child = None;
     let has_view_cmd = handle
         .view_cmd
@@ -552,24 +553,19 @@ async fn handle_attach(
         };
         if let Some(offset) = since {
             if offset < subscription.snapshot_end {
-                let bytes = match read_log_range(
+                attach::write_frame(&mut wr, S_READY, &[]).await?;
+                ready_sent = true;
+                if let Err(error) = write_log_range_frames(
+                    &mut wr,
                     &handle.bs.output_log_path(&handle.session_id),
                     offset,
                     subscription.snapshot_end,
                 )
                 .await
                 {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        attach::write_frame(&mut wr, S_READY, &[]).await?;
-                        attach::write_frame(&mut wr, S_ERROR, error.to_string().as_bytes()).await?;
-                        return Ok(());
-                    }
-                };
-                pending.push_back(AttachOutput::Offset(OutputChunk {
-                    offset,
-                    data: bytes,
-                }));
+                    attach::write_frame(&mut wr, S_ERROR, error.to_string().as_bytes()).await?;
+                    return Ok(());
+                }
             }
         } else if let Some(backlog) = subscription.backlog {
             pending.push_back(AttachOutput::Offset(backlog));
@@ -582,7 +578,7 @@ async fn handle_attach(
     // formatter which may still buffer output after its input closes.
     let has_view = view_child.is_some();
     let mut detach_rx = handle.detach_tx.subscribe();
-    if protocol >= 1 {
+    if protocol >= 1 && !ready_sent {
         attach::write_frame(&mut wr, S_READY, &[]).await?;
     }
 
@@ -853,23 +849,39 @@ fn spawn_view_filter(
     ))
 }
 
-async fn read_log_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
-    use std::io::SeekFrom;
+async fn write_log_range_frames<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    path: &Path,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    use std::io::{ErrorKind, SeekFrom};
     if end < start {
         return Err(anyhow!("invalid output range {start}..{end}"));
     }
-    let len: usize = (end - start)
-        .try_into()
-        .context("output range is too large")?;
     let mut file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("opening {}", path.display()))?;
     file.seek(SeekFrom::Start(start)).await?;
-    let mut bytes = vec![0; len];
-    file.read_exact(&mut bytes)
-        .await
-        .with_context(|| format!("reading output range {start}..{end}"))?;
-    Ok(bytes)
+    let mut offset = start;
+    let mut buffer = vec![0; 64 * 1024];
+    while offset < end {
+        let wanted = usize::try_from((end - offset).min(buffer.len() as u64)).unwrap();
+        let read = file.read(&mut buffer[..wanted]).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("output log ended before offset {end}"),
+            )
+            .into());
+        }
+        let mut payload = Vec::with_capacity(8 + read);
+        payload.extend_from_slice(&offset.to_be_bytes());
+        payload.extend_from_slice(&buffer[..read]);
+        attach::write_frame(writer, S_OUTPUT_OFFSET, &payload).await?;
+        offset += read as u64;
+    }
+    Ok(())
 }
 
 async fn read_log(path: &Path, tail: Option<usize>, raw: bool) -> Result<serde_json::Value> {
@@ -929,8 +941,10 @@ pub fn cleanup(bs: &Babysit, session_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_private_dir, last_n_lines, secure_socket, spawn_view_filter};
-    use crate::paths::Babysit;
+    use super::{
+        ensure_private_dir, last_n_lines, secure_socket, spawn_view_filter, write_log_range_frames,
+    };
+    use crate::{attach, paths::Babysit};
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
     use tokio::sync::mpsc;
@@ -956,6 +970,44 @@ mod tests {
             0o600
         );
         drop(listener);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn resumed_log_ranges_are_streamed_in_bounded_frames() {
+        let path = std::env::temp_dir().join(format!(
+            "babysit-resume-range-{}-{}.log",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let expected: Vec<u8> = (0..200_000).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&path, &expected).unwrap();
+        let (mut reader, mut writer) = tokio::io::duplex(1024);
+        let write_path = path.clone();
+        let sender = tokio::spawn(async move {
+            write_log_range_frames(&mut writer, &write_path, 0, 200_000)
+                .await
+                .unwrap();
+        });
+
+        let mut actual = Vec::new();
+        let mut expected_offset = 0_u64;
+        let mut frames = 0;
+        while actual.len() < expected.len() {
+            let (tag, payload) = attach::read_frame(&mut reader).await.unwrap().unwrap();
+            assert_eq!(tag, attach::S_OUTPUT_OFFSET);
+            let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
+            assert_eq!(offset, expected_offset);
+            actual.extend_from_slice(&payload[8..]);
+            expected_offset = actual.len() as u64;
+            frames += 1;
+        }
+        sender.await.unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            frames >= 4,
+            "large ranges should not be one allocation/frame"
+        );
         let _ = std::fs::remove_file(path);
     }
 

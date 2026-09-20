@@ -344,8 +344,15 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 established_once = true;
                 cleanup.0 = true;
                 delay = Duration::from_millis(250);
-                // Input typed while disconnected/authenticating is intentionally
-                // discarded and must not leak into the resumed program.
+                // The ready frame can win select while stdin chunks are already
+                // queued. Drain them too: nothing typed before readiness may
+                // leak into the resumed program, but detach must still work.
+                if discard_queued_input(&mut stdin_rx, &mut filter) {
+                    let _ = child.kill().await;
+                    attach::restore_terminal_modes();
+                    cleanup.0 = false;
+                    return Ok(0);
+                }
                 filter.discard_pending();
             }
             Ok(Ok(2)) => {
@@ -505,6 +512,19 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
     }
 }
 
+fn discard_queued_input(
+    stdin_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    filter: &mut DetachFilter,
+) -> bool {
+    while let Ok(bytes) = stdin_rx.try_recv() {
+        let (_, detach) = filter.push(&bytes);
+        if detach {
+            return true;
+        }
+    }
+    false
+}
+
 fn reconnect_notice(host: &str, delay: Duration) {
     eprintln!(
         "\r\nbabysit: connection to {} lost; reconnecting in {:.2}s (detach: Ctrl-\\ Ctrl-\\)",
@@ -578,6 +598,21 @@ mod tests {
             "x".into(),
         ];
         assert_eq!(strip_host_args(&raw).unwrap(), vec!["status", "-s", "x"]);
+    }
+
+    #[test]
+    fn handshake_drain_discards_queued_input_and_honors_detach() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut filter = DetachFilter::default();
+        tx.send(b"offline input".to_vec()).unwrap();
+        assert!(!discard_queued_input(&mut rx, &mut filter));
+        filter.discard_pending();
+        let (forward, detached) = filter.push(b"x");
+        assert_eq!(forward, b"x");
+        assert!(!detached);
+
+        tx.send(vec![0x1c, 0x1c]).unwrap();
+        assert!(discard_queued_input(&mut rx, &mut filter));
     }
 
     #[tokio::test]
