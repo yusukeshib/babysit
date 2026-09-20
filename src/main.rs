@@ -4,7 +4,7 @@
 //! `from_env`), and routes each subcommand to a method on it.
 
 use anyhow::{Context, Result, bail};
-use babysit::{Babysit, attach, cli, machine, remote, session};
+use babysit::{Babysit, attach, cli, remote, session};
 use clap::Parser;
 
 #[tokio::main]
@@ -48,68 +48,14 @@ async fn main() -> Result<()> {
 
     let cli = cli::Cli::parse();
 
-    // Machine profiles and hidden SSH bridge commands are local control-plane
-    // operations. They are handled before constructing/routing a session context.
-    match &cli.command {
-        cli::Command::Machine { command } => {
-            if cli.host != "local" {
-                bail!("`machine` is local configuration; omit --host");
-            }
-            let store = machine::MachineStore::from_env()?;
-            match command {
-                cli::MachineCommand::Add {
-                    name,
-                    target,
-                    remote_command,
-                } => {
-                    let profile = machine::Machine {
-                        target: target.clone(),
-                        remote_command: remote_command.clone(),
-                    };
-                    machine::validate_name(name)?;
-                    machine::validate_machine(&profile)?;
-                    let info = remote::verify(&profile).await?;
-                    store.add(name.clone(), profile)?;
-                    println!(
-                        "added machine {name} (babysit {}, protocol {})",
-                        info.version, info.protocol
-                    );
-                }
-                cli::MachineCommand::List { json } => {
-                    let entries = store.list()?;
-                    if *json {
-                        let value: Vec<_> = entries
-                            .iter()
-                            .map(|(name, profile)| {
-                                serde_json::json!({
-                                    "name": name,
-                                    "target": profile.target,
-                                    "remote_command": profile.remote_command,
-                                })
-                            })
-                            .collect();
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        for (name, profile) in entries {
-                            println!("{name}\t{}\t{}", profile.target, profile.remote_command);
-                        }
-                    }
-                }
-                cli::MachineCommand::Remove { name } => {
-                    store.remove(name)?;
-                    println!("removed machine {name}");
-                }
-            }
-            return Ok(());
-        }
-        cli::Command::RemoteInfo => return remote::print_info(),
-        _ => {}
+    if matches!(cli.command, cli::Command::RemoteInfo) {
+        return remote::print_info();
     }
 
     // Route non-local operational commands over SSH. The remote worker itself
     // is invoked without --host and therefore uses its own local state root.
     if cli.host != "local" {
-        let profile = machine::MachineStore::from_env()?.get(&cli.host)?;
+        let host = cli.host.clone();
         match cli.command {
             cli::Command::Run {
                 id,
@@ -126,6 +72,9 @@ async fn main() -> Result<()> {
             } => {
                 if detached_id.is_some() || root.is_some() {
                     bail!("internal worker flags cannot be routed remotely");
+                }
+                if !detach {
+                    remote::verify(&host).await?;
                 }
                 let generated = id.is_none();
                 let id =
@@ -154,11 +103,11 @@ async fn main() -> Result<()> {
                 }
                 args.push("--".into());
                 args.extend(cmd.clone());
-                let output = remote::capture(&profile, &args).await?;
+                let output = remote::capture(&host, &args).await?;
                 let created = if output.status.success() {
                     true
                 } else if generated && output.status.code() == Some(255) {
-                    remote::confirm_session(&profile, &id).await?
+                    remote::confirm_session(&host, &id).await?
                 } else {
                     false
                 };
@@ -167,7 +116,7 @@ async fn main() -> Result<()> {
                     if output.status.code() == Some(255) {
                         bail!(
                             "remote run outcome is unknown for session `{id}`; check with `babysit --host {} status -s {id}`\n{}",
-                            cli.host,
+                            host,
                             detail.trim()
                         );
                     }
@@ -176,12 +125,12 @@ async fn main() -> Result<()> {
                 if json {
                     println!("{}", serde_json::json!({"id": id}));
                 } else {
-                    eprintln!("babysit: [{}] session {}: {}", cli.host, id, cmd.join(" "));
+                    eprintln!("babysit: [{}] session {}: {}", host, id, cmd.join(" "));
                 }
                 if detach {
                     std::process::exit(0);
                 }
-                let code = remote::attach(&profile, id, true).await?;
+                let code = remote::attach(&host, id, true).await?;
                 std::process::exit(code);
             }
             cli::Command::Attach { sel, no_reconnect } => {
@@ -189,18 +138,17 @@ async fn main() -> Result<()> {
                     .session
                     .or_else(|| std::env::var("BABYSIT_SESSION_ID").ok())
                     .context("remote attach requires --session <ID>")?;
-                let code = remote::attach(&profile, id, !no_reconnect).await?;
+                let code = remote::attach(&host, id, !no_reconnect).await?;
                 std::process::exit(code);
             }
             cli::Command::Config { .. }
-            | cli::Command::Machine { .. }
             | cli::Command::RemoteInfo
             | cli::Command::RemoteBridge { .. } => {
                 bail!("this command cannot be routed with --host");
             }
             _ => {
                 let args = remote::strip_host_args(&raw[1..])?;
-                let code = remote::proxy(&profile, &args).await?;
+                let code = remote::proxy(&host, &args).await?;
                 std::process::exit(code);
             }
         }
@@ -350,6 +298,6 @@ async fn main() -> Result<()> {
             Ok(())
         }
         cli::Command::RemoteBridge { sel } => remote::bridge(&bs, sel.session).await,
-        cli::Command::RemoteInfo | cli::Command::Machine { .. } => unreachable!(),
+        cli::Command::RemoteInfo => unreachable!(),
     }
 }

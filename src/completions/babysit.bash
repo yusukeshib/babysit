@@ -17,7 +17,7 @@ _babysit() {
 	local cur prev words cword
 	_init_completion || return
 
-	local subcommands="machine run list status log screenshot send key expect wait-idle wait resize flag unflag restart kill attach detach prune upgrade config help"
+	local subcommands="run list status log screenshot send key expect wait-idle wait resize flag unflag restart kill attach detach prune upgrade config help"
 
 	if [[ $cword -eq 1 ]]; then
 		COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -31,9 +31,6 @@ _babysit() {
 	fi
 
 	case "${words[1]}" in
-	machine)
-		COMPREPLY=($(compgen -W "add list remove --json --remote-command" -- "$cur"))
-		;;
 	run)
 		case "$cur" in
 		-*) COMPREPLY=($(compgen -W "--id --detach --no-tty --timeout --idle-timeout --size --json" -- "$cur")) ;;

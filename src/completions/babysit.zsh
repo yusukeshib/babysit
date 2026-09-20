@@ -50,7 +50,7 @@ _babysit() {
     typeset -A opt_args
 
     _arguments -C \
-        '--host=[Run on a saved SSH machine]:machine:' \
+        '--host=[Run on an SSH destination]:host:_hosts' \
         '1: :->subcmd' \
         '*:: :->args'
 
@@ -60,7 +60,6 @@ _babysit() {
             local -a subcmds
             # shellcheck disable=SC2034
             subcmds=(
-                'machine:Manage saved SSH machines'
                 'run:Wrap a shell command in a PTY'
                 'list:List all babysit sessions'
                 'status:Show status of a session'
@@ -138,11 +137,6 @@ _babysit() {
                     _arguments \
                         '--session[Session id]:session:__babysit_sessions' \
                         '--no-reconnect[Return instead of reconnecting after SSH loss]'
-                    ;;
-                machine)
-                    _arguments \
-                        '1:action:(add list remove)' \
-                        '*::arguments:_normal'
                     ;;
                 expect)
                     _arguments \

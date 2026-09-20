@@ -14,7 +14,6 @@
 pub mod attach;
 pub mod cli;
 pub mod control;
-pub mod machine;
 pub mod pane;
 pub mod paths;
 pub mod remote;

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
     arg_required_else_help = true,
 )]
 pub struct Cli {
-    /// Run the command on a saved SSH machine (default: this machine)
-    #[arg(long, global = true, default_value = "local", value_name = "NAME")]
+    /// Run on an SSH destination (user@host or SSH config alias; default: local)
+    #[arg(long, global = true, default_value = "local", value_name = "HOST")]
     pub host: String,
 
     #[command(subcommand)]
@@ -89,11 +89,6 @@ pub struct SessionSel {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Manage saved SSH machines
-    Machine {
-        #[command(subcommand)]
-        command: MachineCommand,
-    },
     /// Internal: report remote transport compatibility
     #[command(name = "__remote-info", hide = true)]
     RemoteInfo,
@@ -413,25 +408,6 @@ pub enum Command {
         #[arg(value_enum)]
         shell: Shell,
     },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum MachineCommand {
-    /// Save and verify an SSH machine
-    Add {
-        name: String,
-        target: String,
-        /// Remote babysit executable or path
-        #[arg(long, default_value = "babysit", value_name = "PATH")]
-        remote_command: String,
-    },
-    /// List saved SSH machines
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove a saved machine without touching its sessions
-    Remove { name: String },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]

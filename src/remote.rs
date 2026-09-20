@@ -3,7 +3,6 @@ use crate::attach::{
     S_OUTPUT_OFFSET, S_READY,
 };
 use crate::control::Request;
-use crate::machine::Machine;
 use crate::pane::ExitInfo;
 use crate::paths::Babysit;
 use crate::session::{self, State};
@@ -43,27 +42,35 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn remote_command(machine: &Machine, args: &[String]) -> String {
-    std::iter::once(machine.remote_command.as_str())
+fn remote_command(args: &[String]) -> String {
+    std::iter::once("babysit")
         .chain(args.iter().map(String::as_str))
         .map(shell_quote)
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn ssh_command(machine: &Machine, args: &[String]) -> Command {
+fn ssh_command(host: &str, args: &[String]) -> Result<Command> {
+    validate_host(host)?;
     let ssh = std::env::var_os("BABYSIT_SSH").unwrap_or_else(|| "ssh".into());
     let mut command = Command::new(ssh);
     command
         .arg("-T")
         .arg("--")
-        .arg(&machine.target)
-        .arg(remote_command(machine, args));
-    command
+        .arg(host)
+        .arg(remote_command(args));
+    Ok(command)
 }
 
-pub async fn verify(machine: &Machine) -> Result<RemoteInfo> {
-    let mut command = ssh_command(machine, &["__remote-info".into()]);
+fn validate_host(host: &str) -> Result<()> {
+    if host.is_empty() || host.starts_with('-') {
+        bail!("SSH host must be non-empty and must not begin with `-`");
+    }
+    Ok(())
+}
+
+pub async fn verify(host: &str) -> Result<RemoteInfo> {
+    let mut command = ssh_command(host, &["__remote-info".into()])?;
     command.stdin(Stdio::null()).kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(20), command.output())
         .await
@@ -88,8 +95,8 @@ pub async fn verify(machine: &Machine) -> Result<RemoteInfo> {
     Ok(info)
 }
 
-pub async fn proxy(machine: &Machine, args: &[String]) -> Result<i32> {
-    let status = ssh_command(machine, args)
+pub async fn proxy(host: &str, args: &[String]) -> Result<i32> {
+    let status = ssh_command(host, args)?
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -99,8 +106,8 @@ pub async fn proxy(machine: &Machine, args: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(255))
 }
 
-pub async fn capture(machine: &Machine, args: &[String]) -> Result<std::process::Output> {
-    ssh_command(machine, args)
+pub async fn capture(host: &str, args: &[String]) -> Result<std::process::Output> {
+    ssh_command(host, args)?
         .stdin(Stdio::null())
         .output()
         .await
@@ -109,10 +116,10 @@ pub async fn capture(machine: &Machine, args: &[String]) -> Result<std::process:
 
 /// After an ambiguous create transport failure, query the caller-chosen ID for
 /// a bounded period. This never retries `run`, so it cannot duplicate work.
-pub async fn confirm_session(machine: &Machine, id: &str) -> Result<bool> {
+pub async fn confirm_session(host: &str, id: &str) -> Result<bool> {
     for attempt in 0..10 {
         let output = capture(
-            machine,
+            host,
             &[
                 "status".into(),
                 "--session".into(),
@@ -240,11 +247,11 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
     }
 }
 
-fn spawn_bridge(machine: &Machine, id: &str) -> Result<Child> {
+fn spawn_bridge(host: &str, id: &str) -> Result<Child> {
     ssh_command(
-        machine,
+        host,
         &["__remote-bridge".into(), "--session".into(), id.into()],
-    )
+    )?
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::inherit())
@@ -253,7 +260,7 @@ fn spawn_bridge(machine: &Machine, id: &str) -> Result<Child> {
     .context("starting ssh attach bridge")
 }
 
-pub async fn attach(machine: &Machine, id: String, reconnect: bool) -> Result<i32> {
+pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
     struct TerminalCleanup(bool);
     impl Drop for TerminalCleanup {
         fn drop(&mut self) {
@@ -290,7 +297,7 @@ pub async fn attach(machine: &Machine, id: String, reconnect: bool) -> Result<i3
     let mut cleanup = TerminalCleanup(false);
 
     'reconnect: loop {
-        let mut child = spawn_bridge(machine, &id)?;
+        let mut child = spawn_bridge(host, &id)?;
         let mut child_in = child.stdin.take().context("ssh stdin unavailable")?;
         let child_out = child.stdout.take().context("ssh stdout unavailable")?;
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -347,7 +354,7 @@ pub async fn attach(machine: &Machine, id: String, reconnect: bool) -> Result<i3
                 if !reconnect {
                     bail!("remote attach transport disconnected");
                 }
-                reconnect_notice(machine, delay);
+                reconnect_notice(host, delay);
                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                     attach::restore_terminal_modes();
                     return Ok(0);
@@ -360,7 +367,7 @@ pub async fn attach(machine: &Machine, id: String, reconnect: bool) -> Result<i3
                 if !established_once || !reconnect {
                     return Err(error.into());
                 }
-                reconnect_notice(machine, delay);
+                reconnect_notice(host, delay);
                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                     attach::restore_terminal_modes();
                     return Ok(0);
@@ -376,7 +383,7 @@ pub async fn attach(machine: &Machine, id: String, reconnect: bool) -> Result<i3
                 if !reconnect {
                     bail!("remote attach transport timed out");
                 }
-                reconnect_notice(machine, delay);
+                reconnect_notice(host, delay);
                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                     attach::restore_terminal_modes();
                     return Ok(0);
@@ -426,7 +433,7 @@ pub async fn attach(machine: &Machine, id: String, reconnect: bool) -> Result<i3
                     Ok(None) | Err(_) => {
                         let _ = child.kill().await;
                         if !reconnect { bail!("remote attach transport disconnected"); }
-                        reconnect_notice(machine, delay);
+                        reconnect_notice(host, delay);
                         if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                             attach::restore_terminal_modes();
                             return Ok(0);
@@ -461,10 +468,10 @@ pub async fn attach(machine: &Machine, id: String, reconnect: bool) -> Result<i3
     }
 }
 
-fn reconnect_notice(machine: &Machine, delay: Duration) {
+fn reconnect_notice(host: &str, delay: Duration) {
     eprintln!(
         "\r\nbabysit: connection to {} lost; reconnecting in {:.2}s (detach: Ctrl-\\ Ctrl-\\)",
-        machine.target,
+        host,
         delay.as_secs_f32()
     );
 }
@@ -502,6 +509,14 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("hello world"), "'hello world'");
         assert_eq!(shell_quote("a'b;$HOME"), "'a'\\''b;$HOME'");
+    }
+
+    #[test]
+    fn validates_direct_ssh_destinations() {
+        assert!(validate_host("user@host").is_ok());
+        assert!(validate_host("ssh-alias").is_ok());
+        assert!(validate_host("").is_err());
+        assert!(validate_host("-oProxyCommand=bad").is_err());
     }
 
     #[test]
