@@ -52,6 +52,17 @@ exec sh -c "$1"
     path
 }
 
+fn fake_ssh_incompatible(root: &Path) -> PathBuf {
+    let path = root.join("fake-ssh-incompatible");
+    fs::write(
+        &path,
+        "#!/bin/sh\nprintf '%s\\n' '{\"protocol\":0,\"version\":\"old\"}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
 fn fake_ssh_creation_drop(root: &Path) -> PathBuf {
     let path = root.join("fake-ssh-create-drop");
     fs::write(
@@ -125,6 +136,29 @@ fn direct_ssh_destination_runs_remote_commands() {
     let log = cli(&root, &ssh, &["--host", "user@fake", "log", "-s", &id]);
     assert_eq!(log.stdout, b"remote-ok");
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn incompatible_remote_is_rejected_before_foreground_run_creation() {
+    let root = temp_root("incompatible");
+    let ssh = fake_ssh_incompatible(&root);
+    let output = cli(
+        &root,
+        &ssh,
+        &[
+            "--host",
+            "old-host",
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "touch should-not-run",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("protocol 0 is incompatible"));
+    assert!(!root.join("remote-state/sessions").exists());
     let _ = fs::remove_dir_all(root);
 }
 
