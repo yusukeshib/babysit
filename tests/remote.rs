@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -25,17 +25,54 @@ fn temp_root(label: &str) -> PathBuf {
 fn fake_ssh(root: &Path, disconnect_first_bridge: bool) -> PathBuf {
     let path = root.join("fake-ssh");
     let body = if disconnect_first_bridge {
+        let proxy = root.join("drop-first-bridge.py");
+        fs::write(
+            &proxy,
+            r#"import subprocess, sys
+
+cmd = sys.argv[1]
+child = subprocess.Popen(
+    ["sh", "-c", cmd],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+)
+hello = sys.stdin.buffer.readline()
+child.stdin.write(hello)
+child.stdin.flush()
+
+def read_exact(size):
+    data = b""
+    while len(data) < size:
+        chunk = child.stdout.read(size - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+while True:
+    header = read_exact(5)
+    if header is None:
+        raise SystemExit(child.wait())
+    length = int.from_bytes(header[1:], "big")
+    payload = read_exact(length)
+    if payload is None:
+        raise SystemExit(child.wait())
+    sys.stdout.buffer.write(header + payload)
+    sys.stdout.buffer.flush()
+    if header[0] in (1, 4):
+        child.kill()
+        child.wait()
+        raise SystemExit(255)
+"#,
+        )
+        .unwrap();
         r#"#!/bin/sh
 [ "$1" = "-T" ] && shift
 [ "$1" = "--" ] && shift
 shift
 cmd=$1
 if echo "$cmd" | grep -q __remote-bridge && mkdir "$FAKE_ONCE" 2>/dev/null; then
-  sh -c "$cmd" <&0 >&1 2>&2 & p=$!
-  sleep .35
-  kill "$p" 2>/dev/null || true
-  wait "$p" 2>/dev/null || true
-  exit 255
+  exec python3 "$FAKE_PROXY" "$cmd"
 fi
 exec sh -c "$cmd"
 "#
@@ -94,7 +131,8 @@ fn cli_command(root: &Path, ssh: &Path) -> Command {
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("BABYSIT_DIR", root.join("remote-state"))
         .env("BABYSIT_SSH", ssh)
-        .env("FAKE_ONCE", root.join("first-bridge"));
+        .env("FAKE_ONCE", root.join("first-bridge"))
+        .env("FAKE_PROXY", root.join("drop-first-bridge.py"));
     command
 }
 
@@ -293,7 +331,7 @@ fn detach_sequence_works_while_waiting_to_reconnect() {
             "--",
             "sh",
             "-c",
-            "sleep 2",
+            "printf A; sleep 2",
         ],
     );
     let id = serde_json::from_slice::<Value>(&started.stdout).unwrap()["id"]
@@ -308,7 +346,21 @@ fn detach_sequence_works_while_waiting_to_reconnect() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(450));
+    let stderr = child.stderr.take().unwrap();
+    let (notice_tx, notice_rx) = std::sync::mpsc::channel();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if line.contains("reconnecting") {
+                let _ = notice_tx.send(());
+            }
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
+    });
+    notice_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     child
         .stdin
         .take()
@@ -316,12 +368,9 @@ fn detach_sequence_works_while_waiting_to_reconnect() {
         .write_all(&[0x1c, 0x1c])
         .unwrap();
     let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("reconnecting"));
+    let stderr = stderr_reader.join().unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("reconnecting"));
     let status = cli(
         &root,
         &ssh,
