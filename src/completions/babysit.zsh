@@ -1,15 +1,46 @@
 #compdef babysit
 
-# Complete known session ids (directories under ~/.babysit/sessions). Read
-# straight from disk so completion stays fast and never has to spawn babysit.
+# Return the host selected anywhere on the current command line. `words` is a
+# zsh completion-special array and is dynamically visible from helper functions.
+__babysit_host() {
+    local i
+    for (( i = 1; i <= ${#words}; i++ )); do
+        case "${words[$i]}" in
+            --host)
+                if (( i < ${#words} )); then
+                    print -r -- "${words[$(( i + 1 ))]}"
+                    return
+                fi
+                ;;
+            --host=*)
+                print -r -- "${words[$i]#--host=}"
+                return
+                ;;
+        esac
+    done
+    print -r -- local
+}
+
+# Complete known session ids. Local completion reads ~/.babysit directly so it
+# stays fast; a selected remote host is queried through babysit's SSH routing.
 #
-# Each candidate carries a description (state + ⚑ flag + command) parsed from
-# the session's status.json/meta.json, mirroring `babysit ls`. This shows up as
+# Each candidate carries a description mirroring `babysit ls`. This shows up as
 # a second column in plain zsh completion and in the fzf-tab list/preview.
 __babysit_sessions() {
     local -a sessions
+    local __bs_host="$(__babysit_host)"
     local __bs_dir="$HOME/.babysit/sessions"
-    if [[ -d "$__bs_dir" ]]; then
+    if [[ "$__bs_host" != local ]]; then
+        local line id desc
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == ID[[:space:]]* || "$line" == \(no\ sessions\) ]] && continue
+            # Last-output preview lines are indented and are not sessions.
+            [[ "$line" == [[:space:]]* ]] && continue
+            id="${line%%[[:space:]]*}"
+            desc="${line#$id}"
+            sessions+=("${id}:${desc}")
+        done < <(command babysit --host "$__bs_host" list 2>/dev/null)
+    elif [[ -d "$__bs_dir" ]]; then
         local sess id state code cmd flag desc
         for sess in "$__bs_dir"/*(N/); do
             id="${sess:t}"
