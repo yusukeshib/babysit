@@ -316,7 +316,7 @@ impl ReconnectStatus {
             format!("\r\nLatest failure: {}", self.latest_reason)
         };
         format!(
-            "\x1b[2J\x1b[H\x1b[?25h\
+            "\x1b[2J\x1b[H\
              babysit: remote connection lost\r\n\r\n\
              Host:            {host}\r\n\
              Session:         {id}\r\n\
