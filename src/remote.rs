@@ -372,6 +372,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 reconnect_notice(host, delay);
                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                     attach::restore_terminal_modes();
+                    cleanup.0 = false;
                     return Ok(0);
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
@@ -385,6 +386,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 reconnect_notice(host, delay);
                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                     attach::restore_terminal_modes();
+                    cleanup.0 = false;
                     return Ok(0);
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
@@ -401,6 +403,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 reconnect_notice(host, delay);
                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                     attach::restore_terminal_modes();
+                    cleanup.0 = false;
                     return Ok(0);
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
@@ -426,6 +429,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                                 reconnect_notice(host, delay);
                                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                                     attach::restore_terminal_modes();
+                                    cleanup.0 = false;
                                     return Ok(0);
                                 }
                                 delay = (delay * 2).min(Duration::from_secs(5));
@@ -467,6 +471,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                         reconnect_notice(host, delay);
                         if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                             attach::restore_terminal_modes();
+                            cleanup.0 = false;
                             return Ok(0);
                         }
                         delay = (delay * 2).min(Duration::from_secs(5));
