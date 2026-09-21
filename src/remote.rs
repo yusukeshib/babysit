@@ -43,11 +43,19 @@ pub fn shell_quote(value: &str) -> String {
 }
 
 fn remote_command(args: &[String]) -> String {
-    std::iter::once("babysit")
+    remote_command_with_term(args, std::env::var("TERM").ok().as_deref())
+}
+
+fn remote_command_with_term(args: &[String], term: Option<&str>) -> String {
+    let command = std::iter::once("babysit")
         .chain(args.iter().map(String::as_str))
         .map(shell_quote)
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    match term.filter(|value| !value.is_empty()) {
+        Some(value) => format!("TERM={} {command}", shell_quote(value)),
+        None => command,
+    }
 }
 
 fn ssh_command(host: &str, args: &[String]) -> Result<Command> {
@@ -597,6 +605,27 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("hello world"), "'hello world'");
         assert_eq!(shell_quote("a'b;$HOME"), "'a'\\''b;$HOME'");
+    }
+
+    #[test]
+    fn forwards_terminal_type_to_remote_commands() {
+        let args = vec!["run".into(), "echo $TERM".into()];
+        assert_eq!(
+            remote_command_with_term(&args, Some("xterm-256color")),
+            "TERM='xterm-256color' 'babysit' 'run' 'echo $TERM'"
+        );
+        assert_eq!(
+            remote_command_with_term(&args, Some("x'; touch /tmp/nope; echo '")),
+            "TERM='x'\\''; touch /tmp/nope; echo '\\''' 'babysit' 'run' 'echo $TERM'"
+        );
+        assert_eq!(
+            remote_command_with_term(&args, None),
+            "'babysit' 'run' 'echo $TERM'"
+        );
+        assert_eq!(
+            remote_command_with_term(&args, Some("")),
+            "'babysit' 'run' 'echo $TERM'"
+        );
     }
 
     #[test]
