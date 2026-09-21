@@ -372,6 +372,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 reconnect_notice(host, delay);
                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                     attach::restore_terminal_modes();
+                    cleanup.0 = false;
                     return Ok(0);
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
@@ -385,6 +386,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 reconnect_notice(host, delay);
                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                     attach::restore_terminal_modes();
+                    cleanup.0 = false;
                     return Ok(0);
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
@@ -401,6 +403,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 reconnect_notice(host, delay);
                 if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                     attach::restore_terminal_modes();
+                    cleanup.0 = false;
                     return Ok(0);
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
@@ -416,15 +419,26 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                     Ok(Some((S_OUTPUT_OFFSET, payload))) if payload.len() >= 8 => {
                         let start = u64::from_be_bytes(payload[..8].try_into().unwrap());
                         let bytes = &payload[8..];
-                        let expected = cursor.unwrap_or(start);
-                        if start > expected {
-                            let _ = child.kill().await;
-                            bail!("remote output gap: expected offset {expected}, received {start}");
-                        }
-                        let skip = usize::try_from(expected.saturating_sub(start)).unwrap_or(usize::MAX).min(bytes.len());
+                        let (skip, next) = match offset_frame_progress(cursor, start, bytes.len()) {
+                            Ok(progress) => progress,
+                            Err((expected, received)) => {
+                                let _ = child.kill().await;
+                                if !reconnect {
+                                    bail!("remote output gap: expected offset {expected}, received {received}");
+                                }
+                                reconnect_notice(host, delay);
+                                if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
+                                    attach::restore_terminal_modes();
+                                    cleanup.0 = false;
+                                    return Ok(0);
+                                }
+                                delay = (delay * 2).min(Duration::from_secs(5));
+                                continue 'reconnect;
+                            }
+                        };
                         std::io::stdout().write_all(&bytes[skip..])?;
                         std::io::stdout().flush()?;
-                        cursor = Some(start + bytes.len() as u64);
+                        cursor = Some(next);
                     }
                     Ok(Some((S_OUTPUT, payload))) => {
                         std::io::stdout().write_all(&payload)?;
@@ -457,6 +471,7 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                         reconnect_notice(host, delay);
                         if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
                             attach::restore_terminal_modes();
+                            cleanup.0 = false;
                             return Ok(0);
                         }
                         delay = (delay * 2).min(Duration::from_secs(5));
@@ -523,6 +538,22 @@ fn discard_queued_input(
         }
     }
     false
+}
+
+fn offset_frame_progress(
+    cursor: Option<u64>,
+    start: u64,
+    len: usize,
+) -> std::result::Result<(usize, u64), (u64, u64)> {
+    let expected = cursor.unwrap_or(start);
+    if start > expected {
+        return Err((expected, start));
+    }
+    let skip = usize::try_from(expected.saturating_sub(start))
+        .unwrap_or(usize::MAX)
+        .min(len);
+    let end = start.saturating_add(len as u64);
+    Ok((skip, expected.max(end)))
 }
 
 fn reconnect_notice(host: &str, delay: Duration) {
@@ -613,6 +644,14 @@ mod tests {
 
         tx.send(vec![0x1c, 0x1c]).unwrap();
         assert!(discard_queued_input(&mut rx, &mut filter));
+    }
+
+    #[test]
+    fn overlapping_offset_frames_never_move_the_cursor_backward() {
+        assert_eq!(offset_frame_progress(Some(100), 80, 10), Ok((10, 100)));
+        assert_eq!(offset_frame_progress(Some(100), 90, 20), Ok((10, 110)));
+        assert_eq!(offset_frame_progress(Some(100), 101, 5), Err((100, 101)));
+        assert_eq!(offset_frame_progress(None, 42, 5), Ok((0, 47)));
     }
 
     #[tokio::test]
