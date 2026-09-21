@@ -51,7 +51,8 @@ SSH config aliases work too, so `--host dev` uses the `Host dev` entry from
 must already have a compatible `babysit` in its non-interactive PATH.
 
 A foreground remote `run` starts one detached worker on the remote machine and
-then attaches to it. If SSH drops after attachment, babysit clears the stale
+then attaches to it. SSH server-alive probes detect a silent transport failure
+(such as Wi-Fi loss) within roughly 10 seconds. Babysit then clears the stale
 local display and shows the host, session, disconnect reason, offline duration,
 raw-log offset, retry attempt, and backoff while reconnecting. The same process
 and PTY continue remotely. Once connected, babysit replays the bounded raw

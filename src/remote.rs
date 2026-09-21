@@ -64,6 +64,12 @@ fn ssh_command(host: &str, args: &[String]) -> Result<Command> {
     let mut command = Command::new(ssh);
     command
         .arg("-T")
+        .arg("-o")
+        .arg("ServerAliveInterval=3")
+        .arg("-o")
+        .arg("ServerAliveCountMax=2")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
         .arg("--")
         .arg(host)
         .arg(remote_command(args));
@@ -301,8 +307,11 @@ impl ReconnectStatus {
         }
     }
 
-    fn update(&mut self, reason: String) {
+    fn update(&mut self, reason: String, last_offset: Option<u64>) {
         self.latest_reason = reason;
+        if last_offset.is_some() {
+            self.last_offset = last_offset;
+        }
     }
 
     fn render(&self, host: &str, id: &str, phase: &str) -> String {
@@ -376,7 +385,7 @@ async fn reconnect_after_loss(
     filter: &mut DetachFilter,
 ) -> Result<bool> {
     match status {
-        Some(status) => status.update(reason),
+        Some(status) => status.update(reason, last_offset),
         None => *status = Some(ReconnectStatus::new(reason, last_offset)),
     }
     let status = status.as_mut().expect("reconnect status was initialized");
@@ -903,6 +912,29 @@ mod tests {
     }
 
     #[test]
+    fn ssh_commands_bound_silent_connections_and_connection_attempts() {
+        let command = ssh_command("devbox", &["status".into()]).unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            &args[..7],
+            [
+                "-T",
+                "-o",
+                "ServerAliveInterval=3",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-o",
+                "ConnectTimeout=5",
+            ]
+        );
+    }
+
+    #[test]
     fn validates_direct_ssh_destinations() {
         assert!(validate_host("user@host").is_ok());
         assert!(validate_host("ssh-alias").is_ok());
@@ -976,11 +1008,13 @@ mod tests {
     fn reconnect_status_tracks_repeated_attempts_and_latest_failure() {
         let mut status = ReconnectStatus::new("connection reset".into(), Some(99));
         status.attempt = 2;
-        status.update("attach handshake failed: timeout".into());
+        status.update("attach handshake failed: timeout".into(), Some(123));
+        status.update("attach handshake failed again".into(), None);
         let screen = status.render("devbox", "ab12", "Reconnecting:    attempt 3 in 1.00s");
 
         assert!(screen.contains("Reason:          connection reset"));
-        assert!(screen.contains("Latest failure: attach handshake failed: timeout"));
+        assert!(screen.contains("Latest failure: attach handshake failed again"));
+        assert!(screen.contains("Last raw offset: 123"));
         assert!(screen.contains("Reconnecting:    attempt 3 in 1.00s"));
     }
 

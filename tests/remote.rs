@@ -68,6 +68,7 @@ while True:
         .unwrap();
         r#"#!/bin/sh
 [ "$1" = "-T" ] && shift
+while [ "$1" = "-o" ]; do shift 2; done
 [ "$1" = "--" ] && shift
 shift
 cmd=$1
@@ -79,6 +80,7 @@ exec sh -c "$cmd"
     } else {
         r#"#!/bin/sh
 [ "$1" = "-T" ] && shift
+while [ "$1" = "-o" ]; do shift 2; done
 [ "$1" = "--" ] && shift
 shift
 exec sh -c "$1"
@@ -106,6 +108,7 @@ fn fake_ssh_creation_drop(root: &Path) -> PathBuf {
         &path,
         r#"#!/bin/sh
 [ "$1" = "-T" ] && shift
+while [ "$1" = "-o" ]; do shift 2; done
 [ "$1" = "--" ] && shift
 shift
 cmd=$1
