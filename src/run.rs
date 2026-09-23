@@ -109,9 +109,8 @@ impl Babysit {
             cmd: cmd.clone(),
             babysit_pid: std::process::id(),
             started_at: Utc::now(),
-            tty,
         };
-        session::write_meta(self, &meta).await?;
+        session::write_meta_with_tty(self, &meta, tty).await?;
         session::write_status(self, &id, &Status::starting()).await?;
 
         // No terminal here (stdio is /dev/null); start at the requested size or

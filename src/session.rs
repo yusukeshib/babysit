@@ -10,10 +10,19 @@ pub struct Meta {
     pub cmd: Vec<String>,
     pub babysit_pid: u32,
     pub started_at: DateTime<Utc>,
-    /// Whether the wrapped command owns a PTY. Older metadata predates this
-    /// field and therefore represents the historical PTY-backed default.
+}
+
+#[derive(Serialize)]
+struct StoredMeta<'a> {
+    #[serde(flatten)]
+    meta: &'a Meta,
+    tty: bool,
+}
+
+#[derive(Deserialize)]
+struct StoredTty {
     #[serde(default = "default_tty")]
-    pub tty: bool,
+    tty: bool,
 }
 
 fn default_tty() -> bool {
@@ -213,9 +222,17 @@ pub async fn new_unique_id(bs: &Babysit) -> String {
 }
 
 pub async fn write_meta(bs: &Babysit, meta: &Meta) -> Result<()> {
+    write_meta_json(bs, meta, serde_json::to_vec_pretty(meta)?).await
+}
+
+pub(crate) async fn write_meta_with_tty(bs: &Babysit, meta: &Meta, tty: bool) -> Result<()> {
+    let stored = StoredMeta { meta, tty };
+    write_meta_json(bs, meta, serde_json::to_vec_pretty(&stored)?).await
+}
+
+async fn write_meta_json(bs: &Babysit, meta: &Meta, json: Vec<u8>) -> Result<()> {
     let dir = bs.session_dir(&meta.id);
     tokio::fs::create_dir_all(&dir).await?;
-    let json = serde_json::to_vec_pretty(meta)?;
     tokio::fs::write(bs.meta_path(&meta.id), json).await?;
     Ok(())
 }
@@ -231,10 +248,19 @@ pub async fn write_status(bs: &Babysit, id: &str, status: &Status) -> Result<()>
 }
 
 pub async fn read_meta(bs: &Babysit, id: &str) -> Result<Meta> {
-    let bytes = tokio::fs::read(bs.meta_path(id))
-        .await
-        .with_context(|| format!("reading meta for {id}"))?;
+    let bytes = read_meta_bytes(bs, id).await?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub(crate) async fn read_tty(bs: &Babysit, id: &str) -> Result<bool> {
+    let bytes = read_meta_bytes(bs, id).await?;
+    Ok(serde_json::from_slice::<StoredTty>(&bytes)?.tty)
+}
+
+async fn read_meta_bytes(bs: &Babysit, id: &str) -> Result<Vec<u8>> {
+    tokio::fs::read(bs.meta_path(id))
+        .await
+        .with_context(|| format!("reading meta for {id}"))
 }
 
 pub async fn read_status(bs: &Babysit, id: &str) -> Result<Status> {
@@ -318,4 +344,45 @@ async fn resolve_one(bs: &Babysit, s: &str) -> Result<String> {
         return Ok(s.to_string());
     }
     Err(anyhow!("no session matching `{s}`"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_meta(id: &str) -> Meta {
+        Meta {
+            id: id.to_string(),
+            cmd: vec!["pi".to_string()],
+            babysit_pid: 123,
+            started_at: "2025-01-01T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_meta_shape_and_persisted_tty_remain_compatible() {
+        let root = std::env::temp_dir().join(format!(
+            "babysit-session-meta-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let bs = Babysit::new(&root);
+        let meta = test_meta("compat");
+
+        write_meta(&bs, &meta).await.unwrap();
+        assert!(read_tty(&bs, &meta.id).await.unwrap());
+        let legacy_json = tokio::fs::read_to_string(bs.meta_path(&meta.id))
+            .await
+            .unwrap();
+        assert!(!legacy_json.contains("\"tty\""));
+
+        write_meta_with_tty(&bs, &meta, false).await.unwrap();
+        assert!(!read_tty(&bs, &meta.id).await.unwrap());
+        let restored = read_meta(&bs, &meta.id).await.unwrap();
+        assert_eq!(restored.id, meta.id);
+        assert_eq!(restored.cmd, meta.cmd);
+        assert!(read_tty(&bs, "missing").await.is_err());
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 }
