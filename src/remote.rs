@@ -183,11 +183,6 @@ pub fn strip_host_args(raw: &[String]) -> Result<Vec<String>> {
 
 pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
     let id = session::resolve(bs, selected).await?;
-    let tty = session::read_meta(bs, &id)
-        .await
-        .map(|meta| meta.tty)
-        .unwrap_or(true);
-    let ready_payload = [u8::from(tty)];
     let mut hello = String::new();
     let mut stdin = BufReader::new(tokio::io::stdin());
     stdin.read_line(&mut hello).await?;
@@ -199,8 +194,28 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
         _ => bail!("remote bridge accepts only attach requests"),
     };
 
-    match attach::connect_retry(bs, &id).await {
-        Ok(Some(mut socket)) => {
+    let connection = match attach::connect_retry(bs, &id).await {
+        Ok(connection) => connection,
+        Err(error) if protocol >= 1 => {
+            let mut stdout = tokio::io::stdout();
+            attach::write_frame(&mut stdout, S_ERROR, error.to_string().as_bytes()).await?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let tty = match session::read_tty(bs, &id).await {
+        Ok(tty) => tty,
+        Err(error) if protocol >= 1 => {
+            let mut stdout = tokio::io::stdout();
+            attach::write_frame(&mut stdout, S_ERROR, error.to_string().as_bytes()).await?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let ready_payload = [u8::from(tty)];
+
+    match connection {
+        Some(mut socket) => {
             socket.write_all(hello.as_bytes()).await?;
             socket.flush().await?;
             let (mut socket_rd, mut socket_wr) = socket.into_split();
@@ -219,7 +234,7 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
             stdout.flush().await?;
             Ok(())
         }
-        Ok(None) => {
+        None => {
             let status = session::read_status(bs, &id).await?;
             let bytes = tokio::fs::read(bs.output_log_path(&id))
                 .await
@@ -263,13 +278,6 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
             attach::write_frame(&mut stdout, S_EXIT, &attach::exit_payload(Some(info))).await?;
             Ok(())
         }
-        Err(error) if protocol >= 1 => {
-            let mut stdout = tokio::io::stdout();
-            attach::write_frame(&mut stdout, S_READY, &ready_payload).await?;
-            attach::write_frame(&mut stdout, S_ERROR, error.to_string().as_bytes()).await?;
-            Ok(())
-        }
-        Err(error) => Err(error),
     }
 }
 
@@ -471,6 +479,12 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                     frame = attach::read_frame(&mut reader) => match frame? {
                         Some((S_READY, payload)) => {
                             return Ok::<(u8, bool), std::io::Error>((1, ready_uses_tty(&payload)));
+                        }
+                        Some((S_ERROR, payload)) => {
+                            return Err(std::io::Error::other(format!(
+                                "remote attach failed: {}",
+                                String::from_utf8_lossy(&payload)
+                            )));
                         }
                         Some(_) => continue,
                         None => return Ok((0, true)),
@@ -1013,19 +1027,6 @@ mod tests {
         assert!(ready_uses_tty(&[]));
         assert!(ready_uses_tty(&[1]));
         assert!(!ready_uses_tty(&[0]));
-    }
-
-    #[test]
-    fn old_session_metadata_defaults_to_tty_mode() {
-        let meta: session::Meta = serde_json::from_value(serde_json::json!({
-            "id": "old",
-            "cmd": ["pi"],
-            "babysit_pid": 123,
-            "started_at": "2025-01-01T00:00:00Z"
-        }))
-        .unwrap();
-
-        assert!(meta.tty);
     }
 
     #[test]
