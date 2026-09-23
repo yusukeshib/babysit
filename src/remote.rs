@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{SignalKind, signal};
@@ -64,6 +64,12 @@ fn ssh_command(host: &str, args: &[String]) -> Result<Command> {
     let mut command = Command::new(ssh);
     command
         .arg("-T")
+        .arg("-o")
+        .arg("ServerAliveInterval=3")
+        .arg("-o")
+        .arg("ServerAliveCountMax=2")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
         .arg("--")
         .arg(host)
         .arg(remote_command(args));
@@ -177,6 +183,11 @@ pub fn strip_host_args(raw: &[String]) -> Result<Vec<String>> {
 
 pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
     let id = session::resolve(bs, selected).await?;
+    let tty = session::read_meta(bs, &id)
+        .await
+        .map(|meta| meta.tty)
+        .unwrap_or(true);
+    let ready_payload = [u8::from(tty)];
     let mut hello = String::new();
     let mut stdin = BufReader::new(tokio::io::stdin());
     stdin.read_line(&mut hello).await?;
@@ -198,7 +209,7 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
             // send S_READY (harmlessly ignored after the handshake), while this
             // lets a new bridge attach once to a pre-protocol worker.
             if protocol >= 1 {
-                attach::write_frame(&mut stdout, S_READY, &[]).await?;
+                attach::write_frame(&mut stdout, S_READY, &ready_payload).await?;
             }
             let input =
                 tokio::spawn(async move { tokio::io::copy(&mut stdin, &mut socket_wr).await });
@@ -223,7 +234,7 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
                         );
                         if protocol >= 1 {
                             let mut stdout = tokio::io::stdout();
-                            attach::write_frame(&mut stdout, S_READY, &[]).await?;
+                            attach::write_frame(&mut stdout, S_READY, &ready_payload).await?;
                             attach::write_frame(&mut stdout, S_ERROR, message.as_bytes()).await?;
                             return Ok(());
                         }
@@ -235,7 +246,7 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
             };
             let mut stdout = tokio::io::stdout();
             if protocol >= 1 {
-                attach::write_frame(&mut stdout, S_READY, &[]).await?;
+                attach::write_frame(&mut stdout, S_READY, &ready_payload).await?;
                 if start < bytes.len() {
                     let mut payload = Vec::with_capacity(8 + bytes.len() - start);
                     payload.extend_from_slice(&(start as u64).to_be_bytes());
@@ -254,7 +265,7 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
         }
         Err(error) if protocol >= 1 => {
             let mut stdout = tokio::io::stdout();
-            attach::write_frame(&mut stdout, S_READY, &[]).await?;
+            attach::write_frame(&mut stdout, S_READY, &ready_payload).await?;
             attach::write_frame(&mut stdout, S_ERROR, error.to_string().as_bytes()).await?;
             Ok(())
         }
@@ -273,6 +284,129 @@ fn spawn_bridge(host: &str, id: &str) -> Result<Child> {
     .kill_on_drop(true)
     .spawn()
     .context("starting ssh attach bridge")
+}
+
+#[derive(Clone, Copy)]
+struct ReconnectTarget<'a> {
+    host: &'a str,
+    id: &'a str,
+    visual: bool,
+}
+
+struct ReconnectStatus {
+    attempt: u32,
+    disconnected_at: Instant,
+    initial_reason: String,
+    latest_reason: String,
+    last_offset: Option<u64>,
+}
+
+impl ReconnectStatus {
+    fn new(reason: String, last_offset: Option<u64>) -> Self {
+        Self {
+            attempt: 0,
+            disconnected_at: Instant::now(),
+            initial_reason: reason.clone(),
+            latest_reason: reason,
+            last_offset,
+        }
+    }
+
+    fn update(&mut self, reason: String, last_offset: Option<u64>) {
+        self.latest_reason = reason;
+        if last_offset.is_some() {
+            self.last_offset = last_offset;
+        }
+    }
+
+    fn render(&self, host: &str, id: &str, phase: &str) -> String {
+        let elapsed = self.disconnected_at.elapsed().as_secs_f32();
+        let offset = self
+            .last_offset
+            .map_or_else(|| "unknown".into(), |value| value.to_string());
+        let latest = if self.latest_reason == self.initial_reason {
+            String::new()
+        } else {
+            format!("\r\nLatest failure: {}", self.latest_reason)
+        };
+        format!(
+            "\x1b[2J\x1b[H\
+             babysit: remote connection lost\r\n\r\n\
+             Host:            {host}\r\n\
+             Session:         {id}\r\n\
+             Offline:         {elapsed:.1}s\r\n\
+             Last raw offset: {offset}\r\n\
+             Reason:          {}{latest}\r\n\r\n\
+             {phase}\r\n\
+             Input while offline is discarded. Detach: Ctrl-\\ Ctrl-\\\r\n",
+            self.initial_reason
+        )
+    }
+
+    fn show_waiting(&self, host: &str, id: &str, delay: Duration, visual: bool) {
+        let phase = format!(
+            "Reconnecting:    attempt {} in {:.2}s",
+            self.attempt.saturating_add(1),
+            delay.as_secs_f32()
+        );
+        if visual {
+            write_reconnect_display(&self.render(host, id, &phase));
+        } else {
+            eprintln!(
+                "babysit: connection to {host} lost ({}); reconnecting attempt {} in {:.2}s",
+                self.latest_reason,
+                self.attempt.saturating_add(1),
+                delay.as_secs_f32()
+            );
+        }
+    }
+
+    fn show_connecting(&mut self, host: &str, id: &str, visual: bool) {
+        self.attempt = self.attempt.saturating_add(1);
+        if visual {
+            let phase = format!("Reconnecting:    attempt {} in progress...", self.attempt);
+            write_reconnect_display(&self.render(host, id, &phase));
+        }
+    }
+}
+
+fn write_reconnect_display(text: &str) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+}
+
+fn clear_reconnect_display() {
+    write_reconnect_display("\x1b[2J\x1b[H");
+}
+
+fn ready_uses_tty(payload: &[u8]) -> bool {
+    payload.first().copied().unwrap_or(1) != 0
+}
+
+async fn reconnect_after_loss(
+    status: &mut Option<ReconnectStatus>,
+    target: ReconnectTarget<'_>,
+    reason: String,
+    last_offset: Option<u64>,
+    delay: Duration,
+    stdin_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    filter: &mut DetachFilter,
+) -> Result<bool> {
+    match status {
+        Some(status) => status.update(reason, last_offset),
+        None => *status = Some(ReconnectStatus::new(reason, last_offset)),
+    }
+    let status = status.as_mut().expect("reconnect status was initialized");
+    status.show_waiting(target.host, target.id, delay, target.visual);
+    if wait_reconnect(delay, stdin_rx, filter).await? {
+        if target.visual {
+            clear_reconnect_display();
+        }
+        return Ok(true);
+    }
+    status.show_connecting(target.host, target.id, target.visual);
+    Ok(false)
 }
 
 pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
@@ -310,6 +444,9 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
     let mut resumable = true;
     let mut established_once = false;
     let mut delay = Duration::from_millis(250);
+    let local_stdout_is_terminal = std::io::stdout().is_terminal();
+    let mut visual_reconnect = false;
+    let mut reconnect_status = None;
     let mut cleanup = TerminalCleanup(false);
 
     'reconnect: loop {
@@ -332,14 +469,16 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
             loop {
                 tokio::select! {
                     frame = attach::read_frame(&mut reader) => match frame? {
-                        Some((S_READY, _)) => return Ok::<u8, std::io::Error>(1),
+                        Some((S_READY, payload)) => {
+                            return Ok::<(u8, bool), std::io::Error>((1, ready_uses_tty(&payload)));
+                        }
                         Some(_) => continue,
-                        None => return Ok(0),
+                        None => return Ok((0, true)),
                     },
                     chunk = stdin_rx.recv() => {
                         if let Some(bytes) = chunk {
                             let (_, detach) = filter.push(&bytes);
-                            if detach { return Ok(2); }
+                            if detach { return Ok((2, true)); }
                         }
                     }
                 }
@@ -348,10 +487,14 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
         .await;
 
         match ready {
-            Ok(Ok(1)) => {
+            Ok(Ok((1, remote_tty))) => {
                 established_once = true;
                 cleanup.0 = true;
                 delay = Duration::from_millis(250);
+                visual_reconnect = local_stdout_is_terminal && remote_tty;
+                if reconnect_status.take().is_some() && visual_reconnect {
+                    clear_reconnect_display();
+                }
                 // The ready frame can win select while stdin chunks are already
                 // queued. Drain them too: nothing typed before readiness may
                 // leak into the resumed program, but detach must still work.
@@ -363,8 +506,11 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 }
                 filter.discard_pending();
             }
-            Ok(Ok(2)) => {
+            Ok(Ok((2, _))) => {
                 let _ = child.kill().await;
+                if reconnect_status.take().is_some() && visual_reconnect {
+                    clear_reconnect_display();
+                }
                 attach::restore_terminal_modes();
                 cleanup.0 = false;
                 return Ok(0);
@@ -377,11 +523,27 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 if !reconnect {
                     bail!("remote attach transport disconnected");
                 }
-                reconnect_notice(host, delay);
-                if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
+                if reconnect_after_loss(
+                    &mut reconnect_status,
+                    ReconnectTarget {
+                        host,
+                        id: &id,
+                        visual: visual_reconnect,
+                    },
+                    "SSH bridge closed before the attach handshake completed".into(),
+                    cursor,
+                    delay,
+                    &mut stdin_rx,
+                    &mut filter,
+                )
+                .await?
+                {
                     attach::restore_terminal_modes();
                     cleanup.0 = false;
                     return Ok(0);
+                }
+                if visual_reconnect {
+                    cursor = None;
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
                 continue;
@@ -391,11 +553,27 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 if !established_once || !reconnect {
                     return Err(error.into());
                 }
-                reconnect_notice(host, delay);
-                if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
+                if reconnect_after_loss(
+                    &mut reconnect_status,
+                    ReconnectTarget {
+                        host,
+                        id: &id,
+                        visual: visual_reconnect,
+                    },
+                    format!("attach handshake failed: {error}"),
+                    cursor,
+                    delay,
+                    &mut stdin_rx,
+                    &mut filter,
+                )
+                .await?
+                {
                     attach::restore_terminal_modes();
                     cleanup.0 = false;
                     return Ok(0);
+                }
+                if visual_reconnect {
+                    cursor = None;
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
                 continue;
@@ -408,11 +586,27 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 if !reconnect {
                     bail!("remote attach transport timed out");
                 }
-                reconnect_notice(host, delay);
-                if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
+                if reconnect_after_loss(
+                    &mut reconnect_status,
+                    ReconnectTarget {
+                        host,
+                        id: &id,
+                        visual: visual_reconnect,
+                    },
+                    "timed out waiting for the attach handshake".into(),
+                    cursor,
+                    delay,
+                    &mut stdin_rx,
+                    &mut filter,
+                )
+                .await?
+                {
                     attach::restore_terminal_modes();
                     cleanup.0 = false;
                     return Ok(0);
+                }
+                if visual_reconnect {
+                    cursor = None;
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
                 continue;
@@ -434,11 +628,29 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                                 if !reconnect {
                                     bail!("remote output gap: expected offset {expected}, received {received}");
                                 }
-                                reconnect_notice(host, delay);
-                                if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
+                                if reconnect_after_loss(
+                                    &mut reconnect_status,
+                                    ReconnectTarget {
+                                        host,
+                                        id: &id,
+                                        visual: visual_reconnect,
+                                    },
+                                    format!(
+                                        "remote output gap: expected offset {expected}, received {received}"
+                                    ),
+                                    cursor,
+                                    delay,
+                                    &mut stdin_rx,
+                                    &mut filter,
+                                )
+                                .await?
+                                {
                                     attach::restore_terminal_modes();
                                     cleanup.0 = false;
                                     return Ok(0);
+                                }
+                                if visual_reconnect {
+                                    cursor = None;
                                 }
                                 delay = (delay * 2).min(Duration::from_secs(5));
                                 continue 'reconnect;
@@ -470,17 +682,38 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                         return Ok(0);
                     }
                     Ok(Some((S_READY, _))) | Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => {
+                    result @ (Ok(None) | Err(_)) => {
                         let _ = child.kill().await;
                         if !reconnect { bail!("remote attach transport disconnected"); }
                         if !resumable {
                             bail!("remote reconnect is unavailable for --view-cmd streams");
                         }
-                        reconnect_notice(host, delay);
-                        if wait_reconnect(delay, &mut stdin_rx, &mut filter).await? {
+                        let reason = match result {
+                            Ok(None) => "remote attach stream closed".into(),
+                            Err(error) => format!("remote attach stream failed: {error}"),
+                            _ => unreachable!(),
+                        };
+                        if reconnect_after_loss(
+                            &mut reconnect_status,
+                            ReconnectTarget {
+                                host,
+                                id: &id,
+                                visual: visual_reconnect,
+                            },
+                            reason,
+                            cursor,
+                            delay,
+                            &mut stdin_rx,
+                            &mut filter,
+                        )
+                        .await?
+                        {
                             attach::restore_terminal_modes();
                             cleanup.0 = false;
                             return Ok(0);
+                        }
+                        if visual_reconnect {
+                            cursor = None;
                         }
                         delay = (delay * 2).min(Duration::from_secs(5));
                         continue 'reconnect;
@@ -489,12 +722,36 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 chunk = stdin_rx.recv() => if let Some(bytes) = chunk {
                     let (forward, detach) = filter.push(&bytes);
                     if !forward.is_empty()
-                        && attach::write_frame(&mut child_in, C_INPUT, &forward).await.is_err()
+                        && let Err(error) = attach::write_frame(&mut child_in, C_INPUT, &forward).await
                     {
+                        let _ = child.kill().await;
                         if !reconnect { bail!("remote attach transport disconnected"); }
                         if !resumable {
                             bail!("remote reconnect is unavailable for --view-cmd streams");
                         }
+                        if reconnect_after_loss(
+                            &mut reconnect_status,
+                            ReconnectTarget {
+                                host,
+                                id: &id,
+                                visual: visual_reconnect,
+                            },
+                            format!("failed to send remote input: {error}"),
+                            cursor,
+                            delay,
+                            &mut stdin_rx,
+                            &mut filter,
+                        )
+                        .await?
+                        {
+                            attach::restore_terminal_modes();
+                            cleanup.0 = false;
+                            return Ok(0);
+                        }
+                        if visual_reconnect {
+                            cursor = None;
+                        }
+                        delay = (delay * 2).min(Duration::from_secs(5));
                         continue 'reconnect;
                     }
                     if detach {
@@ -512,22 +769,75 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 _ = &mut escape_timeout, if filter.has_partial_escape() => {
                     let forward = filter.flush_partial_escape();
                     if !forward.is_empty()
-                        && attach::write_frame(&mut child_in, C_INPUT, &forward).await.is_err()
+                        && let Err(error) = attach::write_frame(&mut child_in, C_INPUT, &forward).await
                     {
+                        let _ = child.kill().await;
                         if !reconnect { bail!("remote attach transport disconnected"); }
                         if !resumable {
                             bail!("remote reconnect is unavailable for --view-cmd streams");
                         }
+                        if reconnect_after_loss(
+                            &mut reconnect_status,
+                            ReconnectTarget {
+                                host,
+                                id: &id,
+                                visual: visual_reconnect,
+                            },
+                            format!("failed to flush remote input: {error}"),
+                            cursor,
+                            delay,
+                            &mut stdin_rx,
+                            &mut filter,
+                        )
+                        .await?
+                        {
+                            attach::restore_terminal_modes();
+                            cleanup.0 = false;
+                            return Ok(0);
+                        }
+                        if visual_reconnect {
+                            cursor = None;
+                        }
+                        delay = (delay * 2).min(Duration::from_secs(5));
                         continue 'reconnect;
                     }
                 },
                 _ = winch.recv() => if let Ok((cols, rows)) = crossterm::terminal::size()
-                    && attach::write_frame(&mut child_in, C_RESIZE, &attach::resize_payload(cols, rows)).await.is_err()
+                    && let Err(error) = attach::write_frame(
+                        &mut child_in,
+                        C_RESIZE,
+                        &attach::resize_payload(cols, rows),
+                    )
+                    .await
                 {
+                    let _ = child.kill().await;
                     if !reconnect { bail!("remote attach transport disconnected"); }
                     if !resumable {
                         bail!("remote reconnect is unavailable for --view-cmd streams");
                     }
+                    if reconnect_after_loss(
+                        &mut reconnect_status,
+                        ReconnectTarget {
+                            host,
+                            id: &id,
+                            visual: visual_reconnect,
+                        },
+                        format!("failed to resize the remote terminal: {error}"),
+                        cursor,
+                        delay,
+                        &mut stdin_rx,
+                        &mut filter,
+                    )
+                    .await?
+                    {
+                        attach::restore_terminal_modes();
+                        cleanup.0 = false;
+                        return Ok(0);
+                    }
+                    if visual_reconnect {
+                        cursor = None;
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(5));
                     continue 'reconnect;
                 }
             }
@@ -562,14 +872,6 @@ fn offset_frame_progress(
         .min(len);
     let end = start.saturating_add(len as u64);
     Ok((skip, expected.max(end)))
-}
-
-fn reconnect_notice(host: &str, delay: Duration) {
-    eprintln!(
-        "\r\nbabysit: connection to {} lost; reconnecting in {:.2}s (detach: Ctrl-\\ Ctrl-\\)",
-        host,
-        delay.as_secs_f32()
-    );
 }
 
 async fn wait_reconnect(
@@ -629,6 +931,29 @@ mod tests {
     }
 
     #[test]
+    fn ssh_commands_bound_silent_connections_and_connection_attempts() {
+        let command = ssh_command("devbox", &["status".into()]).unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            &args[..7],
+            [
+                "-T",
+                "-o",
+                "ServerAliveInterval=3",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-o",
+                "ConnectTimeout=5",
+            ]
+        );
+    }
+
+    #[test]
     fn validates_direct_ssh_destinations() {
         assert!(validate_host("user@host").is_ok());
         assert!(validate_host("ssh-alias").is_ok());
@@ -681,6 +1006,55 @@ mod tests {
         assert_eq!(offset_frame_progress(Some(100), 90, 20), Ok((10, 110)));
         assert_eq!(offset_frame_progress(Some(100), 101, 5), Err((100, 101)));
         assert_eq!(offset_frame_progress(None, 42, 5), Ok((0, 47)));
+    }
+
+    #[test]
+    fn ready_payload_reports_worker_tty_mode_and_defaults_old_bridges_to_tty() {
+        assert!(ready_uses_tty(&[]));
+        assert!(ready_uses_tty(&[1]));
+        assert!(!ready_uses_tty(&[0]));
+    }
+
+    #[test]
+    fn old_session_metadata_defaults_to_tty_mode() {
+        let meta: session::Meta = serde_json::from_value(serde_json::json!({
+            "id": "old",
+            "cmd": ["pi"],
+            "babysit_pid": 123,
+            "started_at": "2025-01-01T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert!(meta.tty);
+    }
+
+    #[test]
+    fn reconnect_status_clears_stale_display_and_shows_details() {
+        let status = ReconnectStatus::new("remote attach stream closed".into(), Some(42));
+        let screen = status.render("devbox", "ab12", "Reconnecting:    attempt 1 in 0.25s");
+
+        assert!(screen.starts_with("\x1b[2J\x1b[H"));
+        assert!(screen.contains("Host:            devbox"));
+        assert!(screen.contains("Session:         ab12"));
+        assert!(screen.contains("Last raw offset: 42"));
+        assert!(screen.contains("Reason:          remote attach stream closed"));
+        assert!(screen.contains("Reconnecting:    attempt 1 in 0.25s"));
+        assert!(screen.contains("Input while offline is discarded"));
+        assert!(screen.contains("Detach: Ctrl-\\ Ctrl-\\"));
+    }
+
+    #[test]
+    fn reconnect_status_tracks_repeated_attempts_and_latest_failure() {
+        let mut status = ReconnectStatus::new("connection reset".into(), Some(99));
+        status.attempt = 2;
+        status.update("attach handshake failed: timeout".into(), Some(123));
+        status.update("attach handshake failed again".into(), None);
+        let screen = status.render("devbox", "ab12", "Reconnecting:    attempt 3 in 1.00s");
+
+        assert!(screen.contains("Reason:          connection reset"));
+        assert!(screen.contains("Latest failure: attach handshake failed again"));
+        assert!(screen.contains("Last raw offset: 123"));
+        assert!(screen.contains("Reconnecting:    attempt 3 in 1.00s"));
     }
 
     #[tokio::test]

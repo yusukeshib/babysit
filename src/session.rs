@@ -10,6 +10,14 @@ pub struct Meta {
     pub cmd: Vec<String>,
     pub babysit_pid: u32,
     pub started_at: DateTime<Utc>,
+    /// Whether the wrapped command owns a PTY. Older metadata predates this
+    /// field and therefore represents the historical PTY-backed default.
+    #[serde(default = "default_tty")]
+    pub tty: bool,
+}
+
+fn default_tty() -> bool {
+    true
 }
 
 /// Live state, updated as the wrapped command transitions.

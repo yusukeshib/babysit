@@ -51,11 +51,15 @@ SSH config aliases work too, so `--host dev` uses the `Host dev` entry from
 must already have a compatible `babysit` in its non-interactive PATH.
 
 A foreground remote `run` starts one detached worker on the remote machine and
-then attaches to it. If SSH drops after attachment, babysit reconnects to the
-same session automatically and resumes from the last raw-log byte, so the same
-process and PTY continue without duplicated output. Input typed while offline
-is discarded. Detach at any time with `Ctrl-\ Ctrl-\`, including while
-reconnecting; pass `attach --no-reconnect` to make a transport loss fatal.
+then attaches to it. SSH server-alive probes detect a silent transport failure
+(such as Wi-Fi loss) within roughly 10 seconds. Babysit then clears the stale
+local display and shows the host, session, disconnect reason, offline duration,
+raw-log offset, retry attempt, and backoff while reconnecting. The same process
+and PTY continue remotely. Once connected, babysit replays the bounded raw
+backlog to rebuild the terminal display, then resumes offset-based live output.
+Input typed while offline is discarded. Detach at any time with
+`Ctrl-\ Ctrl-\`, including while reconnecting; pass `attach --no-reconnect` to
+make a transport loss fatal.
 Sessions using `run --view-cmd` have a transformed stream without stable raw
 byte offsets, so their remote attach returns an error after transport loss
 instead of replaying duplicate output. `run -d` starts the remote worker without
