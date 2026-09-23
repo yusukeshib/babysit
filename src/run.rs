@@ -109,6 +109,7 @@ impl Babysit {
             cmd: cmd.clone(),
             babysit_pid: std::process::id(),
             started_at: Utc::now(),
+            tty,
         };
         session::write_meta(self, &meta).await?;
         session::write_status(self, &id, &Status::starting()).await?;

@@ -183,6 +183,11 @@ pub fn strip_host_args(raw: &[String]) -> Result<Vec<String>> {
 
 pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
     let id = session::resolve(bs, selected).await?;
+    let tty = session::read_meta(bs, &id)
+        .await
+        .map(|meta| meta.tty)
+        .unwrap_or(true);
+    let ready_payload = [u8::from(tty)];
     let mut hello = String::new();
     let mut stdin = BufReader::new(tokio::io::stdin());
     stdin.read_line(&mut hello).await?;
@@ -204,7 +209,7 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
             // send S_READY (harmlessly ignored after the handshake), while this
             // lets a new bridge attach once to a pre-protocol worker.
             if protocol >= 1 {
-                attach::write_frame(&mut stdout, S_READY, &[]).await?;
+                attach::write_frame(&mut stdout, S_READY, &ready_payload).await?;
             }
             let input =
                 tokio::spawn(async move { tokio::io::copy(&mut stdin, &mut socket_wr).await });
@@ -229,7 +234,7 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
                         );
                         if protocol >= 1 {
                             let mut stdout = tokio::io::stdout();
-                            attach::write_frame(&mut stdout, S_READY, &[]).await?;
+                            attach::write_frame(&mut stdout, S_READY, &ready_payload).await?;
                             attach::write_frame(&mut stdout, S_ERROR, message.as_bytes()).await?;
                             return Ok(());
                         }
@@ -241,7 +246,7 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
             };
             let mut stdout = tokio::io::stdout();
             if protocol >= 1 {
-                attach::write_frame(&mut stdout, S_READY, &[]).await?;
+                attach::write_frame(&mut stdout, S_READY, &ready_payload).await?;
                 if start < bytes.len() {
                     let mut payload = Vec::with_capacity(8 + bytes.len() - start);
                     payload.extend_from_slice(&(start as u64).to_be_bytes());
@@ -260,7 +265,7 @@ pub async fn bridge(bs: &Babysit, selected: Option<String>) -> Result<()> {
         }
         Err(error) if protocol >= 1 => {
             let mut stdout = tokio::io::stdout();
-            attach::write_frame(&mut stdout, S_READY, &[]).await?;
+            attach::write_frame(&mut stdout, S_READY, &ready_payload).await?;
             attach::write_frame(&mut stdout, S_ERROR, error.to_string().as_bytes()).await?;
             Ok(())
         }
@@ -375,6 +380,10 @@ fn clear_reconnect_display() {
     write_reconnect_display("\x1b[2J\x1b[H");
 }
 
+fn ready_uses_tty(payload: &[u8]) -> bool {
+    payload.first().copied().unwrap_or(1) != 0
+}
+
 async fn reconnect_after_loss(
     status: &mut Option<ReconnectStatus>,
     target: ReconnectTarget<'_>,
@@ -391,6 +400,9 @@ async fn reconnect_after_loss(
     let status = status.as_mut().expect("reconnect status was initialized");
     status.show_waiting(target.host, target.id, delay, target.visual);
     if wait_reconnect(delay, stdin_rx, filter).await? {
+        if target.visual {
+            clear_reconnect_display();
+        }
         return Ok(true);
     }
     status.show_connecting(target.host, target.id, target.visual);
@@ -432,7 +444,8 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
     let mut resumable = true;
     let mut established_once = false;
     let mut delay = Duration::from_millis(250);
-    let visual_reconnect = std::io::stdout().is_terminal();
+    let local_stdout_is_terminal = std::io::stdout().is_terminal();
+    let mut visual_reconnect = false;
     let mut reconnect_status = None;
     let mut cleanup = TerminalCleanup(false);
 
@@ -456,14 +469,16 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
             loop {
                 tokio::select! {
                     frame = attach::read_frame(&mut reader) => match frame? {
-                        Some((S_READY, _)) => return Ok::<u8, std::io::Error>(1),
+                        Some((S_READY, payload)) => {
+                            return Ok::<(u8, bool), std::io::Error>((1, ready_uses_tty(&payload)));
+                        }
                         Some(_) => continue,
-                        None => return Ok(0),
+                        None => return Ok((0, true)),
                     },
                     chunk = stdin_rx.recv() => {
                         if let Some(bytes) = chunk {
                             let (_, detach) = filter.push(&bytes);
-                            if detach { return Ok(2); }
+                            if detach { return Ok((2, true)); }
                         }
                     }
                 }
@@ -472,10 +487,11 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
         .await;
 
         match ready {
-            Ok(Ok(1)) => {
+            Ok(Ok((1, remote_tty))) => {
                 established_once = true;
                 cleanup.0 = true;
                 delay = Duration::from_millis(250);
+                visual_reconnect = local_stdout_is_terminal && remote_tty;
                 if reconnect_status.take().is_some() && visual_reconnect {
                     clear_reconnect_display();
                 }
@@ -490,8 +506,11 @@ pub async fn attach(host: &str, id: String, reconnect: bool) -> Result<i32> {
                 }
                 filter.discard_pending();
             }
-            Ok(Ok(2)) => {
+            Ok(Ok((2, _))) => {
                 let _ = child.kill().await;
+                if reconnect_status.take().is_some() && visual_reconnect {
+                    clear_reconnect_display();
+                }
                 attach::restore_terminal_modes();
                 cleanup.0 = false;
                 return Ok(0);
@@ -987,6 +1006,26 @@ mod tests {
         assert_eq!(offset_frame_progress(Some(100), 90, 20), Ok((10, 110)));
         assert_eq!(offset_frame_progress(Some(100), 101, 5), Err((100, 101)));
         assert_eq!(offset_frame_progress(None, 42, 5), Ok((0, 47)));
+    }
+
+    #[test]
+    fn ready_payload_reports_worker_tty_mode_and_defaults_old_bridges_to_tty() {
+        assert!(ready_uses_tty(&[]));
+        assert!(ready_uses_tty(&[1]));
+        assert!(!ready_uses_tty(&[0]));
+    }
+
+    #[test]
+    fn old_session_metadata_defaults_to_tty_mode() {
+        let meta: session::Meta = serde_json::from_value(serde_json::json!({
+            "id": "old",
+            "cmd": ["pi"],
+            "babysit_pid": 123,
+            "started_at": "2025-01-01T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert!(meta.tty);
     }
 
     #[test]
