@@ -591,10 +591,12 @@ mod tests {
     use super::*;
 
     fn test_log_dir() -> std::path::PathBuf {
+        static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "babysit-timestamps-{}-{}",
+            "babysit-timestamps-{}-{}-{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&dir).unwrap();
         dir
