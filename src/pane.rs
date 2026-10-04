@@ -109,12 +109,13 @@ impl OutputHub {
         } else {
             false
         };
-        if captured
-            && let Some(timestamps) = g.timestamps.as_mut()
-            && writeln!(timestamps, "[{offset},{},{timestamp}]", data.len()).is_err()
-        {
-            // Metadata is optional: never interrupt raw capture or delivery.
-            g.timestamps = None;
+        if captured && let Some(timestamps) = g.timestamps.as_mut() {
+            // Format first so an unbuffered file does not write each fragment.
+            let row = format!("[{offset},{},{timestamp}]\n", data.len());
+            if timestamps.write_all(row.as_bytes()).is_err() {
+                // Metadata is optional: never interrupt raw capture or delivery.
+                g.timestamps = None;
+            }
         }
         g.next_offset = g.next_offset.saturating_add(data.len() as u64);
         g.backlog.extend(data);
