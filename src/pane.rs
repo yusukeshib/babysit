@@ -51,6 +51,7 @@ struct HubInner {
     backlog_start: u64,
     next_offset: u64,
     log: Option<File>,
+    timestamps: Option<File>,
     log_error: Option<String>,
     clients: Vec<UnboundedSender<Vec<u8>>>,
     resume_clients: Vec<UnboundedSender<OutputChunk>>,
@@ -73,6 +74,15 @@ impl OutputHub {
             let file = OpenOptions::new().create(true).append(true).open(path)?;
             g.next_offset = file.metadata()?.len();
             g.backlog_start = g.next_offset;
+            // An empty raw log starts a new capture; otherwise preserve the
+            // append-only metadata history. Missing coverage is valid.
+            g.timestamps = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(g.next_offset != 0)
+                .truncate(g.next_offset == 0)
+                .open(path.with_extension("timestamps.jsonl"))
+                .ok();
             g.log = Some(file);
             g.log_error = None;
         }
@@ -84,13 +94,29 @@ impl OutputHub {
         let Ok(mut g) = self.inner.lock() else {
             return;
         };
-        if let Some(log) = g.log.as_mut()
-            && let Err(error) = log.write_all(data)
-        {
-            g.log_error = Some(error.to_string());
-            g.log = None;
-        }
         let offset = g.next_offset;
+        let timestamp = now_ms();
+        let captured = if let Some(log) = g.log.as_mut() {
+            match log.write_all(data) {
+                Ok(()) => true,
+                Err(error) => {
+                    g.log_error = Some(error.to_string());
+                    g.log = None;
+                    g.timestamps = None;
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if captured && let Some(timestamps) = g.timestamps.as_mut() {
+            // Format first so an unbuffered file does not write each fragment.
+            let row = format!("[{offset},{},{timestamp}]\n", data.len());
+            if timestamps.write_all(row.as_bytes()).is_err() {
+                // Metadata is optional: never interrupt raw capture or delivery.
+                g.timestamps = None;
+            }
+        }
         g.next_offset = g.next_offset.saturating_add(data.len() as u64);
         g.backlog.extend(data);
         let overflow = g.backlog.len().saturating_sub(BACKLOG_CAP);
@@ -565,6 +591,109 @@ fn spawn_output_reader(
 mod tests {
     use super::*;
 
+    fn test_log_dir() -> std::path::PathBuf {
+        static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "babysit-timestamps-{}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn capture_timestamps_preserve_raw_bytes_and_chunk_offsets() {
+        let dir = test_log_dir();
+        let path = dir.join("output.log");
+        let hub = OutputHub::new();
+        hub.configure_log(&path).unwrap();
+        let before = now_ms();
+        hub.broadcast(b"\x1b[31mhi\r\n");
+        hub.broadcast(&[0xff, 0, b'\n']);
+        let after = now_ms();
+        assert_eq!(std::fs::read(&path).unwrap(), b"\x1b[31mhi\r\n\xff\0\n");
+        let metadata = std::fs::read_to_string(dir.join("output.timestamps.jsonl")).unwrap();
+        assert!(metadata.ends_with('\n'));
+        let rows: Vec<[u64; 3]> = metadata
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(&rows[0][..2], &[0, 9]);
+        assert_eq!(&rows[1][..2], &[9, 3]);
+        assert!(rows.iter().all(|row| (before..=after).contains(&row[2])));
+        drop(hub);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn timestamp_configuration_preserves_append_history_and_resets_empty_log() {
+        let dir = test_log_dir();
+        let path = dir.join("output.log");
+        let metadata = dir.join("output.timestamps.jsonl");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::write(&metadata, b"[0,3,1]\n").unwrap();
+        let hub = OutputHub::new();
+        hub.configure_log(&path).unwrap();
+        hub.broadcast(b"new");
+        assert_eq!(std::fs::read(&path).unwrap(), b"oldnew");
+        assert!(
+            std::fs::read_to_string(&metadata)
+                .unwrap()
+                .starts_with("[0,3,1]\n[3,3,")
+        );
+        drop(hub);
+        std::fs::write(&path, b"").unwrap();
+        let hub = OutputHub::new();
+        hub.configure_log(&path).unwrap();
+        assert_eq!(std::fs::read(&metadata).unwrap(), b"");
+        hub.broadcast(b"x");
+        assert!(
+            std::fs::read_to_string(&metadata)
+                .unwrap()
+                .starts_with("[0,1,")
+        );
+        drop(hub);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn timestamp_open_failure_does_not_interrupt_capture_or_delivery() {
+        let dir = test_log_dir();
+        let path = dir.join("output.log");
+        std::fs::create_dir(dir.join("output.timestamps.jsonl")).unwrap();
+        let hub = OutputHub::new();
+        hub.configure_log(&path).unwrap();
+        let mut client = hub.subscribe();
+        hub.broadcast(b"still captured");
+        assert_eq!(client.recv().await.unwrap(), b"still captured");
+        assert_eq!(std::fs::read(&path).unwrap(), b"still captured");
+        assert!(hub.inner.lock().unwrap().timestamps.is_none());
+        assert!(hub.subscribe_resumable(Some(0)).is_ok());
+        drop(hub);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timestamp_write_failure_disables_metadata_only() {
+        let dir = test_log_dir();
+        let path = dir.join("output.log");
+        let hub = OutputHub::new();
+        hub.configure_log(&path).unwrap();
+        // A read-only file deterministically rejects metadata writes.
+        hub.inner.lock().unwrap().timestamps = Some(File::open(&path).unwrap());
+        hub.broadcast(b"first");
+        assert!(hub.inner.lock().unwrap().timestamps.is_none());
+        hub.broadcast(b"second");
+        assert_eq!(std::fs::read(&path).unwrap(), b"firstsecond");
+        assert!(hub.subscribe_resumable(Some(0)).is_ok());
+        drop(hub);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn resumable_subscription_uses_persisted_offsets_then_live_chunks() {
         let path = std::env::temp_dir().join(format!(
@@ -590,6 +719,7 @@ mod tests {
         assert_eq!(backlog.offset, 0);
         assert_eq!(backlog.data, b"abcde");
         assert!(hub.subscribe_resumable(Some(6)).is_err());
+        let _ = std::fs::remove_file(path.with_extension("timestamps.jsonl"));
         let _ = std::fs::remove_file(path);
     }
 }

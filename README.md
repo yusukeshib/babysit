@@ -33,6 +33,16 @@ State lives in `~/.babysit/sessions/<id>/`. Set `$BABYSIT_DIR` (absolute path) t
 change the root. `status`, `log`, and `screenshot` work after the worker exits;
 `send`, `key`, `restart`, and `kill` need it alive.
 
+`output.log` preserves the raw captured bytes. Its optional sibling
+`output.timestamps.jsonl` records each successfully captured chunk as one
+newline-terminated JSON array `[offset,length,timestamp]`: byte offset and byte
+length in the raw log, followed by capture time in epoch milliseconds (not an
+application event timestamp). Metadata appends with an existing raw log and
+resets when that log is empty. Metadata failures disable timestamp recording
+without interrupting output. Readers must tolerate missing, partial, or corrupt
+metadata and uncovered bytes, including older logs; raw log commands remain
+unchanged.
+
 `-s <id>` selects a session; there is no "most recent" fallback. Inside the
 wrapped command the id is exported as `$BABYSIT_SESSION_ID`.
 
