@@ -214,9 +214,19 @@ async fn main() -> Result<()> {
             since,
             follow,
             json,
+            timestamps,
         } => {
-            bs.log(sel.session, tail, grep, raw, since, follow, json)
-                .await
+            bs.log(
+                sel.session,
+                tail,
+                grep,
+                raw,
+                since,
+                follow,
+                json,
+                timestamps,
+            )
+            .await
         }
         cli::Command::Screenshot { sel, format, trim } => {
             bs.screenshot(sel.session, format, trim).await

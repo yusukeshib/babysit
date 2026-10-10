@@ -145,6 +145,7 @@ impl Babysit {
         since: Option<u64>,
         follow: bool,
         json: bool,
+        timestamps: bool,
     ) -> Result<()> {
         let id = session::resolve(self, session).await?;
         let path = self.output_log_path(&id);
@@ -161,6 +162,14 @@ impl Babysit {
         if let Some(off) = since {
             // Incremental read straight from the (append-only) log file.
             let (text, offset) = read_slice(&path, off, raw).await?;
+            if timestamps {
+                let rows =
+                    capture_rows_in(&path.with_extension("timestamps.jsonl"), off, offset).await;
+                let done = is_finished(self, &id).await;
+                let obj = serde_json::json!({ "text": text, "offset": offset, "done": done, "timestamps": rows });
+                println!("{}", serde_json::to_string(&obj)?);
+                return Ok(());
+            }
             emit_log(self, &id, grep_filter(text, re.as_ref()), offset, json).await
         } else {
             // Whole log (or --tail). Prefer the live socket; fall back to disk.
@@ -750,6 +759,38 @@ async fn emit_log(bs: &Babysit, id: &str, text: String, offset: u64, json: bool)
     Ok(())
 }
 
+/// Capture-time rows `[start, length, unix_ms]` overlapping raw bytes
+/// `[from, to)`, clipped to that range. The sidecar is optional metadata:
+/// missing, partial, malformed, or non-monotonic rows are skipped.
+async fn capture_rows_in(sidecar: &std::path::Path, from: u64, to: u64) -> Vec<[u64; 3]> {
+    let Ok(text) = tokio::fs::read_to_string(sidecar).await else {
+        return Vec::new();
+    };
+    clip_capture_rows(&text, from, to)
+}
+
+fn clip_capture_rows(text: &str, from: u64, to: u64) -> Vec<[u64; 3]> {
+    let mut rows = Vec::new();
+    let mut previous_end = 0u64;
+    for line in text.lines() {
+        let Ok([start, length, time]) = serde_json::from_str::<[u64; 3]>(line) else {
+            continue;
+        };
+        let Some(end) = start.checked_add(length) else {
+            continue;
+        };
+        if length == 0 || start < previous_end {
+            continue;
+        }
+        previous_end = end;
+        let (clipped_start, clipped_end) = (start.max(from), end.min(to));
+        if clipped_start < clipped_end {
+            rows.push([clipped_start, clipped_end - clipped_start, time]);
+        }
+    }
+    rows
+}
+
 /// Keep only lines matching `re` (no-op when `re` is None). Each kept line is
 /// terminated with a newline.
 fn grep_filter(text: String, re: Option<&Regex>) -> String {
@@ -1156,8 +1197,8 @@ fn format_age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_complete, grep_filter, key_to_bytes, last_visible_line, safe_prefix_len,
-        truncate_cols,
+        clip_capture_rows, escape_complete, grep_filter, key_to_bytes, last_visible_line,
+        safe_prefix_len, truncate_cols,
     };
     use regex::Regex;
 
@@ -1208,6 +1249,16 @@ mod tests {
         assert_eq!(key_to_bytes("^a").unwrap(), vec![0x01]);
         // Case-insensitive: C-C is the same control byte as C-c.
         assert_eq!(key_to_bytes("C-C").unwrap(), vec![0x03]);
+    }
+
+    #[test]
+    fn capture_rows_are_clipped_to_the_requested_raw_range() {
+        let sidecar = "[0,5,100]\n[5,5,200]\nnot json\n[3,1,250]\n[10,5,300]\n[15,2";
+        assert_eq!(
+            clip_capture_rows(sidecar, 3, 12),
+            vec![[3, 2, 100], [5, 5, 200], [10, 2, 300]]
+        );
+        assert!(clip_capture_rows(sidecar, 20, 30).is_empty());
     }
 
     #[test]
