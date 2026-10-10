@@ -202,6 +202,10 @@ pub enum Command {
         /// Emit JSON `{text, offset, done}` instead of raw text.
         #[arg(long)]
         json: bool,
+        /// With `--since --raw --json`, add `timestamps`: capture rows
+        /// `[start, length, unix_ms]` clipped to the returned raw-byte range.
+        #[arg(long, requires_all = ["since", "raw", "json"], conflicts_with_all = ["grep", "follow"])]
+        timestamps: bool,
     },
     /// Capture the current visible screen of the wrapped command.
     ///
