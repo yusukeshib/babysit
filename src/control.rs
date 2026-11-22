@@ -194,13 +194,24 @@ pub async fn serve(handle: Handle) -> Result<()> {
             parent.display()
         )
     })?;
-    ensure_private_dir(user_dir)?;
-    ensure_private_dir(parent)?;
-
-    // If a stale socket exists from a prior run with the same id, remove it.
-    let _ = tokio::fs::remove_file(&path).await;
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("binding control socket at {}", path.display()))?;
+    // The per-root directory is removed by `cleanup` once its last socket is
+    // gone, so a sibling worker of the same root can delete it between our
+    // mkdir and bind. Recreate it and retry in that case.
+    let mut attempt = 0;
+    let listener = loop {
+        ensure_private_dir(user_dir)?;
+        ensure_private_dir(parent)?;
+        // If a stale socket exists from a prior run with the same id, remove it.
+        let _ = tokio::fs::remove_file(&path).await;
+        match UnixListener::bind(&path) {
+            Ok(listener) => break listener,
+            Err(error) if error.kind() == ErrorKind::NotFound && attempt < 10 => attempt += 1,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("binding control socket at {}", path.display()));
+            }
+        }
+    };
     secure_socket(&path)?;
     spawn_listener(listener, handle.clone());
 
@@ -933,16 +944,25 @@ impl Drop for AttachedGuard {
     }
 }
 
-/// Best-effort cleanup: remove the socket file. Called on graceful shutdown.
+/// Best-effort cleanup: remove the socket file, and its per-root directory
+/// once no other session of that root still has a socket there (`remove_dir`
+/// only removes an empty directory). Without this, every state root ever used
+/// leaves an empty directory behind in `~/.babysit-sockets`. Called on
+/// graceful shutdown.
 pub fn cleanup(bs: &Babysit, session_id: &str) {
-    let _ = std::fs::remove_file(bs.control_socket_path(session_id));
+    let path = bs.control_socket_path(session_id);
+    let _ = std::fs::remove_file(&path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
     let _ = std::fs::remove_file(bs.legacy_control_socket_path(session_id));
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_private_dir, last_n_lines, secure_socket, spawn_view_filter, write_log_range_frames,
+        cleanup, ensure_private_dir, last_n_lines, secure_socket, spawn_view_filter,
+        write_log_range_frames,
     };
     use crate::{attach, paths::Babysit};
     use std::os::unix::fs::PermissionsExt;
@@ -971,6 +991,27 @@ mod tests {
         );
         drop(listener);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cleanup_removes_the_root_socket_directory_after_its_last_socket() {
+        let bs = Babysit::new(format!("/tmp/babysit-cleanup-{}", std::process::id()));
+        let first = bs.control_socket_path("first");
+        let second = bs.control_socket_path("second");
+        let root_dir = first.parent().unwrap().to_path_buf();
+        ensure_private_dir(root_dir.parent().unwrap()).unwrap();
+        ensure_private_dir(&root_dir).unwrap();
+        std::fs::write(&first, "").unwrap();
+        std::fs::write(&second, "").unwrap();
+
+        cleanup(&bs, "first");
+        assert!(!first.exists());
+        assert!(root_dir.exists(), "a sibling socket keeps the directory");
+        cleanup(&bs, "second");
+        assert!(
+            !root_dir.exists(),
+            "the last cleanup removes the empty directory"
+        );
     }
 
     #[tokio::test]
